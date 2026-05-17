@@ -1591,8 +1591,8 @@ def stream_response(messages: list, is_logic: bool, text_len: int,
     _user_last = _history[-1:] if _history and _history[-1].get("role") == "user" else []
     _conv = _history[:-1] if _user_last else _history
     # n_ctx から出力予約トークンを引いた残りをプロンプトに使える上限とする
-    # ★ num_predict=-1（無制限）のときは出力予約を0として扱い、プロンプト枠を最大化する
-    _n_predict_safe = 0 if _n_predict == -1 else _n_predict
+    # ★[修正/ctx-5] num_predict=-1は廃止済み。常に実値で計算する。
+    _n_predict_safe = max(0, _n_predict) if _n_predict != -1 else 2048
     _prompt_budget = _n_ctx - _n_predict_safe - 64   # 64トークン: 特殊トークン余裕
     _fixed_tokens = _msgs_token_estimate(_fixed + _user_last)
     _budget_for_conv = max(0, _prompt_budget - _fixed_tokens)
@@ -1630,14 +1630,14 @@ def get_llm_opt(is_logic_mode: bool, text_len: int = 0, temp_override: float | N
     }
     ctx, pl, pc, tl, tc, threads = configs.get(power, configs["high"])
     if is_logic_mode:
-        # complexモード: text_lenに依存せずctx・num_predictを固定最大化
-        # ★[修正/ctx-3] 哲学者ペルソナのsystem promptは2000〜3000トークン消費するため
-        # ctx=8192だとプロンプト枠を使い切って出力が途中で途切れる。
-        # 12288に引き上げることで出力に十分な余裕を確保する。
-        ctx = 12288
-        # ★[修正/ctx-4] num_predict=-1（無制限）でモデルが自然に文を完結させるまで生成する。
-        # 4096固定だと「深く長く語れ」指示の哲学者が4096トークン到達で強制終了し結論が急になる。
-        num_predict = -1
+        # complexモード: ctx・num_predictをモデル実上限内に収める
+        # ★[修正/ctx-5] ctx=12288はllama3.1:8b/gemma3:4bの実上限(8192)を超えるため
+        # Ollamaに無視されプロンプト圧迫→途中途切れの直接原因だった。
+        # 8192に戻し、出力予約2048を確保することで「プロンプト≦6144トークン」を保証する。
+        ctx = 8192
+        # ★[修正/ctx-5] num_predict=-1（無制限）はctx残量ゼロでもEOS選択を強制するため
+        # かえって途切れを誘発する。2048固定で十分な出力長を確保しつつ安定させる。
+        num_predict = 2048
     elif text_len < 80:
         ctx = max(512, ctx // 2)
         num_predict = pc
@@ -1650,11 +1650,11 @@ def get_llm_opt(is_logic_mode: bool, text_len: int = 0, temp_override: float | N
     stop_words: list[str] = []
     actual_predict = max_tokens if max_tokens is not None else num_predict
     if actual_predict is None:
-        actual_predict = 4096
+        actual_predict = 2048
     elif actual_predict == -1:
-        # ★[修正/ctx-4] -1はOllamaの「無制限生成」フラグ。logic_modeでは保持する。
-        # 非logicモードでmax_tokens=-1が来た場合も同様に無制限扱い。
-        actual_predict = -1
+        # ★[修正/ctx-5] -1（無制限）はctx残量ゼロ時にEOS早期選択を招くため2048に差し替える。
+        # 呼び出し元が明示的に-1を渡した場合も同様に上書きする。
+        actual_predict = 2048
     else:
         actual_predict = max(1, int(actual_predict))
     if is_logic_mode:
@@ -8308,7 +8308,7 @@ def run() -> None:
                         f"【必須】最後の文を「。」で自然に結論づけて完結させること。"
                         + rag_snippet
                     )
-                d_tokens = -1
+                d_tokens = 2048  # ★[修正/ctx-5] -1（無制限）→2048: ctx超過による途切れ防止
             else:
                 sys_content = (
                     f"あなたは{p['name']}。口調:{p['style']}。一人称:{p.get('first_person','私')}。ユーザーは{USER_NAME}。"
