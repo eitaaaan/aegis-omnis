@@ -1676,15 +1676,17 @@ def get_llm_opt(is_logic_mode: bool, text_len: int = 0, temp_override: float | N
     else:
         actual_predict = max(1, int(actual_predict))
     if is_logic_mode:
-        return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp, top_k=30, top_p=0.86,
-                    repeat_penalty=1.35,      # ★[修正/rep-1] 比喩ループ抑制
-                    repeat_last_n=256,        # ★[修正/rep-1] 広い窓で繰り返しを検出
-                    # presence_penalty/frequency_penaltyはllama.cpp未対応のため除外
+        return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp,
+                    top_k=60,   # ★[修正/smp-1] 30→60: 候補枯渇によるeos早期選択を防止
+                    top_p=0.92, # ★[修正/smp-1] 0.86→0.92: サンプリング幅を拡大
+                    repeat_penalty=1.35,
+                    repeat_last_n=256,
                     num_thread=threads, num_batch=512, stop=stop_words)
-    return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp, top_k=20, top_p=0.85,
-                repeat_penalty=1.30,          # ★[修正/rep-1] 「それはまるで〜」ループ防止
-                repeat_last_n=256,            # ★[修正/rep-1]
-                # presence_penalty/frequency_penaltyはllama.cpp未対応のため除外
+    return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp,
+                top_k=40,   # ★[修正/smp-1] 20→40
+                top_p=0.90, # ★[修正/smp-1] 0.85→0.90
+                repeat_penalty=1.30,
+                repeat_last_n=256,
                 num_thread=threads, num_batch=512, stop=stop_words)
 
 _SYS_PRM_CACHE: dict[str, str] = {}
