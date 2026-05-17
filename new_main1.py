@@ -673,7 +673,7 @@ C = {
 BANNER = (
     f"{C['c']}{C['bold']}\nPROJECT AEGIS [v128.2 FIXED+ENHANCED]{C['w']}\n"
     f"  CORE: {MODEL_NAME} | RAG: MULTI-SOURCE | 2PASS: ACTIVE | LEARN: ON\n"
-    f"  /h コマンド一覧 | /s 1〜36 西洋哲学者 | /s お嬢様 など自由入力でWeb検索生成\n"
+    f"  /h コマンド一覧 | /s 1〜36 西洋哲学者 | /s 自由入力でWeb検索生成\n"
 )
 
 HELP_TEXT = "\n".join([
