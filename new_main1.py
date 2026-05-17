@@ -1580,6 +1580,41 @@ def stream_response(messages: list, is_logic: bool, text_len: int,
     if model is None:
         last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         model = select_model(last)
+
+    # ★[修正/ctx-1] プロンプト長チェック＆古い履歴パージ
+    # Ollamaはトークン超過時に応答が途中で途切れるため、
+    # 送信前に総文字数を推定し、n_ctx上限に収まるよう履歴を削除する。
+    # 日本語は1文字≒1.5トークン、英数字は0.4トークンとして粗く見積もる。
+    def _estimate_tokens(text: str) -> int:
+        jp = sum(1 for c in text if ord(c) > 0x7F)
+        en = len(text) - jp
+        return int(jp * 1.5 + en * 0.4)
+
+    def _msgs_token_estimate(msgs: list) -> int:
+        return sum(_estimate_tokens(m.get("content", "")) for m in msgs)
+
+    _opts_preview = get_llm_opt(is_logic, text_len, temp_override, max_tokens=max_tokens)
+    _n_ctx = _opts_preview.get("num_ctx", 4096)
+    _n_predict = _opts_preview.get("num_predict", 2000)
+    # システムプロンプト＋最新ユーザー発言は必ず残す（削除不可枠）
+    _fixed = [m for m in messages if m.get("role") == "system"]
+    _history = [m for m in messages if m.get("role") != "system"]
+    _user_last = _history[-1:] if _history and _history[-1].get("role") == "user" else []
+    _conv = _history[:-1] if _user_last else _history
+    # n_ctx から出力予約トークンを引いた残りをプロンプトに使える上限とする
+    _prompt_budget = _n_ctx - _n_predict - 64   # 64トークン: 特殊トークン余裕
+    _fixed_tokens = _msgs_token_estimate(_fixed + _user_last)
+    _budget_for_conv = max(0, _prompt_budget - _fixed_tokens)
+    # 予算内に収まるまで古いconvペアを先頭から削除
+    _purged = 0
+    while _conv and _msgs_token_estimate(_conv) > _budget_for_conv:
+        _conv = _conv[2:]   # user/assistant ペアを1組削除
+        _purged += 1
+    if _purged and not silent:
+        print(f"{C['dim']}[ctx] 履歴{_purged}ペア削除 (ctx圧迫回避){C['w']}")
+    messages = _fixed + _conv + _user_last
+    # ★[修正/ctx-1] ここまで
+
     opts = get_llm_opt(is_logic, text_len, temp_override, max_tokens=max_tokens)
 
     full_result, ok = _single_gen(o, model, messages, opts, silent, 0)
@@ -1629,12 +1664,16 @@ def get_llm_opt(is_logic_mode: bool, text_len: int = 0, temp_override: float | N
         actual_predict = max(1, int(actual_predict))
     if is_logic_mode:
         return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp, top_k=30, top_p=0.86,
-                    repeat_penalty=1.25,  # ★ 繰り返し比喩ループ防止
-                    repeat_last_n=128,
+                    repeat_penalty=1.35,      # ★[修正/rep-1] 1.25→1.35: 比喩ループ抑制強化
+                    repeat_last_n=256,        # ★[修正/rep-1] 128→256: より広い窓で繰り返しを検出
+                    presence_penalty=0.8,     # ★[修正/rep-2] 新規追加: 同一フレーズの再出現を抑制
+                    frequency_penalty=0.4,    # ★[修正/rep-2] 新規追加: 高頻度トークンのペナルティ
                     num_thread=threads, num_batch=512, stop=stop_words)
     return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp, top_k=20, top_p=0.85,
-                repeat_penalty=1.20,  # ★ 旧1.05→1.20: 「それはまるで〜」ループ防止
-                repeat_last_n=128,
+                repeat_penalty=1.30,          # ★[修正/rep-1] 1.20→1.30: 「それはまるで〜」ループ防止強化
+                repeat_last_n=256,            # ★[修正/rep-1] 128→256
+                presence_penalty=0.6,         # ★[修正/rep-2] 新規追加: 同一比喩フォーマット抑制
+                frequency_penalty=0.3,        # ★[修正/rep-2] 新規追加
                 num_thread=threads, num_batch=512, stop=stop_words)
 
 _SYS_PRM_CACHE: dict[str, str] = {}
@@ -8214,7 +8253,14 @@ def run() -> None:
                     try:
                         _rag = get_async_rag_data(user_text)
                         if _rag and len(_rag.strip()) > 30:
-                            rag_snippet = f"\n\n【Web参照情報（参考程度に使え。ここにない事実を創作するな）】:\n{_rag[:500]}\n"
+                            # ★[修正/ctx-2] RAGデータをctx予算に合わせてトリミング
+                            # complexモード(ctx=8192, n_predict=4096)では残り≒4096トークン≒2700文字
+                            # RAGが長すぎるとシステムプロンプト+履歴でctxを圧迫して途切れる原因になる
+                            _rag_chars_limit = 800  # 約530トークン相当: 情報密度と安全余裕のバランス
+                            _rag_trimmed = _rag[:_rag_chars_limit]
+                            if len(_rag) > _rag_chars_limit:
+                                _rag_trimmed += "\n…(省略)"
+                            rag_snippet = f"\n\n【Web参照情報（参考程度に使え。ここにない事実を創作するな）】:\n{_rag_trimmed}\n"
                     except Exception as _e:
                         print(f"{C['y']}[WARN] RAG取得失敗（スキップ）: {_e}{C['w']}")
                 persona_style_block = p['style']
