@@ -1645,7 +1645,10 @@ def get_llm_opt(is_logic_mode: bool, text_len: int = 0, temp_override: float | N
     ctx, pl, pc, tl, tc, threads = configs.get(power, configs["high"])
     if is_logic_mode:
         # complexモード: text_lenに依存せずctx・num_predictを固定最大化
-        ctx = 8192
+        # ★[修正/ctx-3] 哲学者ペルソナのsystem promptは2000〜3000トークン消費するため
+        # ctx=8192だとプロンプト枠を使い切って出力が途中で途切れる。
+        # 12288に引き上げることで出力に十分な余裕を確保する。
+        ctx = 12288
         num_predict = 4096
     elif text_len < 80:
         ctx = max(512, ctx // 2)
