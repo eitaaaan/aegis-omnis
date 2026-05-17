@@ -1677,16 +1677,14 @@ def get_llm_opt(is_logic_mode: bool, text_len: int = 0, temp_override: float | N
         actual_predict = max(1, int(actual_predict))
     if is_logic_mode:
         return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp, top_k=30, top_p=0.86,
-                    repeat_penalty=1.35,      # ★[修正/rep-1] 1.25→1.35: 比喩ループ抑制強化
-                    repeat_last_n=256,        # ★[修正/rep-1] 128→256: より広い窓で繰り返しを検出
-                    presence_penalty=0.8,     # ★[修正/rep-2] 新規追加: 同一フレーズの再出現を抑制
-                    frequency_penalty=0.4,    # ★[修正/rep-2] 新規追加: 高頻度トークンのペナルティ
+                    repeat_penalty=1.35,      # ★[修正/rep-1] 比喩ループ抑制
+                    repeat_last_n=256,        # ★[修正/rep-1] 広い窓で繰り返しを検出
+                    # presence_penalty/frequency_penaltyはllama.cpp未対応のため除外
                     num_thread=threads, num_batch=512, stop=stop_words)
     return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp, top_k=20, top_p=0.85,
-                repeat_penalty=1.30,          # ★[修正/rep-1] 1.20→1.30: 「それはまるで〜」ループ防止強化
-                repeat_last_n=256,            # ★[修正/rep-1] 128→256
-                presence_penalty=0.6,         # ★[修正/rep-2] 新規追加: 同一比喩フォーマット抑制
-                frequency_penalty=0.3,        # ★[修正/rep-2] 新規追加
+                repeat_penalty=1.30,          # ★[修正/rep-1] 「それはまるで〜」ループ防止
+                repeat_last_n=256,            # ★[修正/rep-1]
+                # presence_penalty/frequency_penaltyはllama.cpp未対応のため除外
                 num_thread=threads, num_batch=512, stop=stop_words)
 
 _SYS_PRM_CACHE: dict[str, str] = {}
