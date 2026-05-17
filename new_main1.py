@@ -1536,9 +1536,6 @@ def _find_overlap(base: str, continuation: str, max_check: int = 80) -> int:
 
 def _single_gen(o, model: str, msgs: list, opts: dict, silent: bool, timeout: int) -> tuple:
     """1回分の生成。タイムアウトなしの直接ストリーミング。(テキスト, 成功フラグ) を返す。"""
-    # ★ スレッド+タイムアウト方式を廃止。
-    # th.join(timeout=N) が N秒で部分テキストを返すのが途切れの根本原因だった。
-    # Ollamaのストリームを直接イテレートし、モデルが止まるまで待ち続ける。
     full = ""
     try:
         for chunk in o.chat(model=model, messages=msgs, stream=True, options=opts, keep_alive=-1):
@@ -1550,24 +1547,14 @@ def _single_gen(o, model: str, msgs: list, opts: dict, silent: bool, timeout: in
             if not t: continue
             if not silent: print(t, end="", flush=True)
             full += t
-        # ★ 末尾が文として不完全な場合（句読点なしで終わる）は「。」を補完
-        TERMINAL = {"。", "．", "！", "？", "…", "」", "』", "】", "）", ")", ".", "!", "?", "\n"}
-        if full and full[-1] not in TERMINAL:
-            # 末尾が途中の文字列で終わっている場合のみ補完
-            if not silent: print("。", end="", flush=True)
-            full += "。"
+        # ★[修正/eos-1] 末尾への「。」自動補完を廃止。
+        # モデルが文の途中でEOSを出した場合でも補完せずそのまま返す。
+        # 補完が「によって。」「我々が。」のような不自然な途切れを生んでいた。
         return full, True
     except KeyboardInterrupt:
-        # Ctrl+C で中断された場合は途中テキストを返す
         return full, False
     except Exception as e:
         if not silent: print(f"\n{C['r']}[ERR] {e}{C['w']}")
-        # ★ 途中まで生成できていた場合はそれを返す（空文字より有用）
-        if full.strip():
-            TERMINAL2 = {"。", "．", "！", "？", "…", "」", "』", "】", "）", ")", ".", "!", "?"}
-            if full[-1] not in TERMINAL2:
-                full += "。"
-            return full, False
         return full, False
 
 
@@ -1628,12 +1615,7 @@ def stream_response(messages: list, is_logic: bool, text_len: int,
 
     # 繰り返しループ検出 → 末尾を整形して返す
     if detect_repetition(full_result):
-        t = full_result.rstrip("、，")
-        TERMINAL = {"。", "．", "！", "？", "…", "」", "』", "】", "）", ")", ".", "!", "?"}
-        if t and t[-1] not in TERMINAL:
-            full_result = t + "。"
-        else:
-            full_result = t
+        full_result = full_result.rstrip("、，")
 
     if not silent: print()
     return full_result
