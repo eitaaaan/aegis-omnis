@@ -3087,7 +3087,7 @@ def _spi_pick_smart(filter_cat: str | None = None, use_llm: bool = True) -> dict
                 result_box.append(q)
         t = threading.Thread(target=_gen, daemon=True)
         t.start()
-        t.join(timeout=14)   # 最大14秒待つ
+        t.join(timeout=5)   # 最大14秒待つ
         if result_box:
             _spi_mark_used(result_box[0])
             return result_box[0]
