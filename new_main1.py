@@ -405,7 +405,6 @@ class BackgroundOptimizer:
 
         for a in actions:
             self._log(a)
-            print(f"{C['dim']}[最適化] {a}{C['w']}")
 
     def status(self) -> str:
         rows = [f"{C['c']}=== 最適化エンジン ==={C['w']}"]
