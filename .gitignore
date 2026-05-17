@@ -1,0 +1,44 @@
+# バックアップ・旧バージョン
+*.bak
+*.bak2
+*.save
+*.bak.*
+main.py.v1*
+main_py_*.py
+main_v1*.py
+
+# Windowsゾーン識別子
+*.Zone.Identifier
+*:Zone.Identifier
+
+# コピーファイル
+*コピー*.py
+main１２３.py
+
+# テストスクリプト
+test_*.py
+test_*.sh
+
+# キャッシュ
+__pycache__/
+*.pyc
+
+# 一時ファイル
+*.mid
+*.wav
+*.mp3
+output/
+
+# 状態ファイル
+s01_state.json
+s01_vector_db/
+
+# 作業用スクリプト
+patch.py
+fix_*.py
+update_*.py
+port_features.py
+
+# その他
+run.sh
+*.zip

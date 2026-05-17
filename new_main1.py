@@ -1162,8 +1162,10 @@ def detect_repetition(text: str, window: int = 150) -> bool:
         half = len(chunk) // 2
         if chunk[:half] == chunk[half:]:
             return True
-    # 総文字数が4000字を超えたら強制終了（無制限生成の暴走防止）
-    if len(text) > 8000:
+    # ★[修正/rep-3] 総文字数上限を8000→20000に緩和
+    # 哲学者モード(num_predict=-1)で長文生成時に8000字で強制終了していた。
+    # 7段落×5文×80字≒2800字が通常だが余裕を持って20000字に設定。
+    if len(text) > 20000:
         return True
     return False
 
@@ -1602,7 +1604,9 @@ def stream_response(messages: list, is_logic: bool, text_len: int,
     _user_last = _history[-1:] if _history and _history[-1].get("role") == "user" else []
     _conv = _history[:-1] if _user_last else _history
     # n_ctx から出力予約トークンを引いた残りをプロンプトに使える上限とする
-    _prompt_budget = _n_ctx - _n_predict - 64   # 64トークン: 特殊トークン余裕
+    # ★ num_predict=-1（無制限）のときは出力予約を0として扱い、プロンプト枠を最大化する
+    _n_predict_safe = 0 if _n_predict == -1 else _n_predict
+    _prompt_budget = _n_ctx - _n_predict_safe - 64   # 64トークン: 特殊トークン余裕
     _fixed_tokens = _msgs_token_estimate(_fixed + _user_last)
     _budget_for_conv = max(0, _prompt_budget - _fixed_tokens)
     # 予算内に収まるまで古いconvペアを先頭から削除
