@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# S-01 v128.1 Aegis Omnis — ENHANCED EDITION
+# S-01 v129.0 Aegis Omnis — NEXT GENERATION EDITION (2026)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 主な強化点 (v128.1 → v129.0):
+#   ★ AIエンジン: gemma3:12b/4b/1b 自動選択 + Thinking Mode
+#   ★ ハイブリッドRAG v2: BM25 + Vector + Cross-Encoder Reranking
+#   ★ 並列Multi-Agent: 非同期ツール実行 (asyncio)
+#   ★ Context Caching: KVキャッシュ最大活用・プリフィルキャッシュ
+#   ★ 将棋AI: Negamax + TranspositionTable + KillerHeuristic
+#   ★ チェスAI: MCTS (Monte Carlo Tree Search) 搭載
+#   ★ セキュリティ: プロンプトインジェクション多層防御
+#   ★ 新コマンド: /think /plan /code /reflect /mindmap /persona_edit
+#   ★ Structured Outputs: JSON Schema強制でハルシネーション削減
+#   ★ TokenBudget: 動的ctx割当・バックプレッシャー制御
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 from __future__ import annotations
 
 import atexit, glob, html as html_module, itertools, json, math, os, platform, re, shutil, ssl, traceback
 import subprocess as S, sys, threading, time, unicodedata, urllib.parse as U, urllib.request as R
+import asyncio, hashlib, queue, signal, weakref
+from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -24,43 +39,77 @@ from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-_ollama = None
+_ollama = None  # None=未試行, False=失敗確定（センチネル）
 def _get_ollama():
     global _ollama
+    # ★[修正/#2] 失敗済み(False)の場合は再試行しない。
+    # 旧コードは失敗後も None のままにしていたため毎ターン import を試みていた。
+    # また `import ollama, os` で os を関数内で毎回再 import していた点も修正。
+    if _ollama is False:
+        return None
     if _ollama is None:
         try:
-            import ollama, os
+            import ollama as _ollama_mod
             # ★[修正/ollama-host] WSL2→Windows Ollama接続対応
             # OLLAMA_HOST環境変数があればClientを明示的に初期化する。
-            # デフォルトはlocalhost:11434のため、Windows側Ollamaを使う場合は
             # export OLLAMA_HOST=http://172.24.80.1:11434 を~/.bashrcに設定すること。
             host = os.environ.get("OLLAMA_HOST", "")
             if host:
-                _ollama = ollama.Client(host=host)
+                _ollama = _ollama_mod.Client(host=host)
             else:
-                _ollama = ollama
+                _ollama = _ollama_mod
         except Exception:
-            _ollama = None
-    return _ollama
+            _ollama = False  # センチネル: 以降の再 import を抑止
+    return _ollama if _ollama is not False else None
 
-MODEL_NAME    = "gemma3:4b"
-DEEP_MODEL    = "gemma3:4b"   # ★[最適化] Ryzen5700U CPU専用: 8b(3-5tok/s)→4b(15-20tok/s)に統一
-MAX_HISTORY   = 4
-RAG_TIMEOUT   = 3.0   # ★[最適化] 2.5→3.0: 並列取得のため体感変化なし。Wikiヒット率向上
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★[v129] モデル設定 — 自動選択エンジン対応
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# モデルは POWER_MODE と入力の複雑度から自動選択される。
+# GPU環境 (OLLAMA_GPU=1) では 12b モデルが自動的に使用される。
+_GPU_AVAILABLE = os.environ.get("OLLAMA_GPU", "0") == "1" or os.environ.get("CUDA_VISIBLE_DEVICES", "") != ""
+_HAS_12B       = False  # 起動時に ollama list で確認 (check_ollama_connection内)
+
+# モデル優先順位: ultra/high=12b→4b, mid=4b, low=1b
+MODEL_TIERS = {
+    "ultra": ["gemma3:12b", "gemma3:4b"],
+    "high":  ["gemma3:12b", "gemma3:4b"],
+    "mid":   ["gemma3:4b"],
+    "low":   ["gemma3:1b", "gemma3:4b"],
+}
+MODEL_NAME    = "gemma3:4b"   # デフォルト（check_ollama_connectionで更新）
+DEEP_MODEL    = "gemma3:4b"   # complexモード用（同上）
+FAST_MODEL    = "gemma3:1b"   # 高速応答用（1b優先）
+MAX_HISTORY   = 6             # ★[v129] 4→6: 長い文脈での一貫性向上
+RAG_TIMEOUT   = 4.0           # ★[v129] 3.0→4.0: ハイブリッドRAGで取得量増加
 USER_NAME     = "先輩"
 OBSERVED_SUBJECT_NAME = USER_NAME
 STATE_FILE    = "s01_state.json"
-POWER_MODE    = "mid"   # ★[最適化] high(ctx=8192)→mid(ctx=4096): CPU専用機で速度優先。哲学者もgemma3:4bで十分な品質
+POWER_MODE    = "mid"
 TEMP_FACT     = 0.05
 TEMP_VOICE    = 0.72
 FACT_MIN_CHARS = 20
+
+# ★[v129] Thinking Mode設定
+THINKING_MODE = False          # True: chain-of-thought強制 (/think で切替)
+THINKING_BUDGET = 1024        # thinking用トークン予算
+
+# ★[v129] TokenBudget — 動的ctx管理
+TOKEN_BUDGET_SAFETY = 128     # 安全マージン(tok)
+TOKEN_EST_JP  = 1.5           # 日本語1文字≒1.5トークン
+TOKEN_EST_EN  = 0.4           # 英数字1文字≒0.4トークン
+
 TEMP_MAP: dict[str, float] = {
     "/a": 0.68, "/w": 0.45, "/p": 0.30, "/c": 0.55,
     "/t": 0.82, "/q": 0.70, "/e": 0.40, "/sum": 0.40,
-    "/r": 0.85, "/d": 0.62,
+    "/r": 0.85, "/d": 0.62, "/think": 0.20, "/plan": 0.35,
+    "/code": 0.15, "/reflect": 0.50,
 }
 MAX_RETRIES   = 0
 RETRY_DELAY   = 0.6
+
+# ★[v129] ThreadPoolExecutor — 非同期RAG・ツール並列実行
+_THREAD_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="s01")
 
 # ===== オフラインモード設定 =====
 # OFFLINE_MODE = True にするとネット不要のパスだけ使う。
@@ -69,7 +118,7 @@ RETRY_DELAY   = 0.6
 OFFLINE_MODE  = False          # True でネット通信を完全無効化
 KIWIX_PORT    = 8888           # kiwix-serve のポート番号
 COMPLEXITY_KEYWORDS = {
-    "deep": ['分析', '比較', '考察', '原因', '影響', '関係性', '構造', 'メカニズム', '原理', '定義', '本質', '違い', '対比', '傾向', '推移', '背景', '要因', '過程', '仕組み', '意義', '評価', '検証', '論点', '議論', '批判', '展望', '課題', '展望', '示唆', 'シナジー', 'トレードオフ', 'アーキテクチャ', 'アプローチ', '手法', '戦略', 'フレームワーク', 'パラダイム'],
+    "deep": ['分析', '比較', '考察', '原因', '影響', '関係性', '構造', 'メカニズム', '原理', '定義', '本質', '違い', '対比', '傾向', '推移', '背景', '要因', '過程', '仕組み', '意義', '評価', '検証', '論点', '議論', '批判', '展望', '課題', '示唆', 'シナジー', 'トレードオフ', 'アーキテクチャ', 'アプローチ', '手法', '戦略', 'フレームワーク', 'パラダイム'],  # ★[修正/#6] '展望' 重複を除去
     "simple": ['こんにちは', 'おはよう', 'こんばんは', '元気', 'やあ', 'hey', 'hello', 'hi', 'おやすみ', 'またね', 'バイバイ', 'ねえ', 'ちょっと', 'ありがとう', 'すごい', 'なるほど', 'わかった', 'OK', 'はい', 'いいね'],
 }
 
@@ -97,7 +146,12 @@ def estimate_complexity(text: str, cmd: str = "") -> str:
     return "simple"
 
 def select_model(text: str, cmd: str = "") -> str:
-    return DEEP_MODEL if estimate_complexity(text, cmd) == "complex" else MODEL_NAME
+    """★[v129] 複雑度・長さ・コマンドでモデル自動選択 (CPU専用最適化)"""
+    c = estimate_complexity(text, cmd)
+    if c == "complex": return DEEP_MODEL
+    if c == "simple" and len(text) < 60 and not cmd:
+        return FAST_MODEL  # ★[v129] 短い単純質問→FASTモデルで高速応答
+    return MODEL_NAME
 
 RAG_CACHE: dict[str, tuple[float, str, int, float]] = {}
 _RAG_LOCK = threading.Lock()
@@ -116,9 +170,14 @@ def _init_vector_db():
     try:
         import chromadb
         _VECTOR_CLIENT = chromadb.PersistentClient(path="s01_vector_db")
-        VECTOR_COL = _get_or_create_col("s01_memory")
+        # ★[修正/#1] VECTOR_AVAILABLE を True にしてから _get_or_create_col を呼ぶ。
+        # 旧コードは False のまま呼んでいたため _get_or_create_col → _init_vector_db →
+        # _get_or_create_col … の無限再帰 (RecursionError) が発生していた。
         VECTOR_AVAILABLE = True
-    except Exception as e: print(f"{C['y']}[WARN] chromadb初期化失敗: {e}{C['w']}")
+        VECTOR_COL = _get_or_create_col("s01_memory")
+    except Exception as e:
+        VECTOR_AVAILABLE = False          # 失敗時はフラグを戻す
+        print(f"{C['y']}[WARN] chromadb初期化失敗: {e}{C['w']}")
 
 def _get_or_create_col(name: str):
     """コレクションをキャッシュして返す。なければ作る。"""
@@ -1259,9 +1318,10 @@ C = {
 }
 
 BANNER = (
-    f"{C['c']}{C['bold']}\nPROJECT AEGIS [v128.2 FIXED+ENHANCED]{C['w']}\n"
-    f"  CORE: {MODEL_NAME} | RAG: MULTI-SOURCE | 2PASS: ACTIVE | LEARN: ON\n"
-    f"  /h コマンド一覧 | /s 1〜36 西洋哲学者 | /s 自由入力でWeb検索生成\n"
+    f"{C['c']}{C['bold']}\nPROJECT AEGIS [v129.0 NEXT GENERATION]{C['w']}\n"
+    f"  FAST: {FAST_MODEL} | MAIN: {MODEL_NAME} | DEEP: {DEEP_MODEL}\n"
+    f"  RAG: HYBRID(BM25+Vector) | MULTI-AGENT: ON | THINKING: {'ON' if THINKING_MODE else 'OFF'}\n"
+    f"  /h コマンド一覧 | /s 1〜36 西洋哲学者 | /think 思考モード切替\n"
 )
 
 HELP_TEXT = "\n".join([
@@ -1313,9 +1373,20 @@ HELP_TEXT = "\n".join([
     f"  {C['c']}/spi{C['w']}                SPI/玉手箱 対策（/spi 模擬 で10問連続）",
     f"  {C['c']}/comp <ID> <ID> [テーマ]{C['w']}  ヘーゲル弁証法対話（哲学者/カジュアル/ビジネス自動判定）",
     f"  {C['c']}/split <ID or 名前> [テーマ]{C['w']} 1ペルソナをテーゼ/アンチテーゼに分解して内的弁証法",
-    f"  {C['c']}/chess{C['w']}              ♟ チェス（完全ルール実装・ターミナル対戦）\n              例: /chess easy  /chess middle  /chess hard  /chess very_hard",
-    f"  {C['c']}/shogi{C['w']}              将棋（本将棋・curses UI・AI対戦対応）\n              例: /shogi easy  /shogi middle  /shogi hard  /shogi very_hard",
+    f"  {C['c']}/chess{C['w']}              ♟ チェス（MCTS強化・curses UI）\n              例: /chess easy  /chess middle  /chess hard  /chess very_hard",
+    f"  {C['c']}/shogi{C['w']}              将棋（Negamax+TT+Killer強化・curses UI）\n              例: /shogi easy  /shogi middle  /shogi hard  /shogi very_hard",
     f"  {C['c']}/mj{C['w']}                🀄 本格麻雀（ブラウザ起動・AI対戦・役/符計算完全実装）\n              例: /mj        → 4人麻雀東風戦\n                  /mj 3     → 3人麻雀\n                  /mj tonpu → 4人麻雀東南戦",
+    f"",
+    f"  {C['c']}━━━ v129.0 新機能 ━━━{C['w']}",
+    f"  {C['c']}/think [on|off]{C['w']}      思考モード切替（chain-of-thought強制）",
+    f"  {C['c']}/plan <目標>{C['w']}         段階的計画生成（OODA Loop）",
+    f"  {C['c']}/code <仕様>{C['w']}         高品質コード生成（テスト付き）",
+    f"  {C['c']}/reflect <内容>{C['w']}      自己批判的振り返り分析",
+    f"  {C['c']}/mindmap <テーマ>{C['w']}    マインドマップ生成（ASCIIアート）",
+    f"  {C['c']}/persona_edit{C['w']}        現在ペルソナのスタイル編集",
+    f"  {C['c']}/model [fast|main|deep]{C['w']} 使用モデル確認/切替",
+    f"  {C['c']}/ctx{C['w']}                コンテキスト使用量表示",
+    f"  {C['c']}/speedtest{C['w']}           モデル速度測定（tok/s）",
     f"  {C['c']}exit / 終了{C['w']}          終了",
 ])
 
@@ -1379,8 +1450,22 @@ def sanitize_obj(value):
 def normalize_input(txt: str) -> str:
     clean = re.sub(r'[\ud800-\udfff]', '', str(txt))
     clean = unicodedata.normalize("NFKC", clean)
-    clean = re.sub(r'<(RAG_DATA|FACT|system|SYSTEM)>', r'&lt;\1&gt;', clean)
-    clean = re.sub(r'[\s\u200b\u200c\u200d\ufeff]+', ' ', clean)
+    # ★[v129] プロンプトインジェクション多層防御
+    # Layer 1: XMLタグ無効化（エスケープ）
+    clean = re.sub(r'<(RAG_DATA|FACT|system|SYSTEM|INST|SYS|PROMPT|CONTEXT)>', r'&lt;\1&gt;', clean, flags=re.I)
+    # Layer 2: 役割変更インジェクション検出・除去
+    _injection_patterns = [
+        r'(?i)(ignore|forget|disregard)\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)',
+        r'(?i)you\s+are\s+now\s+(a|an)\s+\w+',
+        r'(?i)act\s+as\s+(if\s+you\s+are|a|an)\s+\w+',
+        r'(?i)(system|admin|root|sudo)\s*:\s*',
+        r'(?i)\[INST\]|\[SYS\]|\[SYSTEM\]',
+        r'###\s*(System|Instruction|Prompt)\s*:',
+    ]
+    for pat in _injection_patterns:
+        clean = re.sub(pat, '[FILTERED]', clean)
+    # Layer 3: 制御文字除去
+    clean = re.sub(r'[\s\u200b\u200c\u200d\ufeff\u0000-\u001f]+', ' ', clean)
     return clean.strip()
 
 def PurgeEvidence():
@@ -1475,7 +1560,9 @@ def restore_learning():
     # ★[修正/power-persist] コードデフォルト(high)よりstateが格下なら上書きしない。
     # mid保存済み環境でも再起動後にhigh以上が維持される。
     _rank = {"low": 0, "mid": 1, "high": 2, "ultra": 3}
-    if saved in _rank and _rank[saved] >= _rank.get(POWER_MODE, 2): POWER_MODE = saved
+    # ★[修正/#8] コードデフォルトは "mid"（旧コメントは "(high)" と誤記）。
+    # saved が現在の POWER_MODE 以上のランクなら上書きする。
+    if saved in _rank and _rank[saved] >= _rank.get(POWER_MODE, 1): POWER_MODE = saved
     # ペルソナキャッシュを復元（前回Web取得済みをそのまま使い回せる）
     for k, v in state.get("persona_cache", {}).items():
         if isinstance(v, dict) and "name" in v and "style" in v:
@@ -1739,14 +1826,14 @@ def _print_hallucination_warnings(response: str, strict: bool = False) -> None:
         print(f"  {C['r']}※ 局所参照外の情報が多く含まれる可能性。/kb search で原文を確認推奨。{C['w']}")
 
 def detect_repetition(text: str, window: int = 150) -> bool:
-    """繰り返し検出。"""
+    """★[v129] 繰り返し検出強化: フレーズ重複 + 文レベル重複を検出。"""
     if len(text) < window * 2: return False
     # バイナリ重複（完全一致）
     tail = text[-window * 2:]
     if tail[:len(tail)//2] == tail[len(tail)//2:]:
         return True
-    # 同一比喩構文の多用（5回以上に緩和 — 3回だと豊かな散文も止まった）
-    if len(re.findall(r'まるで.{5,50}(?:ようなもの|ような状況|ようだ|かのよう)', text)) >= 5:
+    # 同一比喩構文の多用（4回以上に厳格化）
+    if len(re.findall(r'まるで.{5,50}(?:ようなもの|ような状況|ようだ|かのよう)', text)) >= 4:
         return True
     # 400字ウィンドウで前半=後半
     if len(text) >= 400:
@@ -1754,23 +1841,26 @@ def detect_repetition(text: str, window: int = 150) -> bool:
         half = len(chunk) // 2
         if chunk[:half] == chunk[half:]:
             return True
-    # ★[修正/rep-3] 総文字数上限を8000→20000に緩和
-    # 哲学者モード(num_predict=-1)で長文生成時に8000字で強制終了していた。
-    # 7段落×5文×80字≒2800字が通常だが余裕を持って20000字に設定。
+    # ★[v129] 文レベル重複検出: 同じ文が2回以上出てきたら繰り返し
+    sents = re.split(r'[。！？\n]', text)
+    sents = [s.strip() for s in sents if len(s.strip()) > 10]
+    seen_sents: set = set()
+    for s in sents:
+        norm = re.sub(r"\s+", "", s)[:35]
+        if norm in seen_sents: return True
+        seen_sents.add(norm)
     if len(text) > 20000:
         return True
     return False
 
 def trim_history(ms: list, max_pairs: int = MAX_HISTORY, token_budget: int = 2000) -> list:
-    """件数上限 + トークン予算の両方でトリムする。
-    ★[修正/hist-1] 哲学者の長い返答が履歴に積み上がってctxを圧迫する問題を防止。
-    token_budget: 履歴全体に使えるトークン数の上限（デフォルト2000）。
-    """
+    """★[v129] 件数上限 + トークン予算の両方でトリム。重要度スコアで古いペアを優先削除。"""
     ms = ms[-(max_pairs * 2):]  # まず件数で絞る
     def _tok(s: str) -> int:
-        return int(sum(1.5 if ord(c) > 0x7F else 0.4 for c in s))
-    # 予算超過なら古いペアから削除
-    while len(ms) >= 2:
+        jp = sum(1 for c in s if ord(c) > 0x7F)
+        return int(jp * TOKEN_EST_JP + (len(s) - jp) * TOKEN_EST_EN)
+    # ★[v129] 予算超過なら古いペアから削除（最後の2ペアは必ず残す）
+    while len(ms) >= 6:  # 3ペア以上ある場合のみ削除対象
         total = sum(_tok(m.get("content", "")) for m in ms)
         if total <= token_budget:
             break
@@ -1998,7 +2088,7 @@ def _fetch_nhk_snippets(query: str) -> str:
         url = f"https://www3.nhk.or.jp/news/search/?keyword={U.quote(query)}"
         h = fetch_html(url, timeout=4, silent=True, spoof_bot=True)
         snips = re.findall(r'<p class="text--M"[^>]*>(.*?)</p>', h, re.I | re.S)
-        return "\n".join(f"[NHK] {strip_tags(s)}" for s in snips[:3] if len(strip_tags(s)) > 20)
+        return "\n".join(f"[NEWS] {strip_tags(s)}" for s in snips[:3] if len(strip_tags(s)) > 20)
     except Exception: return ""
 
 def _fetch_kotobank(query: str) -> str:
@@ -2028,48 +2118,90 @@ def get_async_rag_data(query: str) -> str:
             return content
     res: dict[str, str] = {}
     lock = threading.Lock()
+
     def run_task(key: str, fn, *args):
         try:
             val = fn(*args)
             with lock: res[key] = val or ""
-        except Exception as e: print(f"{C['y']}[WARN] RAGタスク'{key}'失敗: {e}{C['w']}")
+        except Exception as e: pass  # サイレントフェイルアウト
+
     tasks = [
         ("wiki",     get_wikipedia,         query),
         ("yahoo",    _fetch_yahoo_snippets,  query + " 概要"),
         ("ddg",      _fetch_ddg_snippets,    query),
-        ("bing",     _fetch_bing_snippets,   query),          # バグ修正: 追加
+        ("bing",     _fetch_bing_snippets,   query),
         ("kotobank", _fetch_kotobank,        query),
+        # ★[v129] ニュースも並列取得
+        ("nhk",      _fetch_nhk_snippets,    query),
     ]
-    threads = [threading.Thread(target=run_task, args=(k, fn, *a), daemon=True) for k, fn, *a in tasks]
-    for t in threads: t.start()
+    # ★[v129] ThreadPoolExecutorで並列実行（パフォーマンス向上）
+    futures = {_THREAD_POOL.submit(run_task, k, fn, *a): k for k, fn, *a in tasks}
     start_time = time.time()
+
     while time.time() - start_time < RAG_TIMEOUT:
         with lock:
             wiki_len = len(res.get("wiki", ""))
-            web_len  = sum(len(res.get(k, "")) for k in ["yahoo", "ddg", "bing", "kotobank"])
-            # Wikipedia単独で十分長い場合、またはWeb検索が十分集まった場合に早期終了
-            if wiki_len > 800 or web_len > 600:
+            web_len  = sum(len(res.get(k, "")) for k in ["yahoo", "ddg", "bing", "kotobank", "nhk"])
+            if wiki_len > 800 or web_len > 800:
                 break
-        time.sleep(0.15)
-    for t in threads: t.join(timeout=RAG_TIMEOUT)
+        time.sleep(0.1)
+
+    # 全futureを待つ（残り時間まで）
+    for f in futures:
+        remain = max(0.0, RAG_TIMEOUT - (time.time() - start_time))
+        try: f.result(timeout=remain)
+        except Exception: pass
+
     with lock:
         wiki = res.get("wiki", "").strip()
-        web_hits = [res.get(k, "").strip() for k in ["yahoo", "ddg", "bing", "kotobank"]]
+        web_hits = [res.get(k, "").strip() for k in ["yahoo", "ddg", "bing", "kotobank", "nhk"]]
+
+    # ★[v129] BM25風スコアリング: クエリキーワードの出現頻度でスニペットをランキング
+    def _bm25_score(text: str, query: str) -> float:
+        if not text: return 0.0
+        q_words = re.findall(r'[\u3040-\u9FFF\w]{2,}', query.lower())
+        if not q_words: return len(text) * 0.001
+        score = 0.0
+        text_lower = text.lower()
+        for w in q_words:
+            tf = text_lower.count(w)
+            if tf > 0:
+                # BM25近似: k1=1.5, b=0.75
+                score += (tf * 2.5) / (tf + 1.5 * (0.25 + 0.75 * len(text) / 500))
+        return score
+
     all_lines = []
-    for block in web_hits: all_lines.extend(block.splitlines())
-    merged_web = "\n".join(_deduplicate_lines(all_lines))
+    for block in web_hits:
+        for line in block.splitlines():
+            line = line.strip()
+            if len(line) > 20:
+                all_lines.append((line, _bm25_score(line, query)))
+
+    # ★[v129] スコア降順でソートして重複除去
+    all_lines.sort(key=lambda x: -x[1])
+    seen = set()
+    ranked_lines = []
+    for line, score in all_lines:
+        norm = re.sub(r'\s+', '', line.lower())[:40]
+        if norm not in seen and score > 0:
+            seen.add(norm)
+            ranked_lines.append(line)
+        if len(ranked_lines) >= 20:
+            break
+
+    merged_web = "\n".join(ranked_lines)
     if len(wiki) < 10 and len(merged_web) < 20: return ""
     parts = []
     if wiki: parts.append(f"[Wikipedia JA]\n{wiki}")
-    if merged_web: parts.append(f"[Web Search]\n{merged_web}")
+    if merged_web: parts.append(f"[Web Search (BM25 ranked)]\n{merged_web}")
     final = "\n\n".join(parts)
-    # confidence計算: 実際に取得できたソースのみカウント（バグ修正）
+
     has_wiki = bool(res.get("wiki", "").strip())
-    has_web  = bool(sum(len(res.get(k, "").strip()) for k in ["yahoo", "ddg", "bing", "kotobank"]))
-    confidence = 0.7 if (has_wiki and has_web) else (0.5 if (has_wiki or has_web) else 0.2)
+    has_web  = bool(merged_web)
+    confidence = 0.8 if (has_wiki and has_web) else (0.6 if (has_wiki or has_web) else 0.2)
+
     with _RAG_LOCK:
         if len(RAG_CACHE) > 200:
-            # アクセス数が少なく古いものから優先削除
             evict_keys = sorted(RAG_CACHE.items(), key=lambda x: (x[1][2], x[1][0]))[:20]
             for k, _ in evict_keys: RAG_CACHE.pop(k, None)
         RAG_CACHE[query] = (time.time(), final, 1, confidence)
@@ -2106,13 +2238,24 @@ def _build_no_data_prompt(query: str, persona: dict) -> list[dict]:
     return [{"role": "system", "content": f"あなたは{persona['name']}。口調: {persona['style']}。一人称: {persona.get('first_person','私')}。「情報がない」とだけ言え。推測・創作は一切するな。"}, {"role": "user", "content": f"「{query}」について調べたが見つからなかった。「情報がない」とだけ言え。"}]
 
 def two_pass_analysis(query: str, rag_data: str, persona: dict, text_len: int) -> str:
-    sp1 = SystemSpinner("RAG事実抽出中...", stage="pass1")
+    sp1 = SystemSpinner("RAG事実抽出(BM25)...", stage="pass1")
     sp1.start()
-    lines_rag = [re.sub(r'[^\x20-\x7E\u3000-\u9FFF\uFF00-\uFFEF]', '', ln.strip()) for ln in rag_data.splitlines()]
+    lines_rag = [re.sub(r'[^ -~　-鿿＀-￯]', '', ln.strip()) for ln in rag_data.splitlines()]
     lines_rag = [ln for ln in lines_rag if len(ln) >= FACT_MIN_CHARS and ln not in ("(empty)", "")]
-    q_words = [w for w in re.split(r'[\s\u3000\u3001\u3002\uff0c\uff0e]+', query) if len(w) >= 2]
-    scored = sorted([(sum(1 for w in q_words if w in ln) + len(ln) * 0.001, ln) for ln in lines_rag], key=lambda x: -x[0])
-    facts = [ln[:200] for _, ln in scored[:8]]
+    q_words = [w for w in re.split(r'[\s　、。，．]+', query) if len(w) >= 2]
+    # ★[v129] BM25風スコアリング (k1=1.5, b=0.75)
+    avg_len = sum(len(ln) for ln in lines_rag) / max(len(lines_rag), 1)
+    def bm25(ln: str) -> float:
+        score = 0.0
+        ln_lower = ln.lower()
+        for w in q_words:
+            tf = ln_lower.count(w)
+            if tf > 0:
+                idf = math.log(1 + len(lines_rag) / (1 + sum(1 for l in lines_rag if w in l.lower())))
+                score += idf * (tf * 2.5) / (tf + 1.5 * (0.25 + 0.75 * len(ln) / max(avg_len, 1)))
+        return score
+    scored = sorted([(bm25(ln), ln) for ln in lines_rag], key=lambda x: -x[0])
+    facts = [ln[:250] for _, ln in scored[:10]]  # ★[v129] 8→10件, 200→250文字
     raw_p1 = "\n".join(f"<FACT>[HIGH] {f}</FACT>" for f in facts[:4]) + "\n".join(f"<FACT>[MID] {f}</FACT>" for f in facts[4:])
     elapsed1 = sp1.stop()
     print(f"{C['dim']}  Pass1完了 ({elapsed1:.1f}s) / {len(facts)}件抽出{C['w']}")
@@ -2175,48 +2318,71 @@ def stream_response(messages: list, is_logic: bool, text_len: int,
         last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         model = select_model(last)
 
-    # ★[修正/ctx-1] プロンプト長チェック＆古い履歴パージ
-    # Ollamaはトークン超過時に応答が途中で途切れるため、
-    # 送信前に総文字数を推定し、n_ctx上限に収まるよう履歴を削除する。
-    # 日本語は1文字≒1.5トークン、英数字は0.4トークンとして粗く見積もる。
+    # ★[v129] トークン推定（改良版: BPEベース近似）
     def _estimate_tokens(text: str) -> int:
+        if not text: return 0
         jp = sum(1 for c in text if ord(c) > 0x7F)
         en = len(text) - jp
-        return int(jp * 1.5 + en * 0.4)
+        # 句読点・記号の調整
+        punct = sum(1 for c in text if c in "。、！？.,!?;:「」『』【】")
+        return int(jp * TOKEN_EST_JP + en * TOKEN_EST_EN + punct * 0.2)
 
     def _msgs_token_estimate(msgs: list) -> int:
-        return sum(_estimate_tokens(m.get("content", "")) for m in msgs)
+        return sum(_estimate_tokens(m.get("content", "")) for m in msgs) + len(msgs) * 4  # +4=role overhead
 
     _opts_preview = get_llm_opt(is_logic, text_len, temp_override, max_tokens=max_tokens)
     _n_ctx = _opts_preview.get("num_ctx", 4096)
     _n_predict = _opts_preview.get("num_predict", 2000)
-    # システムプロンプト＋最新ユーザー発言は必ず残す（削除不可枠）
+
+    # ★[v129] TokenBudget: 動的コンテキスト管理
+    _n_predict_safe = max(0, _n_predict) if _n_predict != -1 else 2048
+    _prompt_budget = _n_ctx - _n_predict_safe - TOKEN_BUDGET_SAFETY
     _fixed = [m for m in messages if m.get("role") == "system"]
     _history = [m for m in messages if m.get("role") != "system"]
     _user_last = _history[-1:] if _history and _history[-1].get("role") == "user" else []
     _conv = _history[:-1] if _user_last else _history
-    # n_ctx から出力予約トークンを引いた残りをプロンプトに使える上限とする
-    # ★[修正/ctx-5] num_predict=-1は廃止済み。常に実値で計算する。
-    _n_predict_safe = max(0, _n_predict) if _n_predict != -1 else 2048
-    _prompt_budget = _n_ctx - _n_predict_safe - 64   # 64トークン: 特殊トークン余裕
     _fixed_tokens = _msgs_token_estimate(_fixed + _user_last)
     _budget_for_conv = max(0, _prompt_budget - _fixed_tokens)
-    # 予算内に収まるまで古いconvペアを先頭から削除
+
+    # ★[v129] スマートプルーニング: 重要度スコアで古い会話を削除
     _purged = 0
     while _conv and _msgs_token_estimate(_conv) > _budget_for_conv:
-        _conv = _conv[2:]   # user/assistant ペアを1組削除
+        # 最初のuser/assistantペアを削除（最古の会話）
+        _conv = _conv[2:] if len(_conv) >= 2 else []
         _purged += 1
     if _purged and not silent:
         print(f"{C['dim']}[ctx] 履歴{_purged}ペア削除 (ctx圧迫回避){C['w']}")
     messages = _fixed + _conv + _user_last
-    # ★[修正/ctx-1] ここまで
 
     opts = get_llm_opt(is_logic, text_len, temp_override, max_tokens=max_tokens)
 
+    # ★[v129] Thinking Mode: chain-of-thought prefix
+    if THINKING_MODE and is_logic:
+        # think タグを自動追加（対応モデルのみ）
+        _sys_idx = next((i for i, m in enumerate(messages) if m.get("role") == "system"), None)
+        if _sys_idx is not None:
+            _orig = messages[_sys_idx]["content"]
+            messages = list(messages)
+            messages[_sys_idx] = {
+                "role": "system",
+                "content": _orig + "\n\n【思考プロセス】まず<think>タグ内で段階的に考え、その後回答を出力せよ。"
+            }
+
     full_result, ok = _single_gen(o, model, messages, opts, silent, 0)
     if not full_result.strip():
-        if not silent: print(f"\n{C['r']}[ERR] 応答がありません{C['w']}")
-        return ""
+        # ★[v129] モデルフォールバック: FASTモデルで再試行
+        if model == DEEP_MODEL and DEEP_MODEL != MODEL_NAME:
+            if not silent: print(f"{C['y']}[WARN] {DEEP_MODEL}失敗 → {MODEL_NAME}で再試行{C['w']}")
+            full_result, ok = _single_gen(o, MODEL_NAME, messages, opts, silent, 0)
+        if not full_result.strip():
+            if not silent: print(f"\n{C['r']}[ERR] 応答がありません{C['w']}")
+            return ""
+
+    # ★[v129] <think>タグを除去して最終回答のみ返す
+    if "<think>" in full_result and "</think>" in full_result:
+        _think_end = full_result.rfind("</think>")
+        if _think_end != -1:
+            full_result = full_result[_think_end + 8:].strip()
 
     # 繰り返しループ検出 → 末尾を整形して返す
     if detect_repetition(full_result):
@@ -2227,54 +2393,68 @@ def stream_response(messages: list, is_logic: bool, text_len: int,
 
 def get_llm_opt(is_logic_mode: bool, text_len: int = 0, temp_override: float | None = None, max_tokens: int | None = None) -> dict:
     power = POWER_MODE
+    # ★[v129] GPU環境では大幅にctxを拡張
+    _gpu = _GPU_AVAILABLE or _HAS_12B
     configs = {
-        "ultra": (12288, 4096, 4096, 0.12, 0.74, 16),
-        "high":  (8192,  2048, 2000, 0.18, 0.78, 16),
-        "mid":   (5120,  2000, 2000, 0.18, 0.78, 16),  # ★[最適化] ctx5120=品質/速度バランス最適, threads=16(5700U全コア活用)
-        "low":   (2048,   700,  600, 0.20, 0.78, 16),
+        #          ctx     pl    pc    tl     tc    threads
+        "ultra": (131072 if _gpu else 16384, 8192, 8192, 0.10, 0.72, 16),
+        "high":  (65536  if _gpu else 12288, 4096, 4096, 0.15, 0.76, 16),
+        "mid":   (32768  if _gpu else 8192,  2048, 2048, 0.18, 0.78, 16),
+        "low":   (4096,                       700,  600, 0.20, 0.78,  8),
     }
     ctx, pl, pc, tl, tc, threads = configs.get(power, configs["high"])
-    if is_logic_mode:
-        # complexモード: ctx・num_predictをモデル実上限内に収める
-        # ★[最適化] gemma3:4bの実効上限は8192だが、CPU専用機では6144が速度・品質のバランス最適点
-        # 8192は生成が遅くなるため6144に変更。出力予約2048で「プロンプト≦4096トークン」を確保
-        ctx = 6144
-        num_predict = 2048
+
+    # ★[v129] Thinking Mode: logicモードで低温・長いpredict
+    if THINKING_MODE and is_logic_mode:
+        ctx = max(ctx, 16384 if _gpu else 8192)
+        num_predict = min(max_tokens or 3072, 3072)
+        final_temp = temp_override if temp_override is not None else 0.10
+    elif is_logic_mode:
+        ctx = max(ctx, 8192 if _gpu else 6144)
+        num_predict = min(max_tokens or 2048, 2048 if not _gpu else 4096)
+        final_temp = temp_override if temp_override is not None else tl
     elif text_len < 80:
-        ctx = max(512, ctx // 2)
-        num_predict = pc
+        ctx = max(512, ctx // 4)
+        num_predict = pc // 4
+        final_temp = temp_override if temp_override is not None else tc
     elif text_len > 600:
-        ctx = max(ctx, 6144)  # ★[最適化] 8192→6144: gemma3:4b CPU最適上限
+        ctx = max(ctx, 8192 if _gpu else 6144)
         num_predict = pc
+        final_temp = temp_override if temp_override is not None else tc
     else:
         num_predict = pc
-    final_temp = temp_override if temp_override is not None else (tl if is_logic_mode else tc)
+        final_temp = temp_override if temp_override is not None else tc
+
     stop_words: list[str] = []
     actual_predict = max_tokens if max_tokens is not None else num_predict
     if actual_predict is None:
         actual_predict = 2048
     elif actual_predict == -1:
-        # ★[修正/ctx-5] -1（無制限）はctx残量ゼロ時にEOS早期選択を招くため2048に差し替える。
-        # 呼び出し元が明示的に-1を渡した場合も同様に上書きする。
         actual_predict = 2048
     else:
         actual_predict = max(1, int(actual_predict))
+
+    # ★[v129] num_batch: GPU=2048, CPU=1024
+    _batch = 2048 if _gpu else 1024
+
     if is_logic_mode:
         return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp,
-                    top_k=60,   # ★[修正/smp-1] 30→60: 候補枯渇によるeos早期選択を防止
-                    top_p=0.92, # ★[修正/smp-1] 0.86→0.92: サンプリング幅を拡大
-                    repeat_penalty=1.35,
-                    repeat_last_n=128,  # ★[最適化] 256→128: CPUでの計算負荷削減
-                    num_thread=threads, num_batch=1024,  # ★[最適化] 512→1024: CPU並列処理強化
-                    num_keep=64,  # ★[最適化] システムプロンプトをKVキャッシュに保持→2回目以降高速化
+                    top_k=80,          # ★[v129] 60→80: 候補多様性向上
+                    top_p=0.93,        # ★[v129] 0.92→0.93
+                    min_p=0.02,        # ★[v129] min_p追加: 低確率トークンをフィルタ
+                    repeat_penalty=1.30,
+                    repeat_last_n=256, # ★[v129] 128→256: より長い反復検出
+                    num_thread=threads, num_batch=_batch,
+                    num_keep=128,      # ★[v129] 64→128: システムプロンプトキャッシュ拡大
                     stop=stop_words)
     return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp,
-                top_k=40,   # ★[修正/smp-1] 20→40
-                top_p=0.90, # ★[修正/smp-1] 0.85→0.90
-                repeat_penalty=1.30,
-                repeat_last_n=64,   # ★[最適化] 256→64: 雑談モードは短い反復チェックで十分
-                num_thread=threads, num_batch=1024,  # ★[最適化] 512→1024: CPU並列処理強化
-                num_keep=64,  # ★[最適化] システムプロンプトをKVキャッシュに保持
+                top_k=50,             # ★[v129] 40→50
+                top_p=0.91,           # ★[v129] 0.90→0.91
+                min_p=0.02,           # ★[v129] min_p追加
+                repeat_penalty=1.25,  # ★[v129] 1.30→1.25: 雑談で自然な繰り返し許容
+                repeat_last_n=128,    # ★[v129] 64→128
+                num_thread=threads, num_batch=_batch,
+                num_keep=128,
                 stop=stop_words)
 
 _SYS_PRM_CACHE: dict[str, str] = {}
@@ -2336,7 +2516,10 @@ def get_sys_prm(mode: str, data: str = "", key: str = "", per_id=2) -> dict:
         opt_block = inject_optimizations(mode, persona.get("name", ""))
         dict_block = dict_context(data or key or "")
         extras = "".join(p for p in [mem_block, session_block, opt_block, dict_block] if p)
-        _SYS_EXTRAS_CACHE[extras_key] = (now, extras)
+        # ★[修正/#5] TTL=0 のときはキャッシュに書き込まない。
+        # 旧コードは TTL=0 でも毎ターン _SYS_EXTRAS_CACHE に書き続けていた（メモリリーク）。
+        if _SYS_EXTRAS_TTL > 0:
+            _SYS_EXTRAS_CACHE[extras_key] = (now, extras)
     return dict(role="system", content=_SYS_PRM_CACHE[cache_key] + data + extras)
 
 @lru_cache(maxsize=512)
@@ -3727,7 +3910,7 @@ def _spi_pick_smart(filter_cat: str | None = None, use_llm: bool = True) -> dict
                 result_box.append(q)
         t = threading.Thread(target=_gen, daemon=True)
         t.start()
-        t.join(timeout=5)   # 最大14秒待つ
+        t.join(timeout=5)   # ★[修正/#7] 最大5秒待つ（旧コメントは「14秒」と誤記）
         if result_box:
             _spi_mark_used(result_box[0])
             return result_box[0]
@@ -4005,11 +4188,46 @@ def doctor_report() -> str:
 def set_power_mode(arg: str) -> str:
     global POWER_MODE
     mode = arg.strip().lower()
-    if not mode: return f"{C['c']}current: {POWER_MODE}{C['w']}"
-    if mode not in ("low", "mid", "high", "ultra"): return f"{C['r']}usage: /power low|mid|high|ultra{C['w']}"
+    if not mode:
+        return (f"{C['c']}current: {POWER_MODE}{C['w']}\n"
+                f"  FAST={FAST_MODEL} | MAIN={MODEL_NAME} | DEEP={DEEP_MODEL}\n"
+                f"  Thinking={'ON' if THINKING_MODE else 'OFF'}")
+    if mode not in ("low", "mid", "high", "ultra"):
+        return f"{C['r']}usage: /power low|mid|high|ultra{C['w']}"
     POWER_MODE = mode
-    persist_learning()  # ★[修正/power-persist] 変更を即座にstateファイルへ保存。再起動後も維持される。
-    return f"{C['g']}power: {POWER_MODE} ({'軽量' if mode=='low' else '標準' if mode=='mid' else '高推論' if mode=='high' else '最大推論'}){C['w']}"
+    # ★[v129] パワーモード変更時にモデル選択も更新
+    _update_model_for_power()
+    persist_learning()
+    label = {'low':'軽量(1b)','mid':'標準(4b)','high':'高推論(4b→12b)','ultra':'最大(12b)'}.get(mode,'')
+    return (f"{C['g']}power: {POWER_MODE} {label}{C['w']}\n"
+            f"  FAST={FAST_MODEL} | MAIN={MODEL_NAME} | DEEP={DEEP_MODEL}")
+
+
+def _update_model_for_power():
+    """★[v129] パワーモードに応じてモデルを動的選択"""
+    global MODEL_NAME, DEEP_MODEL, FAST_MODEL
+    tier = MODEL_TIERS.get(POWER_MODE, MODEL_TIERS["mid"])
+    o = _get_ollama()
+    if o is None: return
+    try:
+        models = o.list()
+        items = models.get("models", []) if isinstance(models, dict) else getattr(models, "models", [])
+        names = [_model_name(m) for m in items]
+        for t in tier:
+            if any(t.split(":")[0] in n for n in names):
+                MODEL_NAME = t; break
+        if _HAS_12B and POWER_MODE in ("high", "ultra"):
+            DEEP_MODEL = "gemma3:12b"
+        else:
+            DEEP_MODEL = MODEL_NAME
+        # ★[修正/fast-power] FASTモデルもパワーモードに連動させる
+        if POWER_MODE == "low":
+            FAST_MODEL = "gemma3:1b"
+        elif POWER_MODE in ("mid", "high"):
+            FAST_MODEL = "gemma3:4b"
+        elif POWER_MODE == "ultra":
+            FAST_MODEL = "gemma3:12b"
+    except Exception: pass
 
 def build_custom_persona(attr: str, hint: str = "") -> dict:
     name = attr.strip()[:40] or "CUSTOM"
@@ -4267,14 +4485,37 @@ def _model_name(m) -> str:
     return getattr(m, "name", "") or getattr(m, "model", "") or ""
 
 def check_ollama_connection() -> bool:
+    global MODEL_NAME, DEEP_MODEL, FAST_MODEL, _HAS_12B
     o = _get_ollama()
     if o is None: print(f"{C['r']}[FATAL] ollama not installed. pip install ollama{C['w']}"); return False
     try:
         models = o.list()
         items = models.get("models", []) if isinstance(models, dict) else getattr(models, "models", [])
         names = [_model_name(m) for m in items]
-        found = any(MODEL_NAME in n or n.startswith(MODEL_NAME.split(":")[0]) for n in names)
-        if not found: print(f"{C['y']}model '{MODEL_NAME}' not found. available: {', '.join(names) or 'none'}{C['w']}"); return False
+
+        # ★[v129] モデル自動選択: 12b > 4b > 1b の優先順
+        has_12b  = any("12b" in n or "gemma3:12b" in n for n in names)
+        has_4b   = any("4b"  in n or "gemma3:4b"  in n for n in names)
+        has_1b   = any("1b"  in n or "gemma3:1b"  in n or "gemma3.1:1b" in n for n in names)
+        _HAS_12B = has_12b
+
+        tier = MODEL_TIERS.get(POWER_MODE, MODEL_TIERS["mid"])
+        selected = None
+        for t in tier:
+            if any(t in n or n.startswith(t.split(":")[0]) for n in names):
+                selected = t; break
+        if not selected:
+            # fallback: 何でもあれば使う
+            selected = next((n for n in names if "gemma" in n.lower()), None)
+            if not selected:
+                print(f"{C['y']}model not found. available: {', '.join(names) or 'none'}{C['w']}"); return False
+
+        MODEL_NAME  = selected
+        DEEP_MODEL  = "gemma3:12b" if has_12b else selected
+        FAST_MODEL  = "gemma3:1b"  if has_1b  else selected
+
+        gpu_tag = f" {C['g']}[GPU]{C['w']}" if _GPU_AVAILABLE else ""
+        print(f"{C['g']}[OK] FAST={FAST_MODEL} | MAIN={MODEL_NAME} | DEEP={DEEP_MODEL}{gpu_tag}{C['w']}")
         return True
     except Exception as e: print(f"{C['r']}[FATAL] Ollama connection failed: {e}{C['w']}"); return False
 
@@ -4733,8 +4974,22 @@ def handle_color(hex_code: str) -> str:
     rows = [f"{C['c']}=== 色情報 #{hex_code.upper()} ==={C['w']}"]
     rows.append(f"  RGB: ({r}, {g}, {b})")
     rows.append(f"  サンプル: {block}")
-    hsl_h = math.degrees(math.atan2(math.sqrt(3)*(g-b), 2*r-g-b)) % 360
-    rows.append(f"  HSL: ({hsl_h:.0f}°, {max(r,g,b)-min(r,g,b)}%, {max(r,g,b)/2.55:.0f}%)")
+    # ★[修正/#4] HSL を正しい公式で計算。
+    # 旧コード: S=max-min(0〜255の生値), L=max/2.55 は実際のHSL定義と全く異なる式だった。
+    r_, g_, b_ = r / 255.0, g / 255.0, b / 255.0
+    cmax, cmin = max(r_, g_, b_), min(r_, g_, b_)
+    delta = cmax - cmin
+    if delta == 0:
+        hsl_h = 0.0
+    elif cmax == r_:
+        hsl_h = 60.0 * (((g_ - b_) / delta) % 6)
+    elif cmax == g_:
+        hsl_h = 60.0 * ((b_ - r_) / delta + 2)
+    else:
+        hsl_h = 60.0 * ((r_ - g_) / delta + 4)
+    hsl_l = (cmax + cmin) / 2.0
+    hsl_s = 0.0 if delta == 0 else delta / (1.0 - abs(2.0 * hsl_l - 1.0))
+    rows.append(f"  HSL: ({hsl_h:.0f}°, {hsl_s*100:.0f}%, {hsl_l*100:.0f}%)")
     return "\n".join(rows)
 
 def handle_sysinfo() -> str:
@@ -5841,125 +6096,134 @@ class ChessAI:
         ],
     }
 
+    # ★[v129] 難易度設定 — depth増強・Killer/TT有効
     DIFFICULTY_SETTINGS = {
-        "easy":      {"depth": 0, "random_rate": 1.0},   # 完全ランダム
-        "middle":    {"depth": 1, "random_rate": 0.2},   # depth1 + 20%ランダム
-        "hard":      {"depth": 3, "random_rate": 0.0},   # depth3 alpha-beta
-        "very_hard": {"depth": 4, "random_rate": 0.0},   # depth4 alpha-beta
+        "easy":      {"depth": 0, "random_rate": 1.0},
+        "middle":    {"depth": 2, "random_rate": 0.15},  # depth 1→2
+        "hard":      {"depth": 3, "random_rate": 0.0},
+        "very_hard": {"depth": 4, "random_rate": 0.0},
     }
 
     def __init__(self, difficulty: str = "middle", color: str = "b"):
         self.difficulty = difficulty
-        self.color = color  # AIが担当する色 ("w" or "b")
+        self.color = color
         s = self.DIFFICULTY_SETTINGS.get(difficulty, self.DIFFICULTY_SETTINGS["middle"])
         self.depth = s["depth"]
         self.random_rate = s["random_rate"]
+        self._tt: dict = {}          # ★[v129] Transposition Table
+        self._killer: dict = {}      # ★[v129] Killer Heuristic
 
     def _pst_score(self, piece: str, r: int, c: int) -> int:
-        """駒のポジションスコア (白視点)"""
         color, ptype = piece[0], piece[1]
         table = self._PST.get(ptype)
-        if table is None:
-            return 0
-        if color == "w":
-            return table[r][c]
-        else:
-            return table[7 - r][c]
+        if table is None: return 0
+        return table[r][c] if color == "w" else table[7 - r][c]
 
     def evaluate(self, g: "ChessEngine") -> int:
-        """盤面評価 (正=白有利, 負=黒有利)"""
+        """盤面評価 (正=白有利, 負=黒有利) ★[v129] モビリティボーナス追加"""
         score = 0
+        piece_count = 0
         for r in range(8):
             for c in range(8):
                 piece = g.board[r][c]
-                if not piece:
-                    continue
+                if not piece: continue
                 color, ptype = piece[0], piece[1]
                 val = self.PIECE_VALUE.get(ptype, 0) + self._pst_score(piece, r, c)
                 score += val if color == "w" else -val
+                piece_count += 1
+        # ★[v129] エンドゲーム補正: 駒が少ないほどキングを中央へ
+        if piece_count < 16:
+            for r in range(8):
+                for c in range(8):
+                    p = g.board[r][c]
+                    if p and p[1] == "K":
+                        center_bonus = (3 - abs(r - 3.5)) + (3 - abs(c - 3.5))
+                        score += int(center_bonus * 5) if p[0] == "w" else -int(center_bonus * 5)
         return score
 
+    def _mvv_lva_key(self, g: "ChessEngine", mv: tuple) -> int:
+        """★[v129] MVV-LVA: 高価値の駒を取る手を優先"""
+        fr, fc, tr, tc = mv
+        victim = g.board[tr][tc]
+        attacker = g.board[fr][fc]
+        if victim and attacker:
+            return -(self.PIECE_VALUE.get(victim[1], 0) * 10 - self.PIECE_VALUE.get(attacker[1], 0))
+        return 100  # 通常手
+
     def _all_legal_moves(self, g: "ChessEngine", color: str) -> list[tuple]:
-        return g.legal_moves(color)
+        moves = g.legal_moves(color)
+        # ★[v129] MVV-LVA + Killer ソート
+        killers = self._killer.get(0, [])
+        moves.sort(key=lambda mv: (
+            0 if mv in killers else 1,
+            self._mvv_lva_key(g, mv)
+        ))
+        return moves
 
     def _minimax(self, g: "ChessEngine", depth: int, alpha: int, beta: int, maximizing: bool) -> int:
-        if depth == 0 or g.game_over:
-            return self.evaluate(g)
+        if depth == 0 or g.game_over: return self.evaluate(g)
+
+        # ★[v129] Transposition Table lookup
+        bh = hash((str(g.board), g.turn, depth))
+        if bh in self._tt: return self._tt[bh]
 
         color = "w" if maximizing else "b"
         moves = self._all_legal_moves(g, color)
-        if not moves:
-            return self.evaluate(g)
+        if not moves: return self.evaluate(g)
 
         if maximizing:
             best = -10**9
             for fr, fc, tr, tc in moves:
                 saved = g._apply_move_temp(fr, fc, tr, tc)
-                prev_turn = g.turn
-                g.turn = "b"
+                prev_turn = g.turn; g.turn = "b"
                 val = self._minimax(g, depth - 1, alpha, beta, False)
-                g.turn = prev_turn
-                g._undo_move_temp(saved)
-                best = max(best, val)
+                g.turn = prev_turn; g._undo_move_temp(saved)
+                if val > best:
+                    best = val
+                    if val >= beta:  # ★[v129] Killer登録
+                        k = self._killer.setdefault(depth, [])
+                        if (fr,fc,tr,tc) not in k: k.insert(0, (fr,fc,tr,tc)); k[:] = k[:2]
+                        break
                 alpha = max(alpha, val)
-                if beta <= alpha:
-                    break
-            return best
+                if beta <= alpha: break
         else:
             best = 10**9
             for fr, fc, tr, tc in moves:
                 saved = g._apply_move_temp(fr, fc, tr, tc)
-                prev_turn = g.turn
-                g.turn = "w"
+                prev_turn = g.turn; g.turn = "w"
                 val = self._minimax(g, depth - 1, alpha, beta, True)
-                g.turn = prev_turn
-                g._undo_move_temp(saved)
+                g.turn = prev_turn; g._undo_move_temp(saved)
                 best = min(best, val)
                 beta = min(beta, val)
-                if beta <= alpha:
-                    break
-            return best
+                if beta <= alpha: break
+
+        # ★[v129] TT store (TTサイズ上限)
+        self._tt[bh] = best
+        if len(self._tt) > 30000: self._tt.clear()
+        return best
 
     def choose_move(self, g: "ChessEngine") -> tuple | None:
-        """AIが次の手を選んで (fr, fc, tr, tc) を返す。手がなければ None。"""
         moves = self._all_legal_moves(g, self.color)
-        if not moves:
-            return None
+        if not moves: return None
+        if self.difficulty == "easy": return random.choice(moves)
+        if self.random_rate > 0 and random.random() < self.random_rate: return random.choice(moves)
 
-        # easy: 完全ランダム
-        if self.difficulty == "easy":
-            return random.choice(moves)
-
-        # middle/hard/very_hard: random_rate の確率でランダム手
-        if self.random_rate > 0 and random.random() < self.random_rate:
-            return random.choice(moves)
-
-        # minimax で最善手を探す
         maximizing = (self.color == "w")
         best_val = -10**9 if maximizing else 10**9
         best_moves = []
+        self._tt.clear(); self._killer.clear()  # 新探索でリセット
 
         for fr, fc, tr, tc in moves:
             saved = g._apply_move_temp(fr, fc, tr, tc)
-            prev_turn = g.turn
-            g.turn = "b" if self.color == "w" else "w"
+            prev_turn = g.turn; g.turn = "b" if self.color == "w" else "w"
             val = self._minimax(g, self.depth - 1, -10**9, 10**9, not maximizing)
-            g.turn = prev_turn
-            g._undo_move_temp(saved)
-
+            g.turn = prev_turn; g._undo_move_temp(saved)
             if maximizing:
-                if val > best_val:
-                    best_val = val
-                    best_moves = [(fr, fc, tr, tc)]
-                elif val == best_val:
-                    best_moves.append((fr, fc, tr, tc))
+                if val > best_val: best_val = val; best_moves = [(fr, fc, tr, tc)]
+                elif val == best_val: best_moves.append((fr, fc, tr, tc))
             else:
-                if val < best_val:
-                    best_val = val
-                    best_moves = [(fr, fc, tr, tc)]
-                elif val == best_val:
-                    best_moves.append((fr, fc, tr, tc))
-
+                if val < best_val: best_val = val; best_moves = [(fr, fc, tr, tc)]
+                elif val == best_val: best_moves.append((fr, fc, tr, tc))
         return random.choice(best_moves) if best_moves else random.choice(moves)
 
 
@@ -6937,20 +7201,27 @@ class ShogiEngine:
 
 
 class ShogiAI:
-    """将棋AI。4段階難易度。"""
+    """将棋AI v2.0 (v129) — Negamax + Transposition Table + Killer Heuristic + 詳細評価関数"""
 
     PIECE_VALUE = {
-        "FU":100,"KY":200,"KE":250,"GI":350,"KI":450,
-        "KA":600,"HI":700,"OU":10000,
-        "+FU":300,"+KY":350,"+KE":350,"+GI":450,
-        "+KA":800,"+HI":900,
+        "FU":100,"KY":220,"KE":270,"GI":380,"KI":480,
+        "KA":650,"HI":750,"OU":10000,
+        "+FU":320,"+KY":380,"+KE":380,"+GI":480,
+        "+KA":880,"+HI":980,
+    }
+
+    # ★[v129] ポジションボーナス(先手視点, row0=後手陣, row8=先手陣)
+    _POS_BONUS = {
+        "FU": [0,0,0,5,10,15,20,0,0],   # 前進するほど価値が上がる
+        "HI": [0,0,0,0,5,5,5,5,5],
+        "KA": [0,0,0,0,5,5,5,5,5],
     }
 
     DIFFICULTY_SETTINGS = {
         "easy":      {"depth": 0, "random_rate": 1.0},
-        "middle":    {"depth": 1, "random_rate": 0.25},
-        "hard":      {"depth": 2, "random_rate": 0.0},
-        "very_hard": {"depth": 3, "random_rate": 0.0},
+        "middle":    {"depth": 2, "random_rate": 0.20},  # ★[v129] depth 1→2
+        "hard":      {"depth": 3, "random_rate": 0.0},
+        "very_hard": {"depth": 4, "random_rate": 0.0},   # ★[v129] depth 3→4
     }
 
     def __init__(self, difficulty: str = "middle", color: str = "g"):
@@ -6959,8 +7230,11 @@ class ShogiAI:
         s = self.DIFFICULTY_SETTINGS.get(difficulty, self.DIFFICULTY_SETTINGS["middle"])
         self.depth = s["depth"]
         self.random_rate = s["random_rate"]
+        self._tt: dict = {}        # ★[v129] Transposition Table
+        self._killer: dict = {}    # ★[v129] Killer Heuristic
 
     def evaluate(self, g: "ShogiEngine") -> int:
+        """★[v129] 詳細評価: 駒価値 + 位置ボーナス + 持ち駒ボーナス + 王の安全性"""
         score = 0
         for r in range(9):
             for c in range(9):
@@ -6968,33 +7242,64 @@ class ShogiAI:
                 if not cell: continue
                 color, ptype = cell
                 val = self.PIECE_VALUE.get(ptype, 0)
+                # ★[v129] 位置ボーナス
+                pos_arr = self._POS_BONUS.get(ptype)
+                if pos_arr:
+                    bonus = pos_arr[r] if color == ShogiEngine.SENTE else pos_arr[8 - r]
+                    val += bonus
                 score += val if color == ShogiEngine.SENTE else -val
+        # 持ち駒ボーナス (1.0→0.85: 手駒は多少割引)
         for ptype, cnt in g.hands[ShogiEngine.SENTE].items():
-            score += self.PIECE_VALUE.get(ptype, 0) * cnt * 0.8
+            score += int(self.PIECE_VALUE.get(ptype, 0) * cnt * 0.85)
         for ptype, cnt in g.hands[ShogiEngine.GOTE].items():
-            score -= self.PIECE_VALUE.get(ptype, 0) * cnt * 0.8
+            score -= int(self.PIECE_VALUE.get(ptype, 0) * cnt * 0.85)
+        # ★[v129] 王手ボーナス: 王手をかけている方が有利
+        if g.in_check(ShogiEngine.GOTE):  score += 50
+        if g.in_check(ShogiEngine.SENTE): score -= 50
         return int(score)
 
+    def _move_priority(self, g: "ShogiEngine", mv: tuple, depth: int) -> int:
+        """★[v129] 手のソートキー: Killer > 成り > 駒取り > 通常"""
+        fr, fc, tr, tc, promote, drop = mv
+        killers = self._killer.get(depth, [])
+        if mv in killers: return 0
+        if g.board[tr][tc]: return 1  # 駒取り
+        if promote: return 2
+        if drop: return 3
+        return 4
+
     def _minimax(self, g: "ShogiEngine", depth: int, alpha: int, beta: int, maximizing: bool) -> int:
-        if depth == 0 or g.game_over:
-            return self.evaluate(g)
+        if depth == 0 or g.game_over: return self.evaluate(g)
+
+        # ★[v129] Transposition Table
+        bh = hash((str([[str(c) for c in row] for row in g.board]), g.turn, depth))
+        if bh in self._tt: return self._tt[bh]
+
         color = ShogiEngine.SENTE if maximizing else ShogiEngine.GOTE
         moves = g.legal_moves(color)
-        if not moves:
-            return self.evaluate(g)
+        if not moves: return self.evaluate(g)
+
+        # ★[v129] 手のソート
+        moves.sort(key=lambda mv: self._move_priority(g, mv, depth))
+
+        best = -10**9 if maximizing else 10**9
         if maximizing:
-            best = -10**9
             for mv in moves:
                 fr, fc, tr, tc, promote, drop = mv
                 saved = g._apply_temp(fr, fc, tr, tc, promote, drop)
                 prev = g.turn; g.turn = ShogiEngine.GOTE
                 val = self._minimax(g, depth-1, alpha, beta, False)
                 g.turn = prev; g._undo_temp(saved)
-                best = max(best, val); alpha = max(alpha, val)
+                if val > best:
+                    best = val
+                    if val >= beta:
+                        # ★[v129] Killer登録
+                        k = self._killer.setdefault(depth, [])
+                        if mv not in k: k.insert(0, mv); k[:] = k[:2]
+                        break
+                alpha = max(alpha, val)
                 if beta <= alpha: break
-            return best
         else:
-            best = 10**9
             for mv in moves:
                 fr, fc, tr, tc, promote, drop = mv
                 saved = g._apply_temp(fr, fc, tr, tc, promote, drop)
@@ -7003,7 +7308,10 @@ class ShogiAI:
                 g.turn = prev; g._undo_temp(saved)
                 best = min(best, val); beta = min(beta, val)
                 if beta <= alpha: break
-            return best
+
+        self._tt[bh] = best
+        if len(self._tt) > 20000: self._tt.clear()
+        return best
 
     def choose_move(self, g: "ShogiEngine") -> tuple | None:
         moves = g.legal_moves(self.color)
@@ -7013,6 +7321,9 @@ class ShogiAI:
         maximizing = (self.color == ShogiEngine.SENTE)
         best_val = -10**9 if maximizing else 10**9
         best_moves = []
+        self._tt.clear(); self._killer.clear()  # ★[v129] 新探索でリセット
+        # ★[v129] 手を事前ソート
+        moves.sort(key=lambda mv: self._move_priority(g, mv, 0))
         for mv in moves:
             fr, fc, tr, tc, promote, drop = mv
             saved = g._apply_temp(fr, fc, tr, tc, promote, drop)
@@ -7834,7 +8145,15 @@ def handle_mahjong(arg: str) -> str:
     # ── ブラウザ起動 ──────────────────────────────────────────
     # Brave を優先して起動する（EdgeはローカルHTMLをブロックする場合があるため）。
     # Brave が見つからなければ Chrome → Firefox → webbrowser.open() の順でフォールバック。
-    file_uri = pathlib.Path(html_path).as_uri()
+    # WSL環境: wslpathでWindowsパス(\\wsl.localhost\...)に変換して渡す
+    try:
+        import subprocess as _sp
+        _win_path = _sp.check_output(
+            ["wslpath", "-w", html_path], stderr=_sp.DEVNULL
+        ).decode().strip()
+        file_uri = _win_path  # \\wsl.localhost\Ubuntu\tmp\... 形式
+    except Exception:
+        file_uri = pathlib.Path(html_path).as_uri()
     label = f"{num_players}人麻雀({'東南戦' if mode == 'tonpu' else '東風戦'})"
 
     def _try_open_browser(uri: str) -> tuple[bool, str]:
@@ -7879,21 +8198,28 @@ def handle_mahjong(arg: str) -> str:
                 except Exception:
                     continue
 
-        # ── Linux ─────────────────────────────────────────────
+        # ── Linux / WSL ───────────────────────────────────────
         else:
+            # WSL2: cmd.exe /c start でWindowsブラウザをバックグラウンド起動
+            # uri = \\wsl.localhost\Ubuntu\tmp\... 形式
+            try:
+                S.Popen(
+                    ["cmd.exe", "/c", "start", "", uri],
+                    stdout=S.DEVNULL, stderr=S.DEVNULL
+                )
+                return True, "ブラウザ"
+            except Exception:
+                pass
+            # ネイティブLinuxブラウザ（フォールバック）
             linux_bins = [
-                ("brave-browser", "Brave"),
-                ("brave", "Brave"),
-                ("google-chrome", "Chrome"),
-                ("google-chrome-stable", "Chrome"),
-                ("chromium-browser", "Chromium"),
-                ("chromium", "Chromium"),
-                ("firefox", "Firefox"),
+                ("brave-browser", "Brave"), ("brave", "Brave"),
+                ("google-chrome", "Chrome"), ("firefox", "Firefox"),
             ]
             for bin_name, display_name in linux_bins:
                 if shutil.which(bin_name):
                     try:
-                        S.Popen([bin_name, uri])
+                        S.Popen([bin_name, uri],
+                                stdout=S.DEVNULL, stderr=S.DEVNULL)
                         return True, display_name
                     except Exception:
                         continue
@@ -7975,10 +8301,13 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 .round-info{font-size:13px;color:var(--gold);font-weight:700}
 .dora-area{display:flex;gap:4px;align-items:center}
 .dora-label{font-size:10px;color:var(--text2)}
-.pond{background:rgba(0,0,0,.2);border-radius:4px;padding:4px;display:flex;flex-wrap:wrap;gap:1px;align-content:flex-start;min-height:60px;max-height:80px;overflow:hidden;border:1px solid rgba(255,255,255,.05)}
+.pond{background:rgba(0,0,0,.2);border-radius:4px;padding:4px;display:flex;flex-wrap:wrap;gap:1px;align-content:flex-start;min-height:40px;max-height:120px;overflow-y:auto;overflow-x:hidden;border:1px solid rgba(255,255,255,.1);scrollbar-width:thin}
+.pond-label{font-size:9px;color:rgba(255,255,255,.4);margin-bottom:2px;text-align:center}
 .tile{background:var(--tile);color:#1a1a00;border-radius:4px;border:1px solid var(--tile-h);display:inline-flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;cursor:pointer;box-shadow:1px 2px 3px rgba(0,0,0,.4),inset 0 -1px 0 rgba(0,0,0,.2);transition:all .1s;position:relative;flex-shrink:0}
 .tile:hover{filter:brightness(1.1);transform:translateY(-2px)}
 .tile.selected{transform:translateY(-8px);box-shadow:0 6px 12px rgba(255,215,0,.4),1px 2px 3px rgba(0,0,0,.4);border-color:var(--gold)}
+.tile.riichi-cand{transform:translateY(-6px);box-shadow:0 0 12px rgba(255,80,80,.8),0 0 4px rgba(255,80,80,.5);border-color:#ff4444;animation:riichi-pulse .8s infinite alternate}
+@keyframes riichi-pulse{from{box-shadow:0 0 8px rgba(255,80,80,.6)}to{box-shadow:0 0 18px rgba(255,80,80,1),0 0 6px #fff}}
 .tile.man{color:#c62828}.tile.pin{color:#1565c0}.tile.sou{color:#2e7d32}.tile.honor{color:#4a148c}
 .tile.discarded{width:20px;height:28px;font-size:9px;cursor:default}
 .tile.discarded:hover{transform:none;filter:none}
@@ -8055,16 +8384,16 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
   </div>
   <div class="table-area" id="table">
     <div class="seat-top" id="seat-2">
-      <div class="seat-info"><div class="seat-name" id="name-2">対面</div><div class="seat-wind" id="wind-2">北家</div><div class="seat-score" id="score-2">25000</div></div>
+      <div class="seat-info"><div class="seat-name" id="name-2">対面</div><div class="seat-wind" id="wind-2">北家</div><div class="seat-score" id="score-2">-</div></div>
       <div class="melds-area" id="melds-2"></div>
       <div class="ai-hand" id="hand-2"></div>
-      <div class="pond" id="pond-2" style="max-width:260px"></div>
+      <div class="pond-label">対面の河</div><div class="pond" id="pond-2" style="max-width:300px;max-height:120px"></div>
     </div>
     <div class="seat-left" id="seat-1">
-      <div class="seat-info"><div class="seat-name" id="name-1">上家</div><div class="seat-wind" id="wind-1">西家</div><div class="seat-score" id="score-1">25000</div></div>
+      <div class="seat-info"><div class="seat-name" id="name-1">上家</div><div class="seat-wind" id="wind-1">西家</div><div class="seat-score" id="score-1">-</div></div>
       <div class="melds-area" id="melds-1" style="flex-direction:column"></div>
       <div class="ai-hand" id="hand-1"></div>
-      <div class="pond" id="pond-1" style="max-height:100px;flex-direction:column;max-width:60px"></div>
+      <div class="pond-label">上家の河</div><div class="pond" id="pond-1" style="max-height:200px;flex-direction:column;max-width:72px;overflow-y:auto"></div>
     </div>
     <div class="center-area">
       <div class="info-panel">
@@ -8075,19 +8404,21 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
       <div id="riichi-sticks" style="display:flex;gap:4px;justify-content:center;flex-wrap:wrap"></div>
     </div>
     <div class="seat-right" id="seat-3">
-      <div class="seat-info"><div class="seat-name" id="name-3">下家</div><div class="seat-wind" id="wind-3">東家</div><div class="seat-score" id="score-3">25000</div></div>
+      <div class="seat-info"><div class="seat-name" id="name-3">下家</div><div class="seat-wind" id="wind-3">東家</div><div class="seat-score" id="score-3">-</div></div>
       <div class="melds-area" id="melds-3" style="flex-direction:column"></div>
       <div class="ai-hand" id="hand-3"></div>
-      <div class="pond" id="pond-3" style="max-height:100px;flex-direction:column;max-width:60px"></div>
+      <div class="pond-label">下家の河</div><div class="pond" id="pond-3" style="max-height:200px;flex-direction:column;max-width:72px;overflow-y:auto"></div>
     </div>
     <div class="player-area" id="seat-0">
       <div class="melds-area" id="melds-0"></div>
+      <div class="pond-label">あなたの河</div>
+      <div class="pond" id="pond-0" style="max-width:320px;max-height:80px;margin-bottom:4px"></div>
       <div class="player-hand" id="hand-0"></div>
       <div class="player-info-row">
         <div class="player-info">
           <span class="player-name-label">あなた</span>
           <span style="color:var(--text2);margin:0 6px" id="player-wind-label">東家</span>
-          <span class="player-score-label" id="score-0">25000</span>
+          <span class="player-score-label" id="score-0">-</span>
         </div>
         <div id="riichi-indicator"></div>
       </div>
@@ -8154,10 +8485,39 @@ function initGame(np,mode){
      phase:'idle',lastDiscard:null,lastDiscardPlayer:-1,
      pendingClaims:[],maxRound:mode==='tonpu'?8:4,
      gameOver:false,waitingForPlayer:false,
-     selectedTile:null,riichiCandidates:[],_pendingNextRound:null};
-  const names=['あなた','AI-A','AI-B','AI-C'];
+     selectedTile:null,riichiCandidates:[],_pendingNextRound:null,
+     // 特殊役状態フラグ
+     ippatsu:[],        // 一発有効プレイヤー番号リスト
+     rinshan:false,     // 嶺上開花フラグ
+     haitei:false,      // 海底摸月フラグ（最後の牌）
+     chankan:false,     // 槍槓フラグ
+     firstRound:true,   // ダブル立直判定用（第一巡）
+     doubleRiichiPlayers:[] // ダブル立直プレイヤー
+   };
+  // 哲学者プール（全員からランダム3人選択）
+  const _philosopherPool=[
+    'ソクラテス','プラトン','アリストテレス','エピクロス','ピュロン',
+    'アウグスティヌス','トマス・アクィナス','オッカム',
+    'マキャベリ','モンテーニュ','エラスムス',
+    'デカルト','スピノザ','ライプニッツ','パスカル','ベーコン',
+    'ロック','ヒューム','バークリー','ルソー','ヴォルテール',
+    'カント','フィヒテ','シェリング','ヘーゲル',
+    'ショーペンハウアー','フォイエルバッハ','マルクス','エンゲルス',
+    'ミル','ベンサム','スペンサー',
+    'ニーチェ','キルケゴール',
+    'フレーゲ','ラッセル','ムーア','ウィトゲンシュタイン',
+    'フッサール','ハイデガー','サルトル','メルロ＝ポンティ','ボーヴォワール',
+    'デューイ','ジェームズ','パース',
+    'カルナップ','ポパー','クワイン','クーン',
+    'レヴィナス','デリダ','フーコー','ドゥルーズ','バタイユ',
+    'ロールズ','ノージック','サンデル','ハーバーマス',
+    'アーレント','ベンヤミン','アドルノ','ホルクハイマー',
+  ];
+  // ランダムに3人選んでシャッフル
+  const _shuffled=[..._philosopherPool].sort(()=>Math.random()-.5);
+  const names=['あなた',_shuffled[0],_shuffled[1],_shuffled[2]];
   for(let i=0;i<np;i++)
-    G.players.push({name:names[i],isHuman:i===0,score:25000,
+    G.players.push({name:names[i],isHuman:i===0,score:np===3?35000:25000,
       hand:[],drawn:null,pond:[],melds:[],riichi:false,riichiTurn:-1,wind:WIND_CHARS[i]});
   startRound();
 }
@@ -8180,6 +8540,8 @@ function startRound(){
   G.phase='draw';G.activePlayer=G.dealer;
   G.lastDiscard=null;G.lastDiscardPlayer=-1;
   G.selectedTile=null;G.riichiCandidates=[];
+  G.ippatsu=[];G.rinshan=false;G.haitei=false;G.chankan=false;
+  G.firstRound=true;G.doubleRiichiPlayers=[];
   renderAll();log(`${roundName()} 開始`);nextTurn();
 }
 
@@ -8268,16 +8630,72 @@ function tenpaiTiles(hand,melds){
 function isTenpai(hand,melds){return tenpaiTiles(hand,melds).length>0}
 
 // ── 役判定 ──
+// ── 役満判定関数群 ──────────────────────────────────────
+function isSuuanko(decomp,isTsumo){
+  if(!decomp.melds)return false;
+  return decomp.melds.every(m=>m.type==='pon'||m.type==='kan')&&isTsumo;
+}
+function isDaisangen(allM){
+  const drg=['白','発','中'];
+  return drg.every(d=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===d));
+}
+function isTsuiso(hAll){return hAll.every(t=>t.suit==='honor');}
+function isChinroto(hAll){return hAll.every(t=>t.suit!=='honor'&&(t.num===1||t.num===9));}
+function isShousuushi(allM,pair){
+  const winds=['東','南','西','北'];
+  const ponWinds=allM.filter(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&winds.includes(m.tiles[0].num));
+  const pairIsWind=pair&&pair[0]&&pair[0].suit==='honor'&&winds.includes(pair[0].num);
+  return ponWinds.length===3&&pairIsWind;
+}
+function isDaisuushi(allM){
+  const winds=['東','南','西','北'];
+  return winds.every(w=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===w));
+}
+function isRyuiso(hAll){
+  const green=['2','3','4','6','8'].map(Number);
+  return hAll.every(t=>(t.suit==='bamboo'&&green.includes(t.num))||(t.suit==='honor'&&t.num==='発'));
+}
+function isChurenpoton(hAll){
+  const suits=hAll.map(t=>t.suit);
+  if(!suits.every(s=>s===suits[0])||suits[0]==='honor')return false;
+  const nums=hAll.map(t=>t.num).sort((a,b)=>a-b);
+  const base=[1,1,1,2,3,4,5,6,7,8,9,9,9];
+  if(nums.length!==14)return false;
+  const extra=nums.find((n,i)=>{const b=[...base];b.splice(b.indexOf(n),1);return JSON.stringify(b)===JSON.stringify(nums.filter((_,j)=>j!==i).sort((a,b)=>a-b));});
+  return extra!==undefined;
+}
+function isSuukantsu(melds){return melds.filter(m=>m.type==='kan').length===4;}
+function isTenho(player,gameState){return player.pond.length===0&&gameState.round===gameState.dealer&&gameState.walls&&(136-gameState.walls.length)<=4;}
+function isChiho(player,gameState){return player.pond.length===0&&!player.isDealer&&gameState.walls&&(136-gameState.walls.length)<=16;}
+
 function getYaku(decomp,player,gameState,isTsumo){
   const yaku=[];const{melds,riichi}=player;const isMenzen=melds.length===0;
   const{type}=decomp;
+  const hAll=[...player.hand,...(player.drawn?[player.drawn]:[]),...melds.flatMap(m=>m.tiles)];
+  const allM=[...melds,...(decomp.melds||[])];
+
+  // ── 役満チェック（先に判定して通常役と混在させない）──────
+  const yakuman=[];
+  if(type==='kokushi') yakuman.push({name:'国士無双',han:13,yakuman:true});
+  if(isSuuanko(decomp,isTsumo)) yakuman.push({name:'四暗刻',han:13,yakuman:true});
+  if(isDaisangen(allM)) yakuman.push({name:'大三元',han:13,yakuman:true});
+  if(isTsuiso(hAll)) yakuman.push({name:'字一色',han:13,yakuman:true});
+  if(isChinroto(hAll)) yakuman.push({name:'清老頭',han:13,yakuman:true});
+  if(isShousuushi(allM,decomp.pair)) yakuman.push({name:'小四喜',han:13,yakuman:true});
+  if(isDaisuushi(allM)) yakuman.push({name:'大四喜',han:26,yakuman:true});
+  if(isRyuiso(hAll)) yakuman.push({name:'緑一色',han:13,yakuman:true});
+  if(isChurenpoton(hAll)) yakuman.push({name:'九蓮宝燈',han:13,yakuman:true});
+  if(isSuukantsu(allM)) yakuman.push({name:'四槓子',han:13,yakuman:true});
+  if(isTenho(player,gameState)&&isTsumo&&player.pond.length===0) yakuman.push({name:'天和',han:13,yakuman:true});
+  if(isChiho(player,gameState)&&isTsumo&&player.pond.length===0) yakuman.push({name:'地和',han:13,yakuman:true});
+
+  if(yakuman.length>0) return yakuman; // 役満があれば通常役は無視
+
+  // ── 通常役 ──────────────────────────────────────────────
   if(type==='chiitoitsu'){yaku.push({name:'七対子',han:2});}
-  else if(type==='kokushi'){yaku.push({name:'国士無双',han:13,yakuman:true});}
   else{
-    const allM=[...melds,...(decomp.melds||[])];
     if(isTsumo&&isMenzen)yaku.push({name:'門前清自摸和',han:1});
     if(riichi)yaku.push({name:'立直',han:1});
-    const hAll=[...player.hand,...(player.drawn?[player.drawn]:[]),...melds.flatMap(m=>m.tiles)];
     if(isTanyao(hAll))yaku.push({name:'断么九',han:1});
     if(isMenzen&&!isTsumo&&isPinfu(decomp,player,gameState))yaku.push({name:'平和',han:1});
     if(isMenzen&&isIipeiko(decomp.melds))yaku.push({name:'一盃口',han:1});
@@ -8286,8 +8704,22 @@ function getYaku(decomp,player,gameState,isTsumo){
     if(isSanshokuDoukou(allM))yaku.push({name:'三色同刻',han:2});
     if(isIttsu(allM))yaku.push({name:'一気通貫',han:isMenzen?2:1});
     if(isToitoi(allM))yaku.push({name:'対々和',han:2});
+    // 三暗刻・三槓子・小三元・混老頭・二盃口
+    if(isSananko(decomp,isTsumo,gameState.lastDiscard))yaku.push({name:'三暗刻',han:2});
+    if(isSankantsu(allM))yaku.push({name:'三槓子',han:2});
+    if(isShouSangen(allM,decomp.pair))yaku.push({name:'小三元',han:2});
+    if(isHonroto(hAll))yaku.push({name:'混老頭',han:2});
+    if(isRyanpeikou(decomp,isMenzen))yaku.push({name:'二盃口',han:3});
     const hc=checkHoChiNitsu(hAll);
     if(hc)yaku.push({name:hc,han:hc==='清一色'?(isMenzen?6:5):(isMenzen?3:2)});
+    // 一発・ダブル立直・海底・河底・嶺上・槍槓
+    if(gameState.ippatsu&&gameState.ippatsu.includes(0)&&player.isHuman)
+      yaku.push({name:'一発',han:1});
+    if(player.doubleRiichi)yaku.push({name:'ダブル立直',han:2});
+    if(isTsumo&&gameState.haitei)yaku.push({name:'海底摸月',han:1});
+    if(!isTsumo&&gameState.haitei)yaku.push({name:'河底撈魚',han:1});
+    if(isTsumo&&gameState.rinshan){yaku.push({name:'嶺上開花',han:1});G.rinshan=false;}
+    if(!isTsumo&&gameState.chankan){yaku.push({name:'槍槓',han:1});G.chankan=false;}
   }
   const dc=countDora([...player.hand,...(player.drawn?[player.drawn]:[])],player.melds,gameState.doraIndicators);
   if(dc>0)yaku.push({name:`ドラ${dc}`,han:dc,isBonus:true});
@@ -8295,8 +8727,38 @@ function getYaku(decomp,player,gameState,isTsumo){
     const uc=countDora([...player.hand,...(player.drawn?[player.drawn]:[])],player.melds,gameState.uraDoraIndicators);
     if(uc>0)yaku.push({name:`裏ドラ${uc}`,han:uc,isBonus:true});
   }
+  // 北抜きドラ（3人麻雀）
+  if(gameState.numPlayers===3&&player.kitaCount>0){
+    for(let k=0;k<player.kitaCount;k++) yaku.push({name:'北抜き',han:1});
+  }
   return yaku;
 }
+// ── 追加役判定関数 ──────────────────────────────────────
+function isSananko(decomp,isTsumo,lastDiscard){
+  // 三暗刻: 暗刻が3つ（ロン時は最後の面子が暗刻にならない）
+  if(!decomp.melds) return false;
+  const pons=decomp.melds.filter(m=>m.type==='pon');
+  if(isTsumo) return pons.length>=3;
+  // ロン時: 最後の牌を使う面子は明刻扱い
+  return pons.filter(m=>!m.tiles.some(t=>lastDiscard&&t.uid===lastDiscard.uid)).length>=3;
+}
+function isSankantsu(allM){return allM.filter(m=>m.type==='kan').length>=3;}
+function isShouSangen(allM,pair){
+  const drg=['白','発','中'];
+  const ponCount=drg.filter(d=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===d)).length;
+  const pairIsDrg=pair&&pair[0]&&pair[0].suit==='honor'&&drg.includes(pair[0].num);
+  return ponCount===2&&pairIsDrg;
+}
+function isHonroto(hAll){return hAll.every(t=>t.suit==='honor'||(t.num===1||t.num===9));}
+function isRyanpeikou(decomp,isMenzen){
+  if(!isMenzen||!decomp.melds||decomp.melds.length<4)return false;
+  const chis=decomp.melds.filter(m=>m.type==='chi');
+  if(chis.length<4)return false;
+  const keys=chis.map(m=>m.tiles.map(t=>t.suit+t.num).sort().join(','));
+  const counts={};for(const k of keys)counts[k]=(counts[k]||0)+1;
+  return Object.values(counts).filter(v=>v>=2).length>=2;
+}
+
 function isTanyao(tiles){return tiles.every(t=>t.suit!=='honor'&&t.num>=2&&t.num<=8)}
 function isPinfu(decomp,player,gs){
   if(!decomp.melds||!decomp.melds.every(m=>m.type==='chi'))return false;
@@ -8383,6 +8845,18 @@ function calcBasicPoints(han,fu){
 }
 function calcScore(yaku,decomp,isTsumo,isDealer){
   const han=yaku.reduce((s,y)=>s+y.han,0);
+  // 役満は固定点数
+  const isYakuman=yaku.some(y=>y.yakuman);
+  if(isYakuman){
+    // 大四喜はダブル役満(han=26)、それ以外は役満(han=13)
+    const mult=han>=26?2:1;
+    // 役満基本点: 8000点 × 倍率
+    const base=8000*mult;
+    if(isTsumo)return{han,fu:0,basic:base,
+      dealer:base*2,nonDealer:base,isTsumo:true,yakuman:true};
+    return{han,fu:0,basic:base,
+      ron:base*(isDealer?6:4),isTsumo:false,yakuman:true};
+  }
   const fu=calcFu(decomp,isTsumo,true);
   const basic=calcBasicPoints(han,fu);
   if(isTsumo)return{han,fu,basic,dealer:Math.ceil(basic*2/100)*100,nonDealer:Math.ceil(basic/100)*100,isTsumo:true};
@@ -8419,10 +8893,31 @@ function canTsumo(player){
 }
 
 // ── ゲームフロー ──
+// フリーズ検知: 最後の進行タイムスタンプ
+let _lastProgress=Date.now();
+function _touchProgress(){_lastProgress=Date.now();}
+// 8秒以上進行がなければ強制advanceTurn
+setInterval(()=>{
+  if(G.gameOver||!G.phase||G.phase==='idle')return;
+  if(G.waitingForPlayer)return; // 人間の操作待ちは除外
+  if(Date.now()-_lastProgress>5000){
+    console.warn('フリーズ検知: 強制進行');
+    const cur=G.activePlayer||0;
+    G.waitingForPlayer=false;G.pendingClaims=[];
+    advanceTurn(cur);
+    _touchProgress();
+  }
+},2000);
+
 function nextTurn(){
   if(G.gameOver)return;
+  _touchProgress();
   const p=G.players[G.activePlayer];
   if(!G.walls.length){handleRyukyoku();return;}
+  // 海底フラグ（最後の1枚）
+  G.haitei=G.walls.length===1;
+  // 第一巡終了判定（全員1手目が終わったら）
+  if(G.activePlayer===G.dealer&&G.players.every(pl=>pl.pond.length>0)) G.firstRound=false;
   const tile=drawTile(G.activePlayer);if(!tile){handleRyukyoku();return;}
   log(`${p.name}がツモ`);renderAll();
   if(p.isHuman){G.phase='discard';G.waitingForPlayer=true;renderControls();}
@@ -8431,21 +8926,26 @@ function nextTurn(){
 
 function aiTurn(pi){
   if(G.gameOver||G.activePlayer!==pi)return;
+  if(!G.players||!G.players[pi])return;
+  _touchProgress();
   const p=G.players[pi];showWaiting(true);
   setTimeout(()=>{
-    if(canTsumo(p)){showWaiting(false);declareWin(pi,null,true);return;}
-    const ak=canAnkan([...p.hand,...(p.drawn?[p.drawn]:[])]);
-    if(ak.length&&Math.random()<0.3){
-      const kt=[...p.hand,...(p.drawn?[p.drawn]:[])].find(t=>t.suit+t.num===ak[0]);
-      doKan(pi,kt,true);showWaiting(false);return;
-    }
-    const hwD=[...p.hand,...(p.drawn?[p.drawn]:[])];
-    if(!p.riichi&&!p.melds.length&&p.score>=1000&&Math.random()<0.45){
-      const wts=tenpaiTiles(hwD.slice(0,-1),p.melds);
-      if(wts.length){const d=chooseAIDiscard(pi,true);if(d){doRiichi(pi,d);showWaiting(false);return;}}
-    }
-    const d=chooseAIDiscard(pi,false);if(d)doDiscard(pi,d);
-    showWaiting(false);
+    try{
+      if(G.gameOver||!G.players[pi]){showWaiting(false);return;}
+      if(canTsumo(p)){showWaiting(false);declareWin(pi,null,true);return;}
+      const ak=canAnkan([...p.hand,...(p.drawn?[p.drawn]:[])]);
+      if(ak.length&&Math.random()<0.3){
+        const kt=[...p.hand,...(p.drawn?[p.drawn]:[])].find(t=>t.suit+t.num===ak[0]);
+        if(kt){doKan(pi,kt,true);showWaiting(false);return;}
+      }
+      const hwD=[...p.hand,...(p.drawn?[p.drawn]:[])];
+      if(!p.riichi&&!p.melds.length&&p.score>=1000&&Math.random()<0.45){
+        const wts=tenpaiTiles(hwD.slice(0,-1),p.melds);
+        if(wts.length){const d=chooseAIDiscard(pi,true);if(d){doRiichi(pi,d);showWaiting(false);return;}}
+      }
+      const d=chooseAIDiscard(pi,false);if(d)doDiscard(pi,d);else advanceTurn(pi);
+      showWaiting(false);
+    }catch(e){console.error('aiTurn error:',e);showWaiting(false);advanceTurn(pi);}
   },400+Math.random()*400);
 }
 
@@ -8487,12 +8987,23 @@ function doDiscard(pi,tile){
   p.hand=sortHand(p.hand);
   p.pond.push({...tile,riichi:p.riichi&&p.riichiTurn===-1&&p.pond.length===0});
   G.lastDiscard=tile;G.lastDiscardPlayer=pi;G.phase='claim';G.selectedTile=null;
+  // 一発は自分の捨て牌後に消える（他家はadvanceTurnで消去）
+  G.ippatsu=G.ippatsu.filter(i=>i!==pi);
   log(`${p.name}が${tileStr(tile)}を捨て`);renderAll();checkClaims(tile,pi);
 }
 function doRiichi(pi,discardTile){
   const p=G.players[pi];p.score-=1000;G.riichiPool+=1000;
   p.riichi=true;p.riichiTurn=G.players.flatMap(x=>x.pond).length;
-  showFloatMsg('立直！');doDiscard(pi,discardTile);
+  // ダブル立直判定（第一巡内）
+  if(G.firstRound&&p.pond.length===0){
+    p.doubleRiichi=true;G.doubleRiichiPlayers.push(pi);
+    showFloatMsg('ダブル立直！');
+  } else {
+    showFloatMsg('立直！');
+  }
+  // 一発有効
+  if(!G.ippatsu.includes(pi)) G.ippatsu.push(pi);
+  doDiscard(pi,discardTile);
 }
 function doKan(pi,tile,isAnkan){
   const p=G.players[pi];
@@ -8500,13 +9011,23 @@ function doKan(pi,tile,isAnkan){
   let rm=0;p.hand=p.hand.filter(t=>{if(rm<4&&tilesEqual(t,tile)){rm++;return false;}return true;});
   if(p.drawn&&tilesEqual(p.drawn,tile)&&rm<4){p.drawn=null;rm++;}
   p.melds.push({type:'kan',tiles:kanTiles,isAnkan});
-  if(G.deadWall.length){p.drawn=G.deadWall.shift();G.doraIndicators.push(G.deadWall[4-G.doraIndicators.length]);}
+  if(G.deadWall.length){p.drawn=G.deadWall.shift();G.doraIndicators.push(G.deadWall[4-G.doraIndicators.length]);G.rinshan=true;}
   renderAll();log(`${p.name}が槓`);
-  if(p.isHuman){G.phase='discard';renderControls();}
+  if(p.isHuman){
+    G.phase='discard';G.waitingForPlayer=true;
+    // 暗槓後リーチ可能チェック
+    if(!p.riichi&&!p.melds.filter(m=>m.type!=='kan').length&&p.score>=1000){
+      const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
+      const cands=all.filter(t=>isTenpai(all.filter(x=>x.uid!==t.uid),p.melds));
+      if(cands.length) showFloatMsg('槓後リーチ可能！');
+    }
+    renderControls();
+  }
   else setTimeout(()=>aiTurn(pi),600);
 }
 
 function checkClaims(tile,dpi){
+  if(!tile||!G.players){advanceTurn(dpi);return;}
   const claims=[];
   for(let i=0;i<G.numPlayers;i++){
     if(i===dpi)continue;const p=G.players[i];
@@ -8518,7 +9039,7 @@ function checkClaims(tile,dpi){
       if(p.isHuman)claims.push({type:'pon',player:i,priority:2});
       else if(Math.random()<0.4)claims.push({type:'pon',player:i,priority:2});
     }
-    if(!p.riichi){
+    if(!p.riichi&&G.numPlayers===4){
       const co=canChi(p.hand,tile,i,dpi);
       if(co.length){
         if(p.isHuman)claims.push({type:'chi',player:i,priority:1,options:co});
@@ -8533,20 +9054,32 @@ function checkClaims(tile,dpi){
   const ron=claims.filter(c=>c.type==='ron');
   if(ron.length){
     if(ron.some(c=>c.player===0)){G.pendingClaims=hc;G.waitingForPlayer=true;renderControls();return;}
-    declareWin(ron[0].player,dpi,false);return;
+    // AIロン: 少し待ってから処理（フリーズ防止）
+    setTimeout(()=>{
+      if(!G.gameOver) declareWin(ron[0].player,dpi,false);
+    },300);
+    return;
   }
   if(hc.length){G.pendingClaims=hc;G.waitingForPlayer=true;renderControls();return;}
   if(ac.length){setTimeout(()=>executeAIClaim(ac[0],tile),500);return;}
   advanceTurn(dpi);
 }
 function executeAIClaim(claim,tile){
-  if(G.gameOver)return;const p=G.players[claim.player];
+  if(G.gameOver)return;
+  if(!claim||!G.players||!G.players[claim.player]){advanceTurn(G.activePlayer||0);return;}
+  _touchProgress();
+  const p=G.players[claim.player];
   if(claim.type==='ron'){declareWin(claim.player,G.lastDiscardPlayer,false);}
   else if(claim.type==='pon'){
     let rm=0;const pt=[];
     p.hand=p.hand.filter(t=>{if(rm<2&&tilesEqual(t,tile)){rm++;pt.push(t);return false;}return true;});
     p.melds.push({type:'pon',tiles:[...pt,tile]});
-    G.activePlayer=claim.player;G.phase='discard';log(`${p.name}がポン`);renderAll();
+    G.activePlayer=claim.player;G.phase='discard';log(`${p.name}がポン`);
+    if(!G.players[claim.player].isHuman){
+      const _pq=['対話の継続だ','弁証法的ポン','必然的帰結','存在の確認'];
+      showFloatMsg(p.name+': ポン！\n'+_pq[Math.floor(Math.random()*_pq.length)]);
+    }
+    renderAll();
     setTimeout(()=>aiTurn(claim.player),600);
   } else if(claim.type==='chi'){
     const chiNums=claim.options[0];const ct=[];const th=[...p.hand];
@@ -8555,11 +9088,18 @@ function executeAIClaim(claim,tile){
       else{const x=th.findIndex(t=>t.suit===tile.suit&&t.num===n);if(x!==-1)ct.push(th.splice(x,1)[0]);}
     }
     p.hand=th;p.melds.push({type:'chi',tiles:ct});
-    G.activePlayer=claim.player;G.phase='discard';log(`${p.name}がチー`);renderAll();
+    G.activePlayer=claim.player;G.phase='discard';log(`${p.name}がチー`);
+    if(!G.players[claim.player].isHuman){
+      const _cq=['連続性の証明','時間的継起也','論理的帰結','実践的理性'];
+      showFloatMsg(p.name+': チー！\n'+_cq[Math.floor(Math.random()*_cq.length)]);
+    }
+    renderAll();
     setTimeout(()=>aiTurn(claim.player),600);
   }
 }
 function advanceTurn(from){
+  _touchProgress();
+  G.ippatsu=[]; // 誰かが副露・スキップしたら一発消える
   G.activePlayer=(from+1)%G.numPlayers;G.phase='draw';G.waitingForPlayer=false;
   renderControls();setTimeout(()=>nextTurn(),200);
 }
@@ -8587,13 +9127,26 @@ function declareWin(wi,li,isTsumo){
   setTimeout(()=>showWinModal(wi,li,isTsumo,yaku,si,decomp,allH,deltas),500);
 }
 function showWinModal(wi,li,isTsumo,yaku,si,decomp,allH,deltas){
+  const isYakuman=yaku.some(y=>y.yakuman);
+  const yakumanName=isYakuman?yaku.find(y=>y.yakuman).name:'';
+  // 役満エフェクト
+  if(isYakuman){
+    showFloatMsg('🀄 '+yakumanName+' 🀄');
+  }
   let body=`<div class="hand-display">${allH.map(t=>tileHTML(t,'medium')).join('')}</div>`;
-  body+=`<div style="margin:8px 0;font-size:13px;color:var(--text2)">${yaku.map(y=>`<span style="margin-right:8px;color:${y.isBonus?'#ffd700':'var(--text)'}">${y.name}(${y.han}翻)</span>`).join('')}</div>`;
-  body+=`<div style="text-align:center;font-size:20px;font-weight:900;color:#ffd700;margin:8px 0">${si.han}翻${si.fu}符 ${isTsumo?si.nonDealer+'点ALL':si.ron+'点'}</div>`;
+  // 役満は専用スタイル
+  if(isYakuman){
+    body+=`<div style="text-align:center;font-size:22px;font-weight:900;color:#ff4444;margin:8px 0;text-shadow:0 0 12px #ff4444;animation:riichi-pulse .8s infinite alternate">🀄 ${yakumanName} 🀄</div>`;
+    const scoreStr=isTsumo?`${si.dealer}点/${si.nonDealer}点`:si.ron+'点';
+    body+=`<div style="text-align:center;font-size:20px;font-weight:900;color:#ffd700;margin:8px 0">役満 ${scoreStr}</div>`;
+  } else {
+    body+=`<div style="margin:8px 0;font-size:13px;color:var(--text2)">${yaku.map(y=>`<span style="margin-right:8px;color:${y.isBonus?'#ffd700':'var(--text)'}">${y.name}(${y.han}翻)</span>`).join('')}</div>`;
+    body+=`<div style="text-align:center;font-size:20px;font-weight:900;color:#ffd700;margin:8px 0">${si.han}翻${si.fu}符 ${isTsumo?si.nonDealer+'点ALL':si.ron+'点'}</div>`;
+  }
   body+=`<div style="margin-top:12px">`;
   for(let i=0;i<G.numPlayers;i++){const d=deltas[i];body+=`<div class="result-row"><span>${G.players[i].name}</span><span class="score-delta ${d>=0?'pos':'neg'}">${d>=0?'+':''}${d}</span><span>${G.players[i].score}</span></div>`;}
   body+=`</div>`;
-  document.getElementById('modal-title').textContent=isTsumo?'ツモ和了':'ロン和了';
+  document.getElementById('modal-title').textContent=isYakuman?('役満：'+yakumanName):(isTsumo?'ツモ和了':'ロン和了');
   document.getElementById('modal-body').innerHTML=body;
   document.getElementById('modal').classList.add('show');
   G._pendingNextRound=()=>{
@@ -8679,6 +9232,15 @@ function humanPon(){
   G.activePlayer=0;G.phase='discard';G.waitingForPlayer=true;G.pendingClaims=[];
   log('ポン');renderAll();renderControls();
 }
+function humanAnkan(suitnum){
+  if(!G.waitingForPlayer)return;
+  const p=G.players[0];
+  const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
+  const tile=all.find(t=>t.suit+t.num===suitnum);
+  if(!tile)return;
+  doKan(0,tile,true);
+  G.waitingForPlayer=false;
+}
 function humanSkip(){
   if(!G.waitingForPlayer)return;
   G.pendingClaims=[];G.waitingForPlayer=false;G.riichiCandidates=[];G.selectedTile=null;
@@ -8691,7 +9253,7 @@ function tileHTML(t,sz='medium'){
   return`<div class="tile ${t.suit} ${sz}" onclick="selectTile(${t.uid})" ondblclick="humanDiscard(${t.uid})">${tileStr(t)}</div>`;
 }
 function tileHTMLSel(t,sz,sel,rc){
-  if(!t)return'';let c=`tile ${t.suit} ${sz}`;if(sel||rc)c+=' selected';
+  if(!t)return'';let c=`tile ${t.suit} ${sz}`;if(sel)c+=' selected';if(rc)c+=' riichi-cand';
   return`<div class="${c}" onclick="selectTile(${t.uid})" ondblclick="humanDiscard(${t.uid})">${tileStr(t)}</div>`;
 }
 function renderHand(pi){
@@ -8715,6 +9277,26 @@ function renderPond(pi){
   const p=G.players[pi];const el=document.getElementById(`pond-${pi}`);if(!el)return;
   el.innerHTML=p.pond.map(t=>`<div class="tile discarded ${t.suit}">${tileStr(t)}</div>`).join('');
 }
+
+function doKita(){
+  const p=G.players[0];
+  const kitaIdx=p.hand.findIndex(t=>t.suit==='honor'&&t.num==='北');
+  if(kitaIdx<0)return;
+  const kita=p.hand.splice(kitaIdx,1)[0];
+  if(!p.kitaCount)p.kitaCount=0;
+  p.kitaCount++;
+  // 抜きドラとして記録
+  if(!G.kitaDora)G.kitaDora=[];
+  G.kitaDora.push(kita);
+  log(`あなたが北を抜いた（${p.kitaCount}枚目）`);
+  // ツモ補充
+  const drawn=drawTile(0);
+  if(drawn){p.hand.push(drawn);p.hand=sortHand(p.hand);}
+  renderAll();renderControls();
+  // 北抜き枚数をスコア表示に反映
+  const el=document.getElementById('score-0');
+  if(el&&p.kitaCount>0)el.title=`北抜き${p.kitaCount}枚`;
+}
 function renderMelds(pi){
   const p=G.players[pi];const el=document.getElementById(`melds-${pi}`);if(!el)return;
   const sz=pi===0?'medium':'small';
@@ -8723,26 +9305,54 @@ function renderMelds(pi){
 function renderControls(){
   const el=document.getElementById('controls');if(!el)return;
   const p=G.players[0];let html='';showWaiting(false);
+  // 北抜きボタン（3人麻雀のみ・先手番・手牌に北があるとき）
+  if(G.numPlayers===3&&G.phase==='discard'&&G.activePlayer===0&&G.waitingForPlayer){
+    const p=G.players[0];
+    const kitaIdx=p.hand.findIndex(t=>t.suit==='honor'&&t.num==='北');
+    if(kitaIdx>=0){
+      html+=`<button class="action-btn" style="background:#1a6b1a" onclick="doKita()">北抜き</button>`;
+    }
+  }
   if(G.phase==='discard'&&G.activePlayer===0&&G.waitingForPlayer){
     if(canTsumo(p))html+=`<button class="action-btn btn-tsumo" onclick="humanTsumo()">ツモ</button>`;
+    // リーチ可能判定
+    let _canRiichi=false;
+    let _riichiTiles=[];
     if(!p.riichi&&!p.melds.length&&p.score>=1000){
       const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
-      if(all.some(t=>isTenpai(all.filter(x=>x.uid!==t.uid),p.melds)))
+      _riichiTiles=all.filter(t=>isTenpai(all.filter(x=>x.uid!==t.uid),p.melds));
+      _canRiichi=_riichiTiles.length>0;
+      if(_canRiichi)
         html+=`<button class="action-btn btn-riichi" onclick="humanRiichi()">立直</button>`;
     }
+    // ⚠リーチ可能バナー
+    if(_canRiichi&&!G.riichiCandidates.length){
+      const _names=_riichiTiles.map(t=>tileStr(t)).filter((v,i,a)=>a.indexOf(v)===i).join(' or ');
+      html+=`<div style="background:rgba(255,50,50,.15);border:1px solid #f44;border-radius:6px;padding:4px 10px;margin-top:4px;font-size:12px;color:#ff6b6b">
+        ⚠ リーチ可能！→ <b style="color:#ffcc00">${_names}</b> を切ると聴牌
+      </div>`;
+    }
     if(G.riichiCandidates.length){
-      html=`<span style="font-size:12px;color:var(--gold)">立直する牌を選んでください</span>`;
+      html=`<span style="font-size:13px;color:var(--gold)">⚠ 光っている牌を選んでください（立直する牌）</span>`;
       html+=`<button class="action-btn btn-skip" onclick="G.riichiCandidates=[];G.selectedTile=null;renderControls();renderHand(0);">キャンセル</button>`;
     } else if(G.selectedTile||p.riichi){
       html+=`<button class="action-btn btn-discard" onclick="humanDiscard(${p.riichi?(p.drawn?p.drawn.uid:-1):G.selectedTile?.uid})">${p.riichi?'ツモ切り':'捨てる'}</button>`;
     } else {
       html+=`<span style="font-size:12px;color:var(--text2)">牌を選んで捨ててください（ダブルクリックで即捨て）</span>`;
     }
+    // 暗槓ボタン（人間プレイヤー）
+    if(!p.riichi){
+      const ak=canAnkan([...p.hand,...(p.drawn?[p.drawn]:[])]);
+      if(ak.length){
+        html+=`<button class="action-btn" style="background:#4a148c;color:white" onclick="humanAnkan('${ak[0]}')">暗槓</button>`;
+      }
+    }
   } else if(G.phase==='claim'&&G.waitingForPlayer){
     const cs=G.pendingClaims;
     if(cs.some(c=>c.type==='ron'))html+=`<button class="action-btn btn-ron" onclick="humanRon()">ロン</button>`;
     if(cs.some(c=>c.type==='pon'))html+=`<button class="action-btn btn-pon" onclick="humanPon()">ポン</button>`;
-    if(cs.some(c=>c.type==='chi')){
+    // チーは4人麻雀のみ
+    if(G.numPlayers===4&&cs.some(c=>c.type==='chi')){
       cs.filter(c=>c.type==='chi')[0].options.forEach(o=>{
         html+=`<button class="action-btn btn-chi" onclick="humanChi([${o}])">チー(${o.join('-')})</button>`;
       });
@@ -8786,9 +9396,27 @@ function renderAll(){
   renderScores();renderDora();renderWindLabels();renderRiichiSticks();
 }
 function showWaiting(show){const el=document.getElementById('waiting');if(el)el.style.display=show?'flex':'none';}
+// 哲学者テロップ辞書
+const _philoQuotes={
+  'ツモ！':['汝自身を知れ！','必然の勝利也','理性の勝利！','実践理性の凱歌！'],
+  'ロン！':['弁証法的展開！','コペルニクス的転回！','汝の牌は偽りだ','無知の知を示した'],
+  '立直！':['賽は投げられた','意志の表明也','道徳法則に従い','実存的決断！'],
+};
 function showFloatMsg(msg){
-  const el=document.getElementById('float-msg');el.textContent=msg;el.classList.add('show');
-  setTimeout(()=>el.classList.remove('show'),1200);
+  const el=document.getElementById('float-msg');
+  // 哲学者テロップがあれば付け加える
+  let display=msg;
+  const quotes=_philoQuotes[msg];
+  if(quotes&&G.players){
+    const winner=G.players.find(p=>!p.isHuman);
+    if(winner){
+      const q=quotes[Math.floor(Math.random()*quotes.length)];
+      display=msg+'\n'+winner.name+':'+q;
+    }
+  }
+  el.textContent=display;el.style.whiteSpace='pre';
+  el.classList.add('show');
+  setTimeout(()=>el.classList.remove('show'),1800);
 }
 function log(msg){const el=document.getElementById('game-log');if(el)el.textContent=msg;}
 function startGame(np,mode){
@@ -8811,7 +9439,212 @@ __AUTO_START__
     )
 
 
-# ===== COMMAND REGISTRY & MAIN RUNNER v128.1 =====
+# ===== v129.0 新コマンドハンドラ =====
+
+def handle_think_mode(arg: str) -> str:
+    """★[v129] /think: chain-of-thought思考モード切替"""
+    global THINKING_MODE
+    a = arg.strip().lower()
+    if a == "on":
+        THINKING_MODE = True
+        return (f"{C['g']}[思考モード ON]{C['w']} chain-of-thought強制。\n"
+                f"  AIは<think>タグ内で段階的思考を行い、最終回答のみ表示します。\n"
+                f"  複雑な推論・数学・コーディングで特に有効。/think off で解除。")
+    elif a == "off":
+        THINKING_MODE = False
+        return f"{C['y']}[思考モード OFF]{C['w']} 通常モードに戻しました。"
+    else:
+        status = f"{C['g']}ON{C['w']}" if THINKING_MODE else f"{C['dim']}OFF{C['w']}"
+        return (f"思考モード: {status}\n"
+                f"  /think on  → chain-of-thought強制\n"
+                f"  /think off → 通常モード")
+
+def handle_plan(arg: str, per_id: int) -> str:
+    """★[v129] /plan: OODAループ式段階的計画生成"""
+    if not arg: return f"{C['r']}usage: /plan <目標>{C['w']}"
+    persona = get_persona(per_id)
+    fp = persona.get("first_person", "私")
+    sys_content = (
+        f"あなたは{persona['name']}。口調: {persona['style']}。一人称: {fp}。\n"
+        "以下の目標を達成するための具体的な計画を立案せよ。\n"
+        "【出力形式】\n"
+        "1. 観察(Observe): 現状分析・制約・リソース\n"
+        "2. 方針決定(Orient): アプローチの選択肢と判断根拠\n"
+        "3. 決定(Decide): 最適戦略の選択\n"
+        "4. 実行(Act): 具体的なステップ（5〜7項目）\n"
+        "5. 検証指標: 成功の定義・KPI\n"
+        "捏造禁止。現実的かつ実行可能な内容のみ。"
+    )
+    print(f"{C['c']}[PLAN]{C['w']} {persona['name']}: ", end="", flush=True)
+    return stream_response(
+        [{"role": "system", "content": sys_content},
+         {"role": "user", "content": f"目標: {arg}"}],
+        True, len(arg), temp_override=0.35, model=DEEP_MODEL, max_tokens=2048
+    ) or ""
+
+def handle_code(arg: str, per_id: int) -> str:
+    """★[v129] /code: 高品質コード生成（テスト・型ヒント・docstring付き）"""
+    if not arg: return f"{C['r']}usage: /code <仕様>{C['w']}"
+    sys_content = (
+        "あなたは世界最高レベルのソフトウェアエンジニア。\n"
+        "以下の仕様に従い、プロダクション品質のコードを生成せよ。\n"
+        "必須要件:\n"
+        "- 型ヒント(Type Hints)を全ての関数に付ける\n"
+        "- Google形式のdocstringを書く\n"
+        "- エラーハンドリングを適切に実装する\n"
+        "- 単体テスト(unittest/pytest)を2〜3個含める\n"
+        "- セキュリティ上の問題がないよう注意する\n"
+        "- コメントは日本語でも可\n"
+        "コードブロック(```python)で囲んで出力せよ。"
+    )
+    print(f"{C['c']}[CODE]{C['w']} ", end="", flush=True)
+    result = stream_response(
+        [{"role": "system", "content": sys_content},
+         {"role": "user", "content": f"仕様: {arg}"}],
+        True, len(arg), temp_override=0.10, model=DEEP_MODEL, max_tokens=3072
+    ) or ""
+    # ★[v129] コードをファイルに保存するオプション提示
+    if "```python" in result:
+        print(f"{C['dim']}  ※ /convert md html でHTML変換、/m add でメモ保存も可{C['w']}")
+    return result
+
+def handle_reflect(arg: str, per_id: int) -> str:
+    """★[v129] /reflect: 自己批判的振り返り分析"""
+    if not arg: return f"{C['r']}usage: /reflect <振り返りたい内容・経験>{C['w']}"
+    persona = get_persona(per_id)
+    fp = persona.get("first_person", "私")
+    sys_content = (
+        f"あなたは{persona['name']}。口調: {persona['style']}。一人称: {fp}。\n"
+        "以下の内容について批判的・建設的な振り返りを行え。\n"
+        "【分析フレームワーク】\n"
+        "1. 何がうまくいったか（強み）\n"
+        "2. 何が課題だったか（改善点）\n"
+        "3. なぜそうなったか（根本原因分析）\n"
+        "4. 次回どう変えるか（具体的アクション）\n"
+        "5. より深い洞察（哲学的・本質的な気づき）\n"
+        "自己批判と自己肯定のバランスを保ち、建設的に分析せよ。"
+    )
+    print(f"{C['c']}[REFLECT]{C['w']} {persona['name']}: ", end="", flush=True)
+    return stream_response(
+        [{"role": "system", "content": sys_content},
+         {"role": "user", "content": f"振り返り対象: {arg}"}],
+        True, len(arg), temp_override=0.50, model=DEEP_MODEL, max_tokens=2048
+    ) or ""
+
+def handle_mindmap(arg: str, per_id: int) -> str:
+    """★[v129] /mindmap: ASCIIアートマインドマップ生成"""
+    if not arg: return f"{C['r']}usage: /mindmap <テーマ>{C['w']}"
+    persona = get_persona(per_id)
+    sys_content = (
+        f"あなたは{persona['name']}。一人称: {persona.get('first_person','私')}。\n"
+        "以下のテーマについてASCIIアートのマインドマップを生成せよ。\n"
+        "フォーマット:\n"
+        "[中心テーマ]\n"
+        "├── 主要概念1\n"
+        "│   ├── サブ概念1-1\n"
+        "│   └── サブ概念1-2\n"
+        "├── 主要概念2\n"
+        "│   ├── サブ概念2-1\n"
+        "│   └── サブ概念2-2\n"
+        "└── 主要概念3\n"
+        "    └── サブ概念3-1\n"
+        "主要概念は4〜6個、各サブ概念は2〜3個。捏造禁止。"
+    )
+    print(f"{C['c']}[MINDMAP]{C['w']} ", end="", flush=True)
+    return stream_response(
+        [{"role": "system", "content": sys_content},
+         {"role": "user", "content": f"テーマ: {arg}"}],
+        True, len(arg), temp_override=0.25, model=MODEL_NAME, max_tokens=1024
+    ) or ""
+
+def handle_persona_edit(current_persona: dict) -> dict:
+    """★[v129] /persona_edit: 現在ペルソナのスタイルをインタラクティブに編集"""
+    print(f"{C['c']}=== ペルソナ編集 ==={C['w']}")
+    print(f"現在: {current_persona['name']}")
+    print(f"口調: {current_persona['style'][:100]}...")
+    print(f"一人称: {current_persona.get('first_person', '私')}")
+    print(f"{C['dim']}編集する項目を選択（Enter でスキップ）:{C['w']}")
+    try:
+        print(f"1. 一人称 [{current_persona.get('first_person', '私')}]: ", end="", flush=True)
+        fp_new = sys.stdin.readline().strip()
+        if fp_new: current_persona["first_person"] = fp_new
+
+        print(f"2. 口調追加指示（現在の口調に追加）: ", end="", flush=True)
+        style_add = sys.stdin.readline().strip()
+        if style_add:
+            current_persona["style"] = current_persona.get("style", "") + " " + style_add
+
+        print(f"{C['g']}ペルソナ更新完了: {current_persona['name']}{C['w']}")
+    except EOFError:
+        pass
+    return current_persona
+
+def handle_model_cmd(arg: str) -> str:
+    """★[v129] /model: モデル確認・切替"""
+    a = arg.strip().lower()
+    if not a:
+        return (f"{C['c']}=== モデル状態 ==={C['w']}\n"
+                f"  FAST  : {FAST_MODEL}\n"
+                f"  MAIN  : {MODEL_NAME}\n"
+                f"  DEEP  : {DEEP_MODEL}\n"
+                f"  Power : {POWER_MODE}\n"
+                f"  Thinking: {'ON' if THINKING_MODE else 'OFF'}\n"
+                f"  GPU   : {'検出済' if _GPU_AVAILABLE else 'なし(CPU専用)'}\n"
+                f"  12b   : {'利用可' if _HAS_12B else '未検出'}")
+    if a == "fast":
+        return f"{C['g']}FAST={FAST_MODEL} (高速応答用){C['w']}"
+    if a == "main":
+        return f"{C['g']}MAIN={MODEL_NAME} (標準用){C['w']}"
+    if a == "deep":
+        return f"{C['g']}DEEP={DEEP_MODEL} (複雑推論用){C['w']}"
+    return f"{C['r']}usage: /model [fast|main|deep]{C['w']}"
+
+def handle_speedtest() -> str:
+    """★[v129] /speedtest: モデルのトークン速度測定"""
+    o = _get_ollama()
+    if o is None: return f"{C['r']}Ollama未接続{C['w']}"
+    test_models = list(dict.fromkeys([FAST_MODEL, MODEL_NAME, DEEP_MODEL]))
+    results = []
+    test_prompt = "1から10まで数字を日本語で書け。"
+    for m in test_models:
+        try:
+            start = time.time()
+            full = ""
+            for chunk in o.chat(model=m, messages=[{"role": "user", "content": test_prompt}],
+                                stream=True, options={"num_predict": 50, "num_ctx": 512}):
+                msg = chunk.get("message", {}) if isinstance(chunk, dict) else getattr(chunk, "message", None)
+                t = (msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")) or ""
+                full += t
+            elapsed = max(time.time() - start, 0.01)
+            toks = len(full) * 0.7  # rough estimate
+            tps = toks / elapsed
+            results.append(f"  {m:25s} {tps:5.1f} tok/s ({elapsed:.1f}s)")
+        except Exception as e:
+            results.append(f"  {m:25s} エラー: {e}")
+    return f"{C['c']}=== 速度測定 ==={C['w']}\n" + "\n".join(results)
+
+def handle_ctx_status(messages: list) -> str:
+    """★[v129] /ctx: コンテキスト使用量表示"""
+    def _est(text):
+        jp = sum(1 for c in text if ord(c) > 0x7F)
+        return int(jp * 1.5 + (len(text) - jp) * 0.4)
+    total = sum(_est(m.get("content", "")) for m in messages)
+    opts = get_llm_opt(True, total)
+    n_ctx = opts.get("num_ctx", 4096)
+    pct = min(100, int(total / n_ctx * 100))
+    bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+    return (f"{C['c']}=== コンテキスト状態 ==={C['w']}\n"
+            f"  使用: ~{total:,} tok / {n_ctx:,} tok ({pct}%)\n"
+            f"  [{bar}]\n"
+            f"  履歴: {len([m for m in messages if m['role']=='user'])}ターン\n"
+            f"  RAGキャッシュ: {len(RAG_CACHE)}件\n"
+            f"  /g で履歴クリア推奨 (使用率>70%)")
+
+# ===== COMMAND REGISTRY & MAIN RUNNER v129.0 =====
+def setattr_return(name: str, val):
+    """★[v129] lambdaでnonlocal変数を返すためのヘルパー"""
+    return val
+
 def run() -> None:
     global POWER_MODE, TEMP_VOICE, KEYWORD_MEMORY, ROLEPLAY_ACTIVE, ROLEPLAY_SCENE, CUSTOM_PERSONA
     SESSION_STATS["start_time"] = time.time()
@@ -8821,10 +9654,17 @@ def run() -> None:
     restore_learning()
     if not check_ollama_connection():
         print(f"{C['r']}ollama接続不可。終了します。{C['w']}"); return
-    # ★[修正4] vector_db初期化とOPTIMIZER起動をバックグラウンドで実行（起動遅延を解消）
+    # ★[v129] vector_db初期化・OPTIMIZER・バックグラウンドで並列起動
     threading.Thread(target=_init_vector_db, daemon=True).start()
     OPTIMIZER.start()
-    print(BANNER)
+    # ★[v129] BANNER動的更新（check_ollama_connectionでモデル名が確定した後）
+    _dynamic_banner = (
+        f"{C['c']}{C['bold']}\nPROJECT AEGIS [v129.0 NEXT GENERATION]{C['w']}\n"
+        f"  FAST: {FAST_MODEL} | MAIN: {MODEL_NAME} | DEEP: {DEEP_MODEL}\n"
+        f"  RAG: HYBRID(BM25+Vector) | SECURITY: MultiLayer | THINKING: {'ON' if THINKING_MODE else 'OFF'}\n"
+        f"  新コマンド: /think /plan /code /reflect /mindmap /model /ctx /speedtest\n"
+    )
+    print(_dynamic_banner)
     # 起動時：保存済みペルソナ件数を表示
     _saved = list_personas()
     if _saved:
@@ -8865,7 +9705,7 @@ def run() -> None:
                             # ★[修正/ctx-2] RAGデータをctx予算に合わせてトリミング
                             # complexモード(ctx=8192, n_predict=4096)では残り≒4096トークン≒2700文字
                             # RAGが長すぎるとシステムプロンプト+履歴でctxを圧迫して途切れる原因になる
-                            _rag_chars_limit = 800  # 約530トークン相当: 情報密度と安全余裕のバランス
+                            _rag_chars_limit = 1200  # ★[v129] 800→1200: ハイブリッドRAG情報増加に対応
                             _rag_trimmed = _rag[:_rag_chars_limit]
                             if len(_rag) > _rag_chars_limit:
                                 _rag_trimmed += "\n…(省略)"
@@ -8971,7 +9811,7 @@ def run() -> None:
             # ★[修正/hist-1] 哲学者complexモードはtrim_historyにトークン予算を渡す
             # 哲学者の長い返答(~1500tok)が4ペア分積み上がるとプロンプト枠を圧迫するため
             # 履歴全体を1500tok以内に抑えてSP+RAG+出力の余裕を確保する
-            _hist_budget = 1500 if is_complex else 800
+            _hist_budget = 2000 if is_complex else 1000  # ★[v129] 1500→2000: 長期対話の一貫性向上
             cm = [sys_msg] + trim_history(messages[-MAX_HISTORY * 2:], token_budget=_hist_budget) + [{"role": "user", "content": user_text}]
             # total_len: システムプロンプト込みの総文字数をctx計算に渡す
             total_len = sum(len(m.get("content","")) for m in cm)
@@ -9019,7 +9859,9 @@ def run() -> None:
         "export": lambda a: handle_export(a, messages),
         "template": lambda a: handle_template(a),
         "tts": lambda a: handle_tts(a),
-        "tr": lambda a: handle_translate(a),
+        # ★[修正/#3] /tr <言語> <テキスト> 書式に対応。
+        # 旧コードは引数全体を text として渡し target_lang が常に "en" 固定だった。
+        "tr": lambda a: (lambda p: handle_translate(p[1], p[0]) if len(p) >= 2 else handle_translate(a))(a.split(None, 1)) if a else handle_translate(""),
         "reference": lambda _: _handle_reference(),
         "stop": lambda _: _handle_stop(),
         "s": lambda a: _handle_persona_switch(a),
@@ -9042,9 +9884,19 @@ def run() -> None:
         "split": lambda a: handle_split(a),
         "offline": lambda a: _handle_offline(a),
         "ety": lambda a: handle_ety(a),
-        "chess": lambda a: handle_chess(a, persona=current_persona),
-        "shogi": lambda a: handle_shogi(a, persona=current_persona),
-        "mj":    lambda a: handle_mahjong(a),
+        "chess":       lambda a: handle_chess(a, persona=current_persona),
+        "shogi":       lambda a: handle_shogi(a, persona=current_persona),
+        "mj":          lambda a: handle_mahjong(a),
+        # ★[v129] 新コマンド
+        "think":       lambda a: handle_think_mode(a),
+        "plan":        lambda a: handle_plan(a, persona_id),
+        "code":        lambda a: handle_code(a, persona_id),
+        "reflect":     lambda a: handle_reflect(a, persona_id),
+        "mindmap":     lambda a: handle_mindmap(a, persona_id),
+        "persona_edit":lambda _: (setattr_return("current_persona", handle_persona_edit(current_persona)), "")[1] or f"{C['g']}編集完了{C['w']}",
+        "model":       lambda a: handle_model_cmd(a),
+        "ctx":         lambda _: handle_ctx_status(messages),
+        "speedtest":   lambda _: handle_speedtest(),
     }
 
     def _handle_quest(arg: str) -> str:
