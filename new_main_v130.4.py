@@ -88,6 +88,7 @@ STATE_FILE    = "s01_state.json"
 POWER_MODE    = "mid"
 TEMP_FACT     = 0.05
 TEMP_VOICE    = 0.72
+TEMP_HISTORY: list[float] = [0.72]
 FACT_MIN_CHARS = 20
 
 # ★[v129] Thinking Mode設定
@@ -671,7 +672,7 @@ def tool_agent_chat(messages: list, is_logic: bool, text_len: int, temp: float |
 # ===== 自己進化型学習アルゴリズム =====
 INTERACTION_LOG: list[dict] = []
 FEEDBACK_PATTERNS = {
-    'positive': ['ありがとう', 'いいね', '役に立った', 'すごい', '助かった', 'さすが', '正解', 'なるほど', 'なる', 'そうそう', 'それそれ', 'いい', '素晴らしい', '完璧', '最高', 'やった', 'できた', 'わかった', '了解'],
+    'positive': ['ありがとう', 'いいね', '役に立った', 'すごい', '助かった', 'さすが', '正解', 'なるほど', 'そうそう', 'それそれ', '素晴らしい', '完璧', '最高', 'やった', 'できた', 'わかった', '了解', 'グッド', 'ナイス', 'perfect', 'good', 'great', 'いい感じ', 'バッチリ', 'まさに', 'その通り', 'ぴったり'],
     'negative': ['違う', '間違ってる', 'いや', '違います', 'ちがう', 'つまんない', 'もういい', '違うよ', '意味ない', '違ってる', 'ちげえ', 'ダメ', 'ダメだ', '違うんだ',
                  # ★[修正D] 話し方・口調指摘系を追加
                  'おかしい', 'へん', '変だ', '変です', 'おかしくない', 'なんか変', 'ちょっと変',
@@ -1678,10 +1679,23 @@ def analyze_feedback(user_input: str) -> float:
     return 0.0
 
 def log_interaction(user_input: str, response: str, mode: str, feedback: float):
-    global LEARNING_STATS
+    global LEARNING_STATS, TEMP_VOICE
     LEARNING_STATS["total_interactions"] += 1
-    if feedback > 0.3: LEARNING_STATS["positive_count"] += 1
-    elif feedback < -0.3: LEARNING_STATS["negative_count"] += 1
+    if feedback > 0.3:
+        LEARNING_STATS["positive_count"] += 1
+        TEMP_VOICE = min(1.2, TEMP_VOICE + 0.02)
+        TEMP_HISTORY.append(round(TEMP_VOICE, 3))
+        if len(TEMP_HISTORY) > 30: TEMP_HISTORY[:] = TEMP_HISTORY[-30:]
+    elif feedback < -0.3:
+        LEARNING_STATS["negative_count"] += 1
+        neg = LEARNING_STATS["negative_count"]
+        pos = LEARNING_STATS["positive_count"]
+        if neg > pos:
+            TEMP_VOICE = max(0.3, TEMP_VOICE - 0.03)
+        else:
+            TEMP_VOICE = max(0.3, TEMP_VOICE - 0.01)
+        TEMP_HISTORY.append(round(TEMP_VOICE, 3))
+        if len(TEMP_HISTORY) > 30: TEMP_HISTORY[:] = TEMP_HISTORY[-30:]
     entry = {"time": time.time(), "input": sanitize(user_input[:200]), "response_len": len(response), "mode": mode, "feedback": round(feedback, 2)}
     INTERACTION_LOG.append(entry)
     if len(INTERACTION_LOG) > 200: INTERACTION_LOG[:] = INTERACTION_LOG[-200:]
@@ -2869,6 +2883,47 @@ _SEC_TRAITS = {
 _GM = {"piano":0,"strings":48,"pad":88,"bass":32,"guitar":25}
 # ドラム MIDI音番号
 _DRUM = {"kick":36,"snare":38,"hihat":42,"open_hat":46,"crash":49,"ride":51,"tom":45}
+
+_MOOD_MAP = {
+    "悲しい":{"scale":"minor","bpm_mod":-15,"genre":"strings"},
+    "切ない":{"scale":"minor","bpm_mod":-10,"genre":"strings"},
+    "暗い":{"scale":"minor","bpm_mod":-10,"genre":"piano"},
+    "孤独":{"scale":"minor","bpm_mod":-20,"genre":"piano"},
+    "憂鬱":{"scale":"dorian","bpm_mod":-15,"genre":"piano"},
+    "楽しい":{"scale":"major","bpm_mod":+15,"genre":"piano"},
+    "明るい":{"scale":"major","bpm_mod":+10,"genre":"piano"},
+    "元気":{"scale":"pentatonic","bpm_mod":+20,"genre":"rock"},
+    "希望":{"scale":"major","bpm_mod":+5,"genre":"strings"},
+    "激しい":{"scale":"blues","bpm_mod":+30,"genre":"rock"},
+    "燃える":{"scale":"blues","bpm_mod":+35,"genre":"rock"},
+    "戦い":{"scale":"minor","bpm_mod":+25,"genre":"rock"},
+    "怒り":{"scale":"blues","bpm_mod":+20,"genre":"rock"},
+    "神秘":{"scale":"dorian","bpm_mod":-5,"genre":"pad"},
+    "幻想":{"scale":"dorian","bpm_mod":-10,"genre":"pad"},
+    "宇宙":{"scale":"dorian","bpm_mod":-15,"genre":"pad"},
+    "jazz":{"scale":"dorian","bpm_mod":+5,"genre":"jazz"},
+    "ジャズ":{"scale":"dorian","bpm_mod":+5,"genre":"jazz"},
+    "ロック":{"scale":"blues","bpm_mod":+20,"genre":"rock"},
+    "クラシック":{"scale":"major","bpm_mod":-5,"genre":"classical"},
+    "EDM":{"scale":"minor","bpm_mod":+30,"genre":"pad"},
+}
+_GENRE_INSTRUMENTS = {
+    "piano":{"melody":0,"chords":0,"bass":32},
+    "strings":{"melody":40,"chords":48,"bass":43},
+    "rock":{"melody":29,"chords":25,"bass":34},
+    "jazz":{"melody":0,"chords":25,"bass":33},
+    "pad":{"melody":88,"chords":89,"bass":38},
+    "classical":{"melody":40,"chords":48,"bass":43},
+}
+def _analyze_mood(theme):
+    result={"scale":"major","bpm_mod":0,"genre":"piano"}
+    for kw,mood in _MOOD_MAP.items():
+        if kw in theme: result=mood.copy(); break
+    return result
+def _transpose_key(key,semitones):
+    keys=["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"]
+    idx=keys.index(key) if key in keys else 0
+    return keys[(idx+semitones)%12]
 
 def _midi_scale(root: int, stype: str, oct_off: int) -> list[int]:
     """指定ルート・スケールのMIDIピッチリスト（48〜96範囲）"""
@@ -7467,6 +7522,9 @@ _SCP_STATUS_OK= 30
 _SCP_STATUS_WN= 31
 _SCP_DROP_HL  = 32
 _SCP_COMMENT  = 33  # テロップ（ペルソナコメント）
+_SCP_SENTE    = 34  # 先手駒
+_SCP_GOTE     = 35  # 後手駒
+_SCP_PROMOTED = 36  # 成り駒
 
 def _shogi_init_colors():
     curses.start_color()
@@ -7485,6 +7543,9 @@ def _shogi_init_colors():
     curses.init_pair(_SCP_STATUS_WN, curses.COLOR_WHITE,  curses.COLOR_RED)      # 警告
     curses.init_pair(_SCP_DROP_HL,   curses.COLOR_BLACK,  curses.COLOR_YELLOW)   # 持駒選択ハイライト
     curses.init_pair(_SCP_COMMENT,   curses.COLOR_BLACK,  curses.COLOR_MAGENTA)  # ペルソナテロップ
+    curses.init_pair(_SCP_SENTE,     curses.COLOR_WHITE,  curses.COLOR_BLACK)    # 先手駒
+    curses.init_pair(_SCP_GOTE,      curses.COLOR_YELLOW, curses.COLOR_BLACK)    # 後手駒
+    curses.init_pair(_SCP_PROMOTED,  curses.COLOR_RED,    curses.COLOR_BLACK)    # 成り駒
 
 
 def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
@@ -7497,19 +7558,20 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
     stdscr.keypad(True)
     stdscr.timeout(80)
 
-    # ── 端末サイズに合わせてレイアウトを動的調整 ──────────────────
+    # ── 端末サイズ自動調整 ──────────────────────────────────────────
     global _SBY, _SH, _SI_X
     term_h, term_w = stdscr.getmaxyx()
-    # _SH=3 の場合、必要行数 = 3+2+27+3+2 = 37行
-    # 端末が小さければ _SH=2 (=3+2+18+3+2=28行) に切り替え
-    if term_h < 37:
+    if term_h >= 37:
+        _SH = 3
+    elif term_h >= 24:
         _SH = 2
     else:
-        _SH = 3
-    # SBYを確保。収まらなければ2に縮小
-    _SBY = 3
-    if _SBY + 9 * _SH + 5 > term_h:
-        _SBY = 2
+        stdscr.clear()
+        msg = f"端末が小さすぎます ({term_w}x{term_h})。24行以上必要です。"
+        try: stdscr.addstr(term_h//2, max(0,(term_w-len(msg))//2), msg)
+        except curses.error: pass
+        stdscr.refresh(); stdscr.getch(); return
+    _SBY = 2
     _SI_X = _SBX + _SQ * 9 + 2
     # ──────────────────────────────────────────────────────────────
     selected: tuple | None = None      # 選択中マス (r, c) or ("hand", color, ptype)
@@ -7598,9 +7660,11 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                     color, ptype = cell
                     sym = ShogiEngine.PIECE_SYMBOLS[color].get(ptype, "?")
                     is_gote = (color == ShogiEngine.GOTE)
-                    # 後手駒: 上段に駒文字を置いて「逆向き」に見せる
-                    # 先手駒: 下段に駒文字を置く（_SH=2時は中段と同じ）
-                    mid_text = f" {sym} "[:_SQ].ljust(_SQ)  # 駒文字（センタリング）
+                    is_promoted = ptype.startswith("+")
+                    if is_gote:
+                        mid_text = f"v{sym}"[:_SQ].ljust(_SQ)
+                    else:
+                        mid_text = f"^{sym}"[:_SQ].ljust(_SQ)
                     blank    = " " * _SQ
                 else:
                     is_gote  = False
@@ -7621,34 +7685,37 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                 attr     = curses.color_pair(cp)
                 attr_b   = curses.color_pair(cp) | curses.A_BOLD
                 attr_dim = curses.color_pair(cp) | curses.A_DIM
+                if cell and cp in (_SCP_LIGHT, _SCP_DARK):
+                    if is_promoted:
+                        attr_piece = curses.color_pair(_SCP_PROMOTED) | curses.A_BOLD
+                    else:
+                        attr_piece = curses.color_pair(_SCP_GOTE if is_gote else _SCP_SENTE) | curses.A_BOLD
+                else:
+                    attr_piece = attr_b
 
                 try:
                     if _SH >= 3:
                         if cell:
                             if is_gote:
-                                # 後手: 上段=駒文字(BOLD・暗め)、中段・下段=空白
-                                stdscr.addstr(sy,   sx, mid_text, attr_dim)
+                                stdscr.addstr(sy,   sx, mid_text, attr_piece)
                                 stdscr.addstr(sy+1, sx, blank,    attr)
                                 stdscr.addstr(sy+2, sx, blank,    attr)
                             else:
-                                # 先手: 上段=空白、中段=空白、下段=駒文字(BOLD)
                                 stdscr.addstr(sy,   sx, blank,    attr)
                                 stdscr.addstr(sy+1, sx, blank,    attr)
-                                stdscr.addstr(sy+2, sx, mid_text, attr_b)
+                                stdscr.addstr(sy+2, sx, mid_text, attr_piece)
                         else:
-                            # 空マス: 中段にドット
                             stdscr.addstr(sy,   sx, blank,    attr)
                             stdscr.addstr(sy+1, sx, mid_text, attr)
                             stdscr.addstr(sy+2, sx, blank,    attr)
                     else:
-                        # _SH=2: 後手=上段、先手=下段
                         if cell:
                             if is_gote:
-                                stdscr.addstr(sy,   sx, mid_text, attr_dim)
+                                stdscr.addstr(sy,   sx, mid_text, attr_piece)
                                 stdscr.addstr(sy+1, sx, blank,    attr)
                             else:
                                 stdscr.addstr(sy,   sx, blank,    attr)
-                                stdscr.addstr(sy+1, sx, mid_text, attr_b)
+                                stdscr.addstr(sy+1, sx, mid_text, attr_piece)
                         else:
                             stdscr.addstr(sy,   sx, mid_text, attr)
                             stdscr.addstr(sy+1, sx, blank,    attr)
@@ -8145,13 +8212,10 @@ def handle_mahjong(arg: str) -> str:
     # ── ブラウザ起動 ──────────────────────────────────────────
     # Brave を優先して起動する（EdgeはローカルHTMLをブロックする場合があるため）。
     # Brave が見つからなければ Chrome → Firefox → webbrowser.open() の順でフォールバック。
-    # WSL環境: wslpathでWindowsパス(\\wsl.localhost\...)に変換して渡す
     try:
-        import subprocess as _sp
-        _win_path = _sp.check_output(
-            ["wslpath", "-w", html_path], stderr=_sp.DEVNULL
-        ).decode().strip()
-        file_uri = _win_path  # \\wsl.localhost\Ubuntu\tmp\... 形式
+        import subprocess as _sp2
+        _wp = _sp2.check_output(["wslpath","-w",html_path],stderr=_sp2.DEVNULL).decode().strip()
+        file_uri = _wp
     except Exception:
         file_uri = pathlib.Path(html_path).as_uri()
     label = f"{num_players}人麻雀({'東南戦' if mode == 'tonpu' else '東風戦'})"
@@ -8200,17 +8264,16 @@ def handle_mahjong(arg: str) -> str:
 
         # ── Linux / WSL ───────────────────────────────────────
         else:
-            # WSL2: cmd.exe /c start でWindowsブラウザをバックグラウンド起動
-            # uri = \\wsl.localhost\Ubuntu\tmp\... 形式
             try:
-                S.Popen(
-                    ["cmd.exe", "/c", "start", "", uri],
-                    stdout=S.DEVNULL, stderr=S.DEVNULL
-                )
+                import subprocess as _sp
+                _win_path = _sp.check_output(
+                    ["wslpath", "-w", uri.replace("file://","")],
+                    stderr=_sp.DEVNULL).decode().strip()
+                S.Popen(["cmd.exe", "/c", "start", "", _win_path],
+                        stdout=S.DEVNULL, stderr=S.DEVNULL)
                 return True, "ブラウザ"
             except Exception:
                 pass
-            # ネイティブLinuxブラウザ（フォールバック）
             linux_bins = [
                 ("brave-browser", "Brave"), ("brave", "Brave"),
                 ("google-chrome", "Chrome"), ("firefox", "Firefox"),
@@ -8218,11 +8281,9 @@ def handle_mahjong(arg: str) -> str:
             for bin_name, display_name in linux_bins:
                 if shutil.which(bin_name):
                     try:
-                        S.Popen([bin_name, uri],
-                                stdout=S.DEVNULL, stderr=S.DEVNULL)
+                        S.Popen([bin_name, uri], stdout=S.DEVNULL, stderr=S.DEVNULL)
                         return True, display_name
-                    except Exception:
-                        continue
+                    except Exception: continue
 
         # ── 最終フォールバック: webbrowser モジュール ──────────
         try:
@@ -8301,13 +8362,12 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 .round-info{font-size:13px;color:var(--gold);font-weight:700}
 .dora-area{display:flex;gap:4px;align-items:center}
 .dora-label{font-size:10px;color:var(--text2)}
-.pond{background:rgba(0,0,0,.2);border-radius:4px;padding:4px;display:flex;flex-wrap:wrap;gap:1px;align-content:flex-start;min-height:40px;max-height:120px;overflow-y:auto;overflow-x:hidden;border:1px solid rgba(255,255,255,.1);scrollbar-width:thin}
-.pond-label{font-size:9px;color:rgba(255,255,255,.4);margin-bottom:2px;text-align:center}
+.pond{background:rgba(0,0,0,.2);border-radius:4px;padding:4px;display:flex;flex-wrap:wrap;gap:1px;align-content:flex-start;min-height:60px;max-height:80px;overflow:hidden;border:1px solid rgba(255,255,255,.05)}
 .tile{background:var(--tile);color:#1a1a00;border-radius:4px;border:1px solid var(--tile-h);display:inline-flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;cursor:pointer;box-shadow:1px 2px 3px rgba(0,0,0,.4),inset 0 -1px 0 rgba(0,0,0,.2);transition:all .1s;position:relative;flex-shrink:0}
 .tile:hover{filter:brightness(1.1);transform:translateY(-2px)}
 .tile.selected{transform:translateY(-8px);box-shadow:0 6px 12px rgba(255,215,0,.4),1px 2px 3px rgba(0,0,0,.4);border-color:var(--gold)}
-.tile.riichi-cand{transform:translateY(-6px);box-shadow:0 0 12px rgba(255,80,80,.8),0 0 4px rgba(255,80,80,.5);border-color:#ff4444;animation:riichi-pulse .8s infinite alternate}
-@keyframes riichi-pulse{from{box-shadow:0 0 8px rgba(255,80,80,.6)}to{box-shadow:0 0 18px rgba(255,80,80,1),0 0 6px #fff}}
+.tile.riichi-cand{transform:translateY(-6px);box-shadow:0 0 12px rgba(255,80,80,.8);border-color:#ff4444;animation:riichi-pulse .8s infinite alternate}
+@keyframes riichi-pulse{from{box-shadow:0 0 8px rgba(255,80,80,.6)}to{box-shadow:0 0 18px rgba(255,80,80,1)}}
 .tile.man{color:#c62828}.tile.pin{color:#1565c0}.tile.sou{color:#2e7d32}.tile.honor{color:#4a148c}
 .tile.discarded{width:20px;height:28px;font-size:9px;cursor:default}
 .tile.discarded:hover{transform:none;filter:none}
@@ -8384,16 +8444,16 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
   </div>
   <div class="table-area" id="table">
     <div class="seat-top" id="seat-2">
-      <div class="seat-info"><div class="seat-name" id="name-2">対面</div><div class="seat-wind" id="wind-2">北家</div><div class="seat-score" id="score-2">-</div></div>
+      <div class="seat-info"><div class="seat-name" id="name-2">対面</div><div class="seat-wind" id="wind-2">北家</div><div class="seat-score" id="score-2">25000</div></div>
       <div class="melds-area" id="melds-2"></div>
       <div class="ai-hand" id="hand-2"></div>
-      <div class="pond-label">対面の河</div><div class="pond" id="pond-2" style="max-width:300px;max-height:120px"></div>
+      <div class="pond" id="pond-2" style="max-width:260px"></div>
     </div>
     <div class="seat-left" id="seat-1">
-      <div class="seat-info"><div class="seat-name" id="name-1">上家</div><div class="seat-wind" id="wind-1">西家</div><div class="seat-score" id="score-1">-</div></div>
+      <div class="seat-info"><div class="seat-name" id="name-1">上家</div><div class="seat-wind" id="wind-1">西家</div><div class="seat-score" id="score-1">25000</div></div>
       <div class="melds-area" id="melds-1" style="flex-direction:column"></div>
       <div class="ai-hand" id="hand-1"></div>
-      <div class="pond-label">上家の河</div><div class="pond" id="pond-1" style="max-height:200px;flex-direction:column;max-width:72px;overflow-y:auto"></div>
+      <div class="pond" id="pond-1" style="max-height:100px;flex-direction:column;max-width:60px"></div>
     </div>
     <div class="center-area">
       <div class="info-panel">
@@ -8404,21 +8464,21 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
       <div id="riichi-sticks" style="display:flex;gap:4px;justify-content:center;flex-wrap:wrap"></div>
     </div>
     <div class="seat-right" id="seat-3">
-      <div class="seat-info"><div class="seat-name" id="name-3">下家</div><div class="seat-wind" id="wind-3">東家</div><div class="seat-score" id="score-3">-</div></div>
+      <div class="seat-info"><div class="seat-name" id="name-3">下家</div><div class="seat-wind" id="wind-3">東家</div><div class="seat-score" id="score-3">25000</div></div>
       <div class="melds-area" id="melds-3" style="flex-direction:column"></div>
       <div class="ai-hand" id="hand-3"></div>
-      <div class="pond-label">下家の河</div><div class="pond" id="pond-3" style="max-height:200px;flex-direction:column;max-width:72px;overflow-y:auto"></div>
+      <div class="pond" id="pond-3" style="max-height:100px;flex-direction:column;max-width:60px"></div>
     </div>
     <div class="player-area" id="seat-0">
       <div class="melds-area" id="melds-0"></div>
-      <div class="pond-label">あなたの河</div>
+      <div style="font-size:9px;color:rgba(255,255,255,.4);text-align:center">あなたの河</div>
       <div class="pond" id="pond-0" style="max-width:320px;max-height:80px;margin-bottom:4px"></div>
       <div class="player-hand" id="hand-0"></div>
       <div class="player-info-row">
         <div class="player-info">
           <span class="player-name-label">あなた</span>
           <span style="color:var(--text2);margin:0 6px" id="player-wind-label">東家</span>
-          <span class="player-score-label" id="score-0">-</span>
+          <span class="player-score-label" id="score-0">25000</span>
         </div>
         <div id="riichi-indicator"></div>
       </div>
@@ -8485,16 +8545,7 @@ function initGame(np,mode){
      phase:'idle',lastDiscard:null,lastDiscardPlayer:-1,
      pendingClaims:[],maxRound:mode==='tonpu'?8:4,
      gameOver:false,waitingForPlayer:false,
-     selectedTile:null,riichiCandidates:[],_pendingNextRound:null,
-     // 特殊役状態フラグ
-     ippatsu:[],        // 一発有効プレイヤー番号リスト
-     rinshan:false,     // 嶺上開花フラグ
-     haitei:false,      // 海底摸月フラグ（最後の牌）
-     chankan:false,     // 槍槓フラグ
-     firstRound:true,   // ダブル立直判定用（第一巡）
-     doubleRiichiPlayers:[] // ダブル立直プレイヤー
-   };
-  // 哲学者プール（全員からランダム3人選択）
+     selectedTile:null,riichiCandidates:[],_pendingNextRound:null};
   const _philosopherPool=[
     'ソクラテス','プラトン','アリストテレス','エピクロス','ピュロン',
     'アウグスティヌス','トマス・アクィナス','オッカム',
@@ -8503,8 +8554,7 @@ function initGame(np,mode){
     'ロック','ヒューム','バークリー','ルソー','ヴォルテール',
     'カント','フィヒテ','シェリング','ヘーゲル',
     'ショーペンハウアー','フォイエルバッハ','マルクス','エンゲルス',
-    'ミル','ベンサム','スペンサー',
-    'ニーチェ','キルケゴール',
+    'ミル','ベンサム','スペンサー','ニーチェ','キルケゴール',
     'フレーゲ','ラッセル','ムーア','ウィトゲンシュタイン',
     'フッサール','ハイデガー','サルトル','メルロ＝ポンティ','ボーヴォワール',
     'デューイ','ジェームズ','パース',
@@ -8513,7 +8563,6 @@ function initGame(np,mode){
     'ロールズ','ノージック','サンデル','ハーバーマス',
     'アーレント','ベンヤミン','アドルノ','ホルクハイマー',
   ];
-  // ランダムに3人選んでシャッフル
   const _shuffled=[..._philosopherPool].sort(()=>Math.random()-.5);
   const names=['あなた',_shuffled[0],_shuffled[1],_shuffled[2]];
   for(let i=0;i<np;i++)
@@ -8540,8 +8589,6 @@ function startRound(){
   G.phase='draw';G.activePlayer=G.dealer;
   G.lastDiscard=null;G.lastDiscardPlayer=-1;
   G.selectedTile=null;G.riichiCandidates=[];
-  G.ippatsu=[];G.rinshan=false;G.haitei=false;G.chankan=false;
-  G.firstRound=true;G.doubleRiichiPlayers=[];
   renderAll();log(`${roundName()} 開始`);nextTurn();
 }
 
@@ -8630,51 +8677,26 @@ function tenpaiTiles(hand,melds){
 function isTenpai(hand,melds){return tenpaiTiles(hand,melds).length>0}
 
 // ── 役判定 ──
-// ── 役満判定関数群 ──────────────────────────────────────
-function isSuuanko(decomp,isTsumo){
-  if(!decomp.melds)return false;
-  return decomp.melds.every(m=>m.type==='pon'||m.type==='kan')&&isTsumo;
-}
-function isDaisangen(allM){
-  const drg=['白','発','中'];
-  return drg.every(d=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===d));
-}
+function isSuuanko(decomp,isTsumo){if(!decomp.melds)return false;return decomp.melds.every(m=>m.type==='pon'||m.type==='kan')&&isTsumo;}
+function isDaisangen(allM){const drg=['白','発','中'];return drg.every(d=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===d));}
 function isTsuiso(hAll){return hAll.every(t=>t.suit==='honor');}
 function isChinroto(hAll){return hAll.every(t=>t.suit!=='honor'&&(t.num===1||t.num===9));}
-function isShousuushi(allM,pair){
-  const winds=['東','南','西','北'];
-  const ponWinds=allM.filter(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&winds.includes(m.tiles[0].num));
-  const pairIsWind=pair&&pair[0]&&pair[0].suit==='honor'&&winds.includes(pair[0].num);
-  return ponWinds.length===3&&pairIsWind;
-}
-function isDaisuushi(allM){
-  const winds=['東','南','西','北'];
-  return winds.every(w=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===w));
-}
-function isRyuiso(hAll){
-  const green=['2','3','4','6','8'].map(Number);
-  return hAll.every(t=>(t.suit==='bamboo'&&green.includes(t.num))||(t.suit==='honor'&&t.num==='発'));
-}
-function isChurenpoton(hAll){
-  const suits=hAll.map(t=>t.suit);
-  if(!suits.every(s=>s===suits[0])||suits[0]==='honor')return false;
-  const nums=hAll.map(t=>t.num).sort((a,b)=>a-b);
-  const base=[1,1,1,2,3,4,5,6,7,8,9,9,9];
-  if(nums.length!==14)return false;
-  const extra=nums.find((n,i)=>{const b=[...base];b.splice(b.indexOf(n),1);return JSON.stringify(b)===JSON.stringify(nums.filter((_,j)=>j!==i).sort((a,b)=>a-b));});
-  return extra!==undefined;
-}
-function isSuukantsu(melds){return melds.filter(m=>m.type==='kan').length===4;}
-function isTenho(player,gameState){return player.pond.length===0&&gameState.round===gameState.dealer&&gameState.walls&&(136-gameState.walls.length)<=4;}
-function isChiho(player,gameState){return player.pond.length===0&&!player.isDealer&&gameState.walls&&(136-gameState.walls.length)<=16;}
+function isShousuushi(allM,pair){const winds=['東','南','西','北'];const ponWinds=allM.filter(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&winds.includes(m.tiles[0].num));const pairIsWind=pair&&pair[0]&&pair[0].suit==='honor'&&winds.includes(pair[0].num);return ponWinds.length===3&&pairIsWind;}
+function isDaisuushi(allM){const winds=['東','南','西','北'];return winds.every(w=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===w));}
+function isRyuiso(hAll){const green=['2','3','4','6','8'].map(Number);return hAll.every(t=>(t.suit==='bamboo'&&green.includes(t.num))||(t.suit==='honor'&&t.num==='発'));}
+function isChurenpoton(hAll){const suits=hAll.map(t=>t.suit);if(!suits.every(s=>s===suits[0])||suits[0]==='honor')return false;const nums=hAll.map(t=>t.num).sort((a,b)=>a-b);const base=[1,1,1,2,3,4,5,6,7,8,9,9,9];if(nums.length!==14)return false;return base.some((_,i)=>{const b=[...base];b.splice(i,1);return JSON.stringify(b)===JSON.stringify(nums.slice(0,13));});}
+function isSuukantsu(allM){return allM.filter(m=>m.type==='kan').length===4;}
+function isSananko(decomp,isTsumo,lastDiscard){if(!decomp.melds)return false;const pons=decomp.melds.filter(m=>m.type==='pon');if(isTsumo)return pons.length>=3;return pons.filter(m=>!m.tiles.some(t=>lastDiscard&&t.uid===lastDiscard.uid)).length>=3;}
+function isSankantsu(allM){return allM.filter(m=>m.type==='kan').length>=3;}
+function isShouSangen(allM,pair){const drg=['白','発','中'];const ponCount=drg.filter(d=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===d)).length;const pairIsDrg=pair&&pair[0]&&pair[0].suit==='honor'&&drg.includes(pair[0].num);return ponCount===2&&pairIsDrg;}
+function isHonroto(hAll){return hAll.every(t=>t.suit==='honor'||(t.num===1||t.num===9));}
+function isRyanpeikou(decomp,isMenzen){if(!isMenzen||!decomp.melds||decomp.melds.length<4)return false;const chis=decomp.melds.filter(m=>m.type==='chi');if(chis.length<4)return false;const keys=chis.map(m=>m.tiles.map(t=>t.suit+t.num).sort().join(','));const counts={};for(const k of keys)counts[k]=(counts[k]||0)+1;return Object.values(counts).filter(v=>v>=2).length>=2;}
 
 function getYaku(decomp,player,gameState,isTsumo){
   const yaku=[];const{melds,riichi}=player;const isMenzen=melds.length===0;
   const{type}=decomp;
   const hAll=[...player.hand,...(player.drawn?[player.drawn]:[]),...melds.flatMap(m=>m.tiles)];
   const allM=[...melds,...(decomp.melds||[])];
-
-  // ── 役満チェック（先に判定して通常役と混在させない）──────
   const yakuman=[];
   if(type==='kokushi') yakuman.push({name:'国士無双',han:13,yakuman:true});
   if(isSuuanko(decomp,isTsumo)) yakuman.push({name:'四暗刻',han:13,yakuman:true});
@@ -8686,12 +8708,7 @@ function getYaku(decomp,player,gameState,isTsumo){
   if(isRyuiso(hAll)) yakuman.push({name:'緑一色',han:13,yakuman:true});
   if(isChurenpoton(hAll)) yakuman.push({name:'九蓮宝燈',han:13,yakuman:true});
   if(isSuukantsu(allM)) yakuman.push({name:'四槓子',han:13,yakuman:true});
-  if(isTenho(player,gameState)&&isTsumo&&player.pond.length===0) yakuman.push({name:'天和',han:13,yakuman:true});
-  if(isChiho(player,gameState)&&isTsumo&&player.pond.length===0) yakuman.push({name:'地和',han:13,yakuman:true});
-
-  if(yakuman.length>0) return yakuman; // 役満があれば通常役は無視
-
-  // ── 通常役 ──────────────────────────────────────────────
+  if(yakuman.length>0) return yakuman;
   if(type==='chiitoitsu'){yaku.push({name:'七対子',han:2});}
   else{
     if(isTsumo&&isMenzen)yaku.push({name:'門前清自摸和',han:1});
@@ -8704,22 +8721,8 @@ function getYaku(decomp,player,gameState,isTsumo){
     if(isSanshokuDoukou(allM))yaku.push({name:'三色同刻',han:2});
     if(isIttsu(allM))yaku.push({name:'一気通貫',han:isMenzen?2:1});
     if(isToitoi(allM))yaku.push({name:'対々和',han:2});
-    // 三暗刻・三槓子・小三元・混老頭・二盃口
-    if(isSananko(decomp,isTsumo,gameState.lastDiscard))yaku.push({name:'三暗刻',han:2});
-    if(isSankantsu(allM))yaku.push({name:'三槓子',han:2});
-    if(isShouSangen(allM,decomp.pair))yaku.push({name:'小三元',han:2});
-    if(isHonroto(hAll))yaku.push({name:'混老頭',han:2});
-    if(isRyanpeikou(decomp,isMenzen))yaku.push({name:'二盃口',han:3});
     const hc=checkHoChiNitsu(hAll);
     if(hc)yaku.push({name:hc,han:hc==='清一色'?(isMenzen?6:5):(isMenzen?3:2)});
-    // 一発・ダブル立直・海底・河底・嶺上・槍槓
-    if(gameState.ippatsu&&gameState.ippatsu.includes(0)&&player.isHuman)
-      yaku.push({name:'一発',han:1});
-    if(player.doubleRiichi)yaku.push({name:'ダブル立直',han:2});
-    if(isTsumo&&gameState.haitei)yaku.push({name:'海底摸月',han:1});
-    if(!isTsumo&&gameState.haitei)yaku.push({name:'河底撈魚',han:1});
-    if(isTsumo&&gameState.rinshan){yaku.push({name:'嶺上開花',han:1});G.rinshan=false;}
-    if(!isTsumo&&gameState.chankan){yaku.push({name:'槍槓',han:1});G.chankan=false;}
   }
   const dc=countDora([...player.hand,...(player.drawn?[player.drawn]:[])],player.melds,gameState.doraIndicators);
   if(dc>0)yaku.push({name:`ドラ${dc}`,han:dc,isBonus:true});
@@ -8727,38 +8730,16 @@ function getYaku(decomp,player,gameState,isTsumo){
     const uc=countDora([...player.hand,...(player.drawn?[player.drawn]:[])],player.melds,gameState.uraDoraIndicators);
     if(uc>0)yaku.push({name:`裏ドラ${uc}`,han:uc,isBonus:true});
   }
-  // 北抜きドラ（3人麻雀）
   if(gameState.numPlayers===3&&player.kitaCount>0){
     for(let k=0;k<player.kitaCount;k++) yaku.push({name:'北抜き',han:1});
   }
+  if(isSananko(decomp,isTsumo,gameState.lastDiscard))yaku.push({name:'三暗刻',han:2});
+  if(isSankantsu(allM))yaku.push({name:'三槓子',han:2});
+  if(isShouSangen(allM,decomp.pair))yaku.push({name:'小三元',han:2});
+  if(isHonroto(hAll))yaku.push({name:'混老頭',han:2});
+  if(isRyanpeikou(decomp,isMenzen))yaku.push({name:'二盃口',han:3});
   return yaku;
 }
-// ── 追加役判定関数 ──────────────────────────────────────
-function isSananko(decomp,isTsumo,lastDiscard){
-  // 三暗刻: 暗刻が3つ（ロン時は最後の面子が暗刻にならない）
-  if(!decomp.melds) return false;
-  const pons=decomp.melds.filter(m=>m.type==='pon');
-  if(isTsumo) return pons.length>=3;
-  // ロン時: 最後の牌を使う面子は明刻扱い
-  return pons.filter(m=>!m.tiles.some(t=>lastDiscard&&t.uid===lastDiscard.uid)).length>=3;
-}
-function isSankantsu(allM){return allM.filter(m=>m.type==='kan').length>=3;}
-function isShouSangen(allM,pair){
-  const drg=['白','発','中'];
-  const ponCount=drg.filter(d=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===d)).length;
-  const pairIsDrg=pair&&pair[0]&&pair[0].suit==='honor'&&drg.includes(pair[0].num);
-  return ponCount===2&&pairIsDrg;
-}
-function isHonroto(hAll){return hAll.every(t=>t.suit==='honor'||(t.num===1||t.num===9));}
-function isRyanpeikou(decomp,isMenzen){
-  if(!isMenzen||!decomp.melds||decomp.melds.length<4)return false;
-  const chis=decomp.melds.filter(m=>m.type==='chi');
-  if(chis.length<4)return false;
-  const keys=chis.map(m=>m.tiles.map(t=>t.suit+t.num).sort().join(','));
-  const counts={};for(const k of keys)counts[k]=(counts[k]||0)+1;
-  return Object.values(counts).filter(v=>v>=2).length>=2;
-}
-
 function isTanyao(tiles){return tiles.every(t=>t.suit!=='honor'&&t.num>=2&&t.num<=8)}
 function isPinfu(decomp,player,gs){
   if(!decomp.melds||!decomp.melds.every(m=>m.type==='chi'))return false;
@@ -8843,21 +8824,10 @@ function calcBasicPoints(han,fu){
   if(han>=6)return 3000;if(han===5||(han===4&&fu>=30)||(han===3&&fu>=70))return 2000;
   return Math.min(fu*Math.pow(2,han+2),2000);
 }
-function calcScore(yaku,decomp,isTsumo,isDealer){
+function calcScore(yaku,decomp,isTsumo,isDealer,winnerMelds){
   const han=yaku.reduce((s,y)=>s+y.han,0);
-  // 役満は固定点数
-  const isYakuman=yaku.some(y=>y.yakuman);
-  if(isYakuman){
-    // 大四喜はダブル役満(han=26)、それ以外は役満(han=13)
-    const mult=han>=26?2:1;
-    // 役満基本点: 8000点 × 倍率
-    const base=8000*mult;
-    if(isTsumo)return{han,fu:0,basic:base,
-      dealer:base*2,nonDealer:base,isTsumo:true,yakuman:true};
-    return{han,fu:0,basic:base,
-      ron:base*(isDealer?6:4),isTsumo:false,yakuman:true};
-  }
-  const fu=calcFu(decomp,isTsumo,true);
+  const isMenzen=!winnerMelds||winnerMelds.length===0;
+  const fu=calcFu(decomp,isTsumo,isMenzen);
   const basic=calcBasicPoints(han,fu);
   if(isTsumo)return{han,fu,basic,dealer:Math.ceil(basic*2/100)*100,nonDealer:Math.ceil(basic/100)*100,isTsumo:true};
   return{han,fu,basic,ron:Math.ceil(basic*(isDealer?6:4)/100)*100,isTsumo:false};
@@ -8893,18 +8863,15 @@ function canTsumo(player){
 }
 
 // ── ゲームフロー ──
-// フリーズ検知: 最後の進行タイムスタンプ
 let _lastProgress=Date.now();
 function _touchProgress(){_lastProgress=Date.now();}
-// 8秒以上進行がなければ強制advanceTurn
 setInterval(()=>{
   if(G.gameOver||!G.phase||G.phase==='idle')return;
-  if(G.waitingForPlayer)return; // 人間の操作待ちは除外
+  if(G.waitingForPlayer)return;
   if(Date.now()-_lastProgress>5000){
     console.warn('フリーズ検知: 強制進行');
-    const cur=G.activePlayer||0;
     G.waitingForPlayer=false;G.pendingClaims=[];
-    advanceTurn(cur);
+    advanceTurn(G.activePlayer||0);
     _touchProgress();
   }
 },2000);
@@ -8914,10 +8881,6 @@ function nextTurn(){
   _touchProgress();
   const p=G.players[G.activePlayer];
   if(!G.walls.length){handleRyukyoku();return;}
-  // 海底フラグ（最後の1枚）
-  G.haitei=G.walls.length===1;
-  // 第一巡終了判定（全員1手目が終わったら）
-  if(G.activePlayer===G.dealer&&G.players.every(pl=>pl.pond.length>0)) G.firstRound=false;
   const tile=drawTile(G.activePlayer);if(!tile){handleRyukyoku();return;}
   log(`${p.name}がツモ`);renderAll();
   if(p.isHuman){G.phase='discard';G.waitingForPlayer=true;renderControls();}
@@ -8926,26 +8889,21 @@ function nextTurn(){
 
 function aiTurn(pi){
   if(G.gameOver||G.activePlayer!==pi)return;
-  if(!G.players||!G.players[pi])return;
-  _touchProgress();
   const p=G.players[pi];showWaiting(true);
   setTimeout(()=>{
-    try{
-      if(G.gameOver||!G.players[pi]){showWaiting(false);return;}
-      if(canTsumo(p)){showWaiting(false);declareWin(pi,null,true);return;}
-      const ak=canAnkan([...p.hand,...(p.drawn?[p.drawn]:[])]);
-      if(ak.length&&Math.random()<0.3){
-        const kt=[...p.hand,...(p.drawn?[p.drawn]:[])].find(t=>t.suit+t.num===ak[0]);
-        if(kt){doKan(pi,kt,true);showWaiting(false);return;}
-      }
-      const hwD=[...p.hand,...(p.drawn?[p.drawn]:[])];
-      if(!p.riichi&&!p.melds.length&&p.score>=1000&&Math.random()<0.45){
-        const wts=tenpaiTiles(hwD.slice(0,-1),p.melds);
-        if(wts.length){const d=chooseAIDiscard(pi,true);if(d){doRiichi(pi,d);showWaiting(false);return;}}
-      }
-      const d=chooseAIDiscard(pi,false);if(d)doDiscard(pi,d);else advanceTurn(pi);
-      showWaiting(false);
-    }catch(e){console.error('aiTurn error:',e);showWaiting(false);advanceTurn(pi);}
+    if(canTsumo(p)){showWaiting(false);declareWin(pi,null,true);return;}
+    const ak=canAnkan([...p.hand,...(p.drawn?[p.drawn]:[])]);
+    if(ak.length&&Math.random()<0.3){
+      const kt=[...p.hand,...(p.drawn?[p.drawn]:[])].find(t=>t.suit+t.num===ak[0]);
+      doKan(pi,kt,true);showWaiting(false);return;
+    }
+    const hwD=[...p.hand,...(p.drawn?[p.drawn]:[])];
+    if(!p.riichi&&!p.melds.length&&p.score>=1000&&Math.random()<0.45){
+      const wts=tenpaiTiles(hwD.slice(0,-1),p.melds);
+      if(wts.length){const d=chooseAIDiscard(pi,true);if(d){doRiichi(pi,d);showWaiting(false);return;}}
+    }
+    const d=chooseAIDiscard(pi,false);if(d)doDiscard(pi,d);
+    showWaiting(false);
   },400+Math.random()*400);
 }
 
@@ -8965,9 +8923,18 @@ function evaluateHand(hand,melds){
   }
   return score;
 }
-function chooseAIDiscard(pi){
+function chooseAIDiscard(pi,forRiichi){
   const p=G.players[pi];const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
   if(!all.length)return null;
+  if(forRiichi){
+    // リーチ用: テンパイを維持できる捨て牌のみ候補にする
+    const riichiCands=all.filter(t=>{const test=all.filter(x=>x.uid!==t.uid);return tenpaiTiles(test,p.melds).length>0;});
+    if(riichiCands.length){
+      let best=null,bs=-Infinity;
+      for(const t of riichiCands){const test=all.filter(x=>x.uid!==t.uid);const sc=evaluateHand(test,p.melds);if(sc>bs){bs=sc;best=t;}}
+      return best;
+    }
+  }
   let best=null,bs=-Infinity;
   for(const t of all){
     const test=all.filter(x=>x.uid!==t.uid);const sc=evaluateHand(test,p.melds);
@@ -8987,23 +8954,12 @@ function doDiscard(pi,tile){
   p.hand=sortHand(p.hand);
   p.pond.push({...tile,riichi:p.riichi&&p.riichiTurn===-1&&p.pond.length===0});
   G.lastDiscard=tile;G.lastDiscardPlayer=pi;G.phase='claim';G.selectedTile=null;
-  // 一発は自分の捨て牌後に消える（他家はadvanceTurnで消去）
-  G.ippatsu=G.ippatsu.filter(i=>i!==pi);
   log(`${p.name}が${tileStr(tile)}を捨て`);renderAll();checkClaims(tile,pi);
 }
 function doRiichi(pi,discardTile){
   const p=G.players[pi];p.score-=1000;G.riichiPool+=1000;
   p.riichi=true;p.riichiTurn=G.players.flatMap(x=>x.pond).length;
-  // ダブル立直判定（第一巡内）
-  if(G.firstRound&&p.pond.length===0){
-    p.doubleRiichi=true;G.doubleRiichiPlayers.push(pi);
-    showFloatMsg('ダブル立直！');
-  } else {
-    showFloatMsg('立直！');
-  }
-  // 一発有効
-  if(!G.ippatsu.includes(pi)) G.ippatsu.push(pi);
-  doDiscard(pi,discardTile);
+  showFloatMsg('立直！');doDiscard(pi,discardTile);
 }
 function doKan(pi,tile,isAnkan){
   const p=G.players[pi];
@@ -9011,23 +8967,13 @@ function doKan(pi,tile,isAnkan){
   let rm=0;p.hand=p.hand.filter(t=>{if(rm<4&&tilesEqual(t,tile)){rm++;return false;}return true;});
   if(p.drawn&&tilesEqual(p.drawn,tile)&&rm<4){p.drawn=null;rm++;}
   p.melds.push({type:'kan',tiles:kanTiles,isAnkan});
-  if(G.deadWall.length){p.drawn=G.deadWall.shift();G.doraIndicators.push(G.deadWall[4-G.doraIndicators.length]);G.rinshan=true;}
+  if(G.deadWall.length){p.drawn=G.deadWall.shift();G.doraIndicators.push(G.deadWall[4-G.doraIndicators.length]);}
   renderAll();log(`${p.name}が槓`);
-  if(p.isHuman){
-    G.phase='discard';G.waitingForPlayer=true;
-    // 暗槓後リーチ可能チェック
-    if(!p.riichi&&!p.melds.filter(m=>m.type!=='kan').length&&p.score>=1000){
-      const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
-      const cands=all.filter(t=>isTenpai(all.filter(x=>x.uid!==t.uid),p.melds));
-      if(cands.length) showFloatMsg('槓後リーチ可能！');
-    }
-    renderControls();
-  }
+  if(p.isHuman){G.phase='discard';renderControls();}
   else setTimeout(()=>aiTurn(pi),600);
 }
 
 function checkClaims(tile,dpi){
-  if(!tile||!G.players){advanceTurn(dpi);return;}
   const claims=[];
   for(let i=0;i<G.numPlayers;i++){
     if(i===dpi)continue;const p=G.players[i];
@@ -9054,32 +9000,20 @@ function checkClaims(tile,dpi){
   const ron=claims.filter(c=>c.type==='ron');
   if(ron.length){
     if(ron.some(c=>c.player===0)){G.pendingClaims=hc;G.waitingForPlayer=true;renderControls();return;}
-    // AIロン: 少し待ってから処理（フリーズ防止）
-    setTimeout(()=>{
-      if(!G.gameOver) declareWin(ron[0].player,dpi,false);
-    },300);
-    return;
+    declareWin(ron[0].player,dpi,false);return;
   }
   if(hc.length){G.pendingClaims=hc;G.waitingForPlayer=true;renderControls();return;}
   if(ac.length){setTimeout(()=>executeAIClaim(ac[0],tile),500);return;}
   advanceTurn(dpi);
 }
 function executeAIClaim(claim,tile){
-  if(G.gameOver)return;
-  if(!claim||!G.players||!G.players[claim.player]){advanceTurn(G.activePlayer||0);return;}
-  _touchProgress();
-  const p=G.players[claim.player];
+  if(G.gameOver)return;const p=G.players[claim.player];
   if(claim.type==='ron'){declareWin(claim.player,G.lastDiscardPlayer,false);}
   else if(claim.type==='pon'){
     let rm=0;const pt=[];
     p.hand=p.hand.filter(t=>{if(rm<2&&tilesEqual(t,tile)){rm++;pt.push(t);return false;}return true;});
     p.melds.push({type:'pon',tiles:[...pt,tile]});
-    G.activePlayer=claim.player;G.phase='discard';log(`${p.name}がポン`);
-    if(!G.players[claim.player].isHuman){
-      const _pq=['対話の継続だ','弁証法的ポン','必然的帰結','存在の確認'];
-      showFloatMsg(p.name+': ポン！\n'+_pq[Math.floor(Math.random()*_pq.length)]);
-    }
-    renderAll();
+    G.activePlayer=claim.player;G.phase='discard';log(`${p.name}がポン`);renderAll();
     setTimeout(()=>aiTurn(claim.player),600);
   } else if(claim.type==='chi'){
     const chiNums=claim.options[0];const ct=[];const th=[...p.hand];
@@ -9088,18 +9022,11 @@ function executeAIClaim(claim,tile){
       else{const x=th.findIndex(t=>t.suit===tile.suit&&t.num===n);if(x!==-1)ct.push(th.splice(x,1)[0]);}
     }
     p.hand=th;p.melds.push({type:'chi',tiles:ct});
-    G.activePlayer=claim.player;G.phase='discard';log(`${p.name}がチー`);
-    if(!G.players[claim.player].isHuman){
-      const _cq=['連続性の証明','時間的継起也','論理的帰結','実践的理性'];
-      showFloatMsg(p.name+': チー！\n'+_cq[Math.floor(Math.random()*_cq.length)]);
-    }
-    renderAll();
+    G.activePlayer=claim.player;G.phase='discard';log(`${p.name}がチー`);renderAll();
     setTimeout(()=>aiTurn(claim.player),600);
   }
 }
 function advanceTurn(from){
-  _touchProgress();
-  G.ippatsu=[]; // 誰かが副露・スキップしたら一発消える
   G.activePlayer=(from+1)%G.numPlayers;G.phase='draw';G.waitingForPlayer=false;
   renderControls();setTimeout(()=>nextTurn(),200);
 }
@@ -9112,7 +9039,7 @@ function declareWin(wi,li,isTsumo){
   const decomp=decomps[0]||{type:'normal',pair:[],melds:[],tiles:allH};
   const yaku=getYaku(decomp,winner,G,isTsumo);
   const isDealer=wi===G.dealer;
-  const si=calcScore(yaku,decomp,isTsumo,isDealer);
+  const si=calcScore(yaku,decomp,isTsumo,isDealer,winner.melds);
   const deltas=Array(G.numPlayers).fill(0);
   if(isTsumo){
     for(let i=0;i<G.numPlayers;i++){
@@ -9127,26 +9054,13 @@ function declareWin(wi,li,isTsumo){
   setTimeout(()=>showWinModal(wi,li,isTsumo,yaku,si,decomp,allH,deltas),500);
 }
 function showWinModal(wi,li,isTsumo,yaku,si,decomp,allH,deltas){
-  const isYakuman=yaku.some(y=>y.yakuman);
-  const yakumanName=isYakuman?yaku.find(y=>y.yakuman).name:'';
-  // 役満エフェクト
-  if(isYakuman){
-    showFloatMsg('🀄 '+yakumanName+' 🀄');
-  }
   let body=`<div class="hand-display">${allH.map(t=>tileHTML(t,'medium')).join('')}</div>`;
-  // 役満は専用スタイル
-  if(isYakuman){
-    body+=`<div style="text-align:center;font-size:22px;font-weight:900;color:#ff4444;margin:8px 0;text-shadow:0 0 12px #ff4444;animation:riichi-pulse .8s infinite alternate">🀄 ${yakumanName} 🀄</div>`;
-    const scoreStr=isTsumo?`${si.dealer}点/${si.nonDealer}点`:si.ron+'点';
-    body+=`<div style="text-align:center;font-size:20px;font-weight:900;color:#ffd700;margin:8px 0">役満 ${scoreStr}</div>`;
-  } else {
-    body+=`<div style="margin:8px 0;font-size:13px;color:var(--text2)">${yaku.map(y=>`<span style="margin-right:8px;color:${y.isBonus?'#ffd700':'var(--text)'}">${y.name}(${y.han}翻)</span>`).join('')}</div>`;
-    body+=`<div style="text-align:center;font-size:20px;font-weight:900;color:#ffd700;margin:8px 0">${si.han}翻${si.fu}符 ${isTsumo?si.nonDealer+'点ALL':si.ron+'点'}</div>`;
-  }
+  body+=`<div style="margin:8px 0;font-size:13px;color:var(--text2)">${yaku.map(y=>`<span style="margin-right:8px;color:${y.isBonus?'#ffd700':'var(--text)'}">${y.name}(${y.han}翻)</span>`).join('')}</div>`;
+  body+=`<div style="text-align:center;font-size:20px;font-weight:900;color:#ffd700;margin:8px 0">${si.han}翻${si.fu}符 ${isTsumo?si.nonDealer+'点ALL':si.ron+'点'}</div>`;
   body+=`<div style="margin-top:12px">`;
   for(let i=0;i<G.numPlayers;i++){const d=deltas[i];body+=`<div class="result-row"><span>${G.players[i].name}</span><span class="score-delta ${d>=0?'pos':'neg'}">${d>=0?'+':''}${d}</span><span>${G.players[i].score}</span></div>`;}
   body+=`</div>`;
-  document.getElementById('modal-title').textContent=isYakuman?('役満：'+yakumanName):(isTsumo?'ツモ和了':'ロン和了');
+  document.getElementById('modal-title').textContent=isTsumo?'ツモ和了':'ロン和了';
   document.getElementById('modal-body').innerHTML=body;
   document.getElementById('modal').classList.add('show');
   G._pendingNextRound=()=>{
@@ -9232,15 +9146,6 @@ function humanPon(){
   G.activePlayer=0;G.phase='discard';G.waitingForPlayer=true;G.pendingClaims=[];
   log('ポン');renderAll();renderControls();
 }
-function humanAnkan(suitnum){
-  if(!G.waitingForPlayer)return;
-  const p=G.players[0];
-  const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
-  const tile=all.find(t=>t.suit+t.num===suitnum);
-  if(!tile)return;
-  doKan(0,tile,true);
-  G.waitingForPlayer=false;
-}
 function humanSkip(){
   if(!G.waitingForPlayer)return;
   G.pendingClaims=[];G.waitingForPlayer=false;G.riichiCandidates=[];G.selectedTile=null;
@@ -9253,7 +9158,7 @@ function tileHTML(t,sz='medium'){
   return`<div class="tile ${t.suit} ${sz}" onclick="selectTile(${t.uid})" ondblclick="humanDiscard(${t.uid})">${tileStr(t)}</div>`;
 }
 function tileHTMLSel(t,sz,sel,rc){
-  if(!t)return'';let c=`tile ${t.suit} ${sz}`;if(sel)c+=' selected';if(rc)c+=' riichi-cand';
+  if(!t)return'';let c=`tile ${t.suit} ${sz}`;if(sel||rc)c+=' selected';
   return`<div class="${c}" onclick="selectTile(${t.uid})" ondblclick="humanDiscard(${t.uid})">${tileStr(t)}</div>`;
 }
 function renderHand(pi){
@@ -9277,7 +9182,6 @@ function renderPond(pi){
   const p=G.players[pi];const el=document.getElementById(`pond-${pi}`);if(!el)return;
   el.innerHTML=p.pond.map(t=>`<div class="tile discarded ${t.suit}">${tileStr(t)}</div>`).join('');
 }
-
 function doKita(){
   const p=G.players[0];
   const kitaIdx=p.hand.findIndex(t=>t.suit==='honor'&&t.num==='北');
@@ -9285,17 +9189,12 @@ function doKita(){
   const kita=p.hand.splice(kitaIdx,1)[0];
   if(!p.kitaCount)p.kitaCount=0;
   p.kitaCount++;
-  // 抜きドラとして記録
   if(!G.kitaDora)G.kitaDora=[];
   G.kitaDora.push(kita);
   log(`あなたが北を抜いた（${p.kitaCount}枚目）`);
-  // ツモ補充
   const drawn=drawTile(0);
-  if(drawn){p.hand.push(drawn);p.hand=sortHand(p.hand);}
+  if(drawn){p.hand.push(drawn);}
   renderAll();renderControls();
-  // 北抜き枚数をスコア表示に反映
-  const el=document.getElementById('score-0');
-  if(el&&p.kitaCount>0)el.title=`北抜き${p.kitaCount}枚`;
 }
 function renderMelds(pi){
   const p=G.players[pi];const el=document.getElementById(`melds-${pi}`);if(!el)return;
@@ -9305,54 +9204,30 @@ function renderMelds(pi){
 function renderControls(){
   const el=document.getElementById('controls');if(!el)return;
   const p=G.players[0];let html='';showWaiting(false);
-  // 北抜きボタン（3人麻雀のみ・先手番・手牌に北があるとき）
   if(G.numPlayers===3&&G.phase==='discard'&&G.activePlayer===0&&G.waitingForPlayer){
-    const p=G.players[0];
-    const kitaIdx=p.hand.findIndex(t=>t.suit==='honor'&&t.num==='北');
-    if(kitaIdx>=0){
-      html+=`<button class="action-btn" style="background:#1a6b1a" onclick="doKita()">北抜き</button>`;
-    }
+    const _ki=G.players[0].hand.findIndex(t=>t.suit==='honor'&&t.num==='北');
+    if(_ki>=0) html+=`<button class="action-btn" style="background:#1a6b1a" onclick="doKita()">北抜き</button>`;
   }
   if(G.phase==='discard'&&G.activePlayer===0&&G.waitingForPlayer){
     if(canTsumo(p))html+=`<button class="action-btn btn-tsumo" onclick="humanTsumo()">ツモ</button>`;
-    // リーチ可能判定
-    let _canRiichi=false;
-    let _riichiTiles=[];
     if(!p.riichi&&!p.melds.length&&p.score>=1000){
       const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
-      _riichiTiles=all.filter(t=>isTenpai(all.filter(x=>x.uid!==t.uid),p.melds));
-      _canRiichi=_riichiTiles.length>0;
-      if(_canRiichi)
+      if(all.some(t=>isTenpai(all.filter(x=>x.uid!==t.uid),p.melds)))
         html+=`<button class="action-btn btn-riichi" onclick="humanRiichi()">立直</button>`;
     }
-    // ⚠リーチ可能バナー
-    if(_canRiichi&&!G.riichiCandidates.length){
-      const _names=_riichiTiles.map(t=>tileStr(t)).filter((v,i,a)=>a.indexOf(v)===i).join(' or ');
-      html+=`<div style="background:rgba(255,50,50,.15);border:1px solid #f44;border-radius:6px;padding:4px 10px;margin-top:4px;font-size:12px;color:#ff6b6b">
-        ⚠ リーチ可能！→ <b style="color:#ffcc00">${_names}</b> を切ると聴牌
-      </div>`;
-    }
     if(G.riichiCandidates.length){
-      html=`<span style="font-size:13px;color:var(--gold)">⚠ 光っている牌を選んでください（立直する牌）</span>`;
+      html=`<span style="font-size:12px;color:var(--gold)">立直する牌を選んでください</span>`;
       html+=`<button class="action-btn btn-skip" onclick="G.riichiCandidates=[];G.selectedTile=null;renderControls();renderHand(0);">キャンセル</button>`;
     } else if(G.selectedTile||p.riichi){
       html+=`<button class="action-btn btn-discard" onclick="humanDiscard(${p.riichi?(p.drawn?p.drawn.uid:-1):G.selectedTile?.uid})">${p.riichi?'ツモ切り':'捨てる'}</button>`;
     } else {
       html+=`<span style="font-size:12px;color:var(--text2)">牌を選んで捨ててください（ダブルクリックで即捨て）</span>`;
     }
-    // 暗槓ボタン（人間プレイヤー）
-    if(!p.riichi){
-      const ak=canAnkan([...p.hand,...(p.drawn?[p.drawn]:[])]);
-      if(ak.length){
-        html+=`<button class="action-btn" style="background:#4a148c;color:white" onclick="humanAnkan('${ak[0]}')">暗槓</button>`;
-      }
-    }
   } else if(G.phase==='claim'&&G.waitingForPlayer){
     const cs=G.pendingClaims;
     if(cs.some(c=>c.type==='ron'))html+=`<button class="action-btn btn-ron" onclick="humanRon()">ロン</button>`;
     if(cs.some(c=>c.type==='pon'))html+=`<button class="action-btn btn-pon" onclick="humanPon()">ポン</button>`;
-    // チーは4人麻雀のみ
-    if(G.numPlayers===4&&cs.some(c=>c.type==='chi')){
+    if(cs.some(c=>c.type==='chi')){
       cs.filter(c=>c.type==='chi')[0].options.forEach(o=>{
         html+=`<button class="action-btn btn-chi" onclick="humanChi([${o}])">チー(${o.join('-')})</button>`;
       });
@@ -9396,27 +9271,9 @@ function renderAll(){
   renderScores();renderDora();renderWindLabels();renderRiichiSticks();
 }
 function showWaiting(show){const el=document.getElementById('waiting');if(el)el.style.display=show?'flex':'none';}
-// 哲学者テロップ辞書
-const _philoQuotes={
-  'ツモ！':['汝自身を知れ！','必然の勝利也','理性の勝利！','実践理性の凱歌！'],
-  'ロン！':['弁証法的展開！','コペルニクス的転回！','汝の牌は偽りだ','無知の知を示した'],
-  '立直！':['賽は投げられた','意志の表明也','道徳法則に従い','実存的決断！'],
-};
 function showFloatMsg(msg){
-  const el=document.getElementById('float-msg');
-  // 哲学者テロップがあれば付け加える
-  let display=msg;
-  const quotes=_philoQuotes[msg];
-  if(quotes&&G.players){
-    const winner=G.players.find(p=>!p.isHuman);
-    if(winner){
-      const q=quotes[Math.floor(Math.random()*quotes.length)];
-      display=msg+'\n'+winner.name+':'+q;
-    }
-  }
-  el.textContent=display;el.style.whiteSpace='pre';
-  el.classList.add('show');
-  setTimeout(()=>el.classList.remove('show'),1800);
+  const el=document.getElementById('float-msg');el.textContent=msg;el.classList.add('show');
+  setTimeout(()=>el.classList.remove('show'),1200);
 }
 function log(msg){const el=document.getElementById('game-log');if(el)el.textContent=msg;}
 function startGame(np,mode){
@@ -9663,6 +9520,7 @@ def run() -> None:
         f"  FAST: {FAST_MODEL} | MAIN: {MODEL_NAME} | DEEP: {DEEP_MODEL}\n"
         f"  RAG: HYBRID(BM25+Vector) | SECURITY: MultiLayer | THINKING: {'ON' if THINKING_MODE else 'OFF'}\n"
         f"  新コマンド: /think /plan /code /reflect /mindmap /model /ctx /speedtest\n"
+        f"  /h:コマンド一覧 | /s 1〜36:西洋哲学者 | /think:思考モード切替\n"
     )
     print(_dynamic_banner)
     # 起動時：保存済みペルソナ件数を表示
@@ -10150,12 +10008,33 @@ def run() -> None:
         total = sum(len(v) for b in PROMPT_OPTIMIZATIONS.values()
                     if isinstance(b, dict) for v in b.values())
         directive_str = ("\n" + "\n".join(directive_lines)) if directive_lines else " なし"
+        def _temp_graph(hist):
+            if len(hist) < 2: return "  (データ不足)"
+            mn,mx=min(hist),max(hist); rng=mx-mn if mx!=mn else 0.1
+            H,W=5,min(len(hist),30); data=hist[-W:]; rows=[]
+            for row in range(H,-1,-1):
+                thr=mn+rng*(row/H)
+                next_thr=mn+rng*((row-1)/H) if row>0 else mn
+                line=""
+                for v in data:
+                    if next_thr<=v<thr or (row==0 and v<=thr) or (row==H and v>=thr):
+                        line+="●"
+                    else:
+                        line+=" "
+                label=f"{thr:.2f}|" if row in (0,H) else "     |"
+                rows.append(label+line)
+            rows.append("     +"+"─"*W)
+            return "\n".join(rows)
+        trend=""
+        if len(TEMP_HISTORY)>1:
+            trend="↓低下中" if TEMP_HISTORY[-1]<TEMP_HISTORY[-2] else "↑上昇中" if TEMP_HISTORY[-1]>TEMP_HISTORY[-2] else "→安定"
         return "\n".join([
             f"{C['c']}=== 学習状態 ==={C['w']}",
             f"対話数: {LEARNING_STATS['total_interactions']}",
             f"肯定/否定: {LEARNING_STATS['positive_count']}/{LEARNING_STATS['negative_count']}",
             f"自己修正: {LEARNING_STATS['self_correction_count']}",
-            f"温度: {TEMP_VOICE:.2f} (最適候補: {get_best_temp('d') or 'none'})",
+            f"温度: {TEMP_VOICE:.2f} (最適候補: {get_best_temp('d') or 'none'}) {trend}",
+            f"温度推移:\n{_temp_graph(TEMP_HISTORY)}",
             f"キーワード: {', '.join(KEYWORD_MEMORY[-5:]) or 'なし'}",
             f"最適化: {OPTIMIZER.status()}",
             f"ユーザー指摘 全{total}件 / 現在ペルソナ({current_persona.get('name','')}):{directive_str}",
@@ -10289,8 +10168,6 @@ def run() -> None:
                     fb = analyze_feedback(raw)
                     log_interaction(raw, result, "d", fb)
                     update_param_performance("d", TEMP_VOICE, fb)
-                    if fb < -0.3:
-                        LEARNING_STATS["negative_count"] += 1
                     # ★[修正A+B] ユーザー指摘を即時にPROMPT_OPTIMIZATIONSへ反映
                     applied = apply_user_directive(raw, current_persona.get("name", ""))
                     if applied:
