@@ -1719,6 +1719,7 @@ HELP_TEXT = "\n".join([
     f"  {C['c']}/split <ID or 名前> [テーマ]{C['w']} 1ペルソナをテーゼ/アンチテーゼに分解して内的弁証法",
     f"  {C['c']}/chess{C['w']}              ♟ チェス（MCTS強化・curses UI）\n              例: /chess easy  /chess middle  /chess hard  /chess very_hard",
     f"  {C['c']}/shogi{C['w']}              将棋（Negamax+TT+Killer強化・curses UI）\n              例: /shogi easy  /shogi middle  /shogi hard  /shogi very_hard",
+    f"  {C['c']}/wolf [6|9]{C['w']}         哲学者/偉人人狼（ブラウザ起動・昼議論/投票/夜行動）\n              例: /wolf 6 → 6人村  /wolf 9 → 9人村",
     f"  {C['c']}/mj{C['w']}                🀄 本格麻雀（ブラウザ起動・AI対戦・役/符計算完全実装）\n              例: /mj        → 4人麻雀東風戦\n                  /mj 3     → 3人麻雀\n                  /mj tonpu → 4人麻雀東南戦",
     f"",
     f"  {C['c']}━━━ v130.1 新機能 ━━━{C['w']}",
@@ -8780,6 +8781,245 @@ def handle_shogi(arg: str, persona: dict | None = None) -> str:
     return f"\033[32m{result or '将棋を終了しました'}\033[0m"
 
 
+# ===== 哲学者人狼ゲーム =====
+_PHIL_WOLF_HTML_PATH: str | None = None
+
+def handle_philosopher_wolf(arg: str) -> str:
+    """
+    /wolf [6|9] — ブラウザで哲学者/偉人人狼を起動する。
+      6 : 人狼1・占い師1・騎士1・村人3
+      9 : 人狼2・狂人1・占い師1・霊媒師1・騎士1・村人3
+    """
+    global _PHIL_WOLF_HTML_PATH
+    import tempfile, pathlib
+
+    arg = arg.strip().lower()
+    village_size = 9 if "9" in arg else 6
+    html_content = _build_philosopher_wolf_html(village_size)
+
+    save_dir = tempfile.gettempdir()
+    if _PHIL_WOLF_HTML_PATH and pathlib.Path(_PHIL_WOLF_HTML_PATH).exists():
+        html_path = _PHIL_WOLF_HTML_PATH
+    else:
+        import uuid
+        html_path = os.path.join(save_dir, f"s01_philosopher_wolf_{uuid.uuid4().hex[:8]}.html")
+        _PHIL_WOLF_HTML_PATH = html_path
+
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    file_uri = pathlib.Path(html_path).as_uri()
+
+    def _try_open_browser(uri: str) -> tuple[bool, str]:
+        import subprocess as _sp
+        _sys = platform.system()
+        if _sys == "Windows":
+            candidates = [
+                (os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"), "Brave"),
+                (os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"), "Chrome"),
+                (os.path.expandvars(r"%PROGRAMFILES%\Mozilla Firefox\firefox.exe"), "Firefox"),
+            ]
+            for exe, name in candidates:
+                if exe and os.path.exists(exe):
+                    try:
+                        _sp.Popen([exe, uri], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                        return True, name
+                    except Exception:
+                        pass
+            try:
+                os.startfile(uri)  # type: ignore[attr-defined]
+                return True, "既定ブラウザ"
+            except Exception:
+                return False, "起動失敗"
+        try:
+            import webbrowser
+            return (webbrowser.open(uri), "既定ブラウザ")
+        except Exception:
+            return False, "起動失敗"
+
+    ok, browser_name = _try_open_browser(file_uri)
+    label = f"{village_size}人村"
+    if ok:
+        return (
+            f"\033[32m哲学者人狼 {label} を起動しました（{browser_name}）。\033[0m\n"
+            f"\033[36m{file_uri}\033[0m\n"
+            f"\033[33m   /wolf 6 → 6人村  /wolf 9 → 9人村\033[0m"
+        )
+    return (
+        f"\033[33m哲学者人狼HTMLを作成しましたが、ブラウザ自動起動に失敗しました。\033[0m\n"
+        f"\033[36m{file_uri}\033[0m"
+    )
+
+def _build_philosopher_wolf_html(village_size: int = 6) -> str:
+    auto_size = 9 if village_size == 9 else 6
+    html = r"""<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>哲学者人狼 - S-01</title>
+<style>
+:root{--bg:#151411;--panel:#24221d;--line:#4a4237;--text:#f5eee2;--muted:#b8ab98;--accent:#c9a24d;--red:#c85b55;--blue:#6190c8;--green:#6ea36f}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:"Yu Gothic UI","Meiryo",system-ui,sans-serif;min-height:100vh}
+button,select{font:inherit}button{border:1px solid var(--line);background:#302c25;color:var(--text);border-radius:7px;padding:9px 12px;cursor:pointer}button:hover{border-color:var(--accent)}button.primary{background:var(--accent);color:#17130c;border-color:var(--accent);font-weight:700}button.danger{background:var(--red);border-color:var(--red);color:white}button:disabled{opacity:.45;cursor:not-allowed}
+.app{max-width:1180px;margin:0 auto;padding:18px}.top{display:flex;gap:12px;align-items:end;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:12px}.title{font-size:26px;font-weight:800}.sub{color:var(--muted);font-size:13px}.controls{display:flex;gap:8px;flex-wrap:wrap}
+.grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px;margin-top:14px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}.status{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.stat{background:#1d1b17;border:1px solid var(--line);border-radius:7px;padding:9px}.stat b{display:block;color:var(--accent);font-size:12px}.players{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px;margin-top:12px}.card{border:1px solid var(--line);background:#1b1a17;border-radius:8px;padding:10px;min-height:116px}.card.dead{opacity:.48}.name{font-weight:800}.role{font-size:12px;color:var(--muted);margin-top:3px}.tag{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;font-size:11px;margin:6px 4px 0 0;color:var(--muted)}.tag.red{color:#ffd9d6;border-color:var(--red)}.tag.blue{color:#d7e9ff;border-color:var(--blue)}.tag.green{color:#ddf3d7;border-color:var(--green)}
+.talk{height:345px;overflow:auto;background:#161510;border:1px solid var(--line);border-radius:8px;padding:10px}.line{padding:7px 0;border-bottom:1px solid rgba(255,255,255,.06)}.speaker{color:var(--accent);font-weight:700}.system{color:var(--muted)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.voteRow{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;border-bottom:1px solid rgba(255,255,255,.06);padding:7px 0}.small{font-size:12px;color:var(--muted)}.result{font-size:18px;font-weight:800;color:var(--accent);margin-top:8px}
+@media(max-width:860px){.grid{grid-template-columns:1fr}.status{grid-template-columns:repeat(2,1fr)}.top{align-items:start;flex-direction:column}.talk{height:300px}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="top">
+    <div><div class="title">哲学者人狼</div><div class="sub">偉人たちが思想・演説・疑念で殴り合う、6人/9人対応の人狼ゲーム</div></div>
+    <div class="controls">
+      <button onclick="newGame(6)">6人村</button>
+      <button onclick="newGame(9)">9人村</button>
+      <button class="primary" onclick="advance()">進行</button>
+    </div>
+  </div>
+  <div class="grid">
+    <section class="panel">
+      <div class="status">
+        <div class="stat"><b>村</b><span id="villageSize">-</span></div>
+        <div class="stat"><b>日数</b><span id="day">-</span></div>
+        <div class="stat"><b>フェーズ</b><span id="phase">-</span></div>
+        <div class="stat"><b>あなた</b><span id="myRole">-</span></div>
+      </div>
+      <div class="players" id="players"></div>
+    </section>
+    <section class="panel">
+      <div class="talk" id="log"></div>
+      <div class="actions" id="actions"></div>
+      <div class="result" id="result"></div>
+    </section>
+  </div>
+</div>
+<script>
+const PEOPLE=[
+ ['あなた','沈黙もまた発言である。だが投票は沈黙を許さない。'],
+ ['ソクラテス','私は知らない。だからこそ、誰が知りすぎているかを問おう。'],
+ ['プラトン','洞窟の影に紛れた狼を、理性の光で照らすべきだ。'],
+ ['アリストテレス','証拠・性格・行為。この三つから推論しよう。'],
+ ['カント','疑わしき者を処刑する格率は普遍化できるか。'],
+ ['ニーチェ','群れの道徳に隠れる者こそ、もっとも狼らしい。'],
+ ['孔子','言行一致せぬ者は、村の礼を乱す。'],
+ ['マキャベリ','生き残るためなら美徳の仮面を疑え。'],
+ ['ジャンヌ・ダルク','恐れず名を挙げよ。沈む声に火を灯せ。'],
+ ['アインシュタイン','単純な疑いほど美しい。ただし単純すぎてはいけない。'],
+ ['紫式部','人の心は文の端に漏れるもの。発言の綾を見ましょう。'],
+ ['レオナルド','観察せよ。筆跡よりも投票の構図だ。']
+];
+const roleInfo={
+ 'werewolf':'人狼','madman':'狂人','seer':'占い師','medium':'霊媒師','knight':'騎士','villager':'村人'
+};
+let G;
+function shuffle(a){for(let i=a.length-1;i>0;i--){let j=Math.random()*(i+1)|0;[a[i],a[j]]=[a[j],a[i]]}return a}
+function newGame(n){
+ const roles=n===9?['werewolf','werewolf','madman','seer','medium','knight','villager','villager','villager']:['werewolf','seer','knight','villager','villager','villager'];
+ const pool=[PEOPLE[0],...shuffle(PEOPLE.slice(1)).slice(0,n-1)];
+ const assigned=shuffle([...roles]);
+ G={n,day:1,phase:'昼議論',players:pool.map((p,i)=>({id:i,name:p[0],quote:p[1],role:assigned[i],alive:true,known:false,votes:0,suspicion:Math.random()})),log:[],lastExecuted:null,winner:null};
+ G.players[0].known=true; say('system',`${n}人村開始。昼議論から始まります。`);
+ discussion(); render();
+}
+function alive(){return G.players.filter(p=>p.alive)}
+function wolvesAlive(){return alive().filter(p=>p.role==='werewolf').length}
+function villagersAlive(){return alive().filter(p=>p.role!=='werewolf').length}
+function checkWin(){
+ if(wolvesAlive()===0){G.winner='村人陣営の勝利';return true}
+ if(wolvesAlive()>=villagersAlive()){G.winner='人狼陣営の勝利';return true}
+ return false;
+}
+function say(who,msg){G.log.push({who,msg}); if(G.log.length>160)G.log.shift()}
+function suspicionFor(p){
+ let s=p.suspicion;
+ if(p.role==='werewolf')s+=.18;
+ if(p.role==='madman')s+=.1;
+ if(G.lastExecuted&&p.role==='werewolf')s+=.05;
+ return s+Math.random()*.35;
+}
+function discussion(){
+ const list=shuffle(alive().filter(p=>p.id!==0)).slice(0,Math.min(5,alive().length-1));
+ for(const p of list){
+   const target=shuffle(alive().filter(x=>x.id!==p.id))[0];
+   const lines=[
+    `${p.quote} 私は${target.name}の昨日の間合いが気になる。`,
+    `${target.name}を急いで信じるには、まだ根拠が薄い。`,
+    `今日は投票の連鎖を見るべきだ。${target.name}への票が集まるなら、その理由を問いたい。`,
+    `狼は正義を語る時ほど、言葉を飾る。${target.name}を注視する。`
+   ];
+   say(p.name,lines[Math.random()*lines.length|0]);
+ }
+}
+function advance(){
+ if(G.winner){newGame(G.n);return}
+ if(G.phase==='昼議論'){G.phase='投票'; render(); return}
+ if(G.phase==='投票'){resolveVote(); if(!checkWin())G.phase='夜'; render(); return}
+ if(G.phase==='夜'){resolveNight(); if(!checkWin()){G.day++;G.phase='昼議論';discussion()} render(); return}
+}
+function resolveVote(){
+ alive().forEach(p=>p.votes=0);
+ const humanTarget=Number((document.getElementById('voteTarget')||{}).value ?? -1);
+ if(G.players[0].alive&&humanTarget>=0&&G.players[humanTarget]?.alive)G.players[humanTarget].votes++;
+ for(const p of alive().filter(p=>p.id!==0)){
+   const candidates=alive().filter(x=>x.id!==p.id);
+   let t;
+   if(p.role==='werewolf')t=shuffle(candidates.filter(x=>x.role!=='werewolf'))[0]||shuffle(candidates)[0];
+   else if(p.role==='madman')t=shuffle(candidates.filter(x=>x.role!=='madman'))[0];
+   else t=candidates.sort((a,b)=>suspicionFor(b)-suspicionFor(a))[0];
+   t.votes++;
+ }
+ const max=Math.max(...alive().map(p=>p.votes));
+ const tied=alive().filter(p=>p.votes===max);
+ const dead=shuffle(tied)[0]; dead.alive=false; G.lastExecuted=dead;
+ say('system',`投票結果: ${dead.name}が処刑された。正体はまだ伏せられる。`);
+ if(G.players[0].role==='medium'&&G.players[0].alive) say('system',`霊媒結果: ${dead.name}は${dead.role==='werewolf'?'人狼':'人狼ではない'}。`);
+}
+function resolveNight(){
+ const wolves=alive().filter(p=>p.role==='werewolf');
+ const guardSel=Number((document.getElementById('guardTarget')||{}).value ?? -1);
+ const seeSel=Number((document.getElementById('seeTarget')||{}).value ?? -1);
+ if(G.players[0].role==='seer'&&G.players[0].alive&&seeSel>=0){
+   const t=G.players[seeSel]; t.known=true; say('system',`占い結果: ${t.name}は${t.role==='werewolf'?'人狼':'人狼ではない'}。`);
+ }
+ let guard=-1;
+ if(G.players[0].role==='knight'&&G.players[0].alive)guard=guardSel;
+ else {
+   const k=alive().find(p=>p.role==='knight');
+   if(k)guard=shuffle(alive().filter(p=>p.id!==k.id))[0].id;
+ }
+ let victim=shuffle(alive().filter(p=>p.role!=='werewolf'))[0];
+ if(victim&&victim.id===guard){say('system',`夜明け。騎士の護衛が成功し、犠牲者は出なかった。`);return}
+ if(victim){victim.alive=false;say('system',`夜明け。${victim.name}が無残な姿で発見された。`);}
+}
+function render(){
+ document.getElementById('villageSize').textContent=G.n+'人村';
+ document.getElementById('day').textContent=G.day+'日目';
+ document.getElementById('phase').textContent=G.phase;
+ document.getElementById('myRole').textContent=roleInfo[G.players[0].role];
+ document.getElementById('players').innerHTML=G.players.map(p=>`<div class="card ${p.alive?'':'dead'}"><div class="name">${p.name}</div><div class="role">${p.id===0||p.known?roleInfo[p.role]:'役職不明'}</div><span class="tag ${p.alive?'green':'red'}">${p.alive?'生存':'死亡'}</span>${p.votes?`<span class="tag red">${p.votes}票</span>`:''}<div class="small">${p.quote}</div></div>`).join('');
+ document.getElementById('log').innerHTML=G.log.map(x=>`<div class="line"><span class="${x.who==='system'?'system':'speaker'}">${x.who}</span> ${x.msg}</div>`).join('');
+ document.getElementById('log').scrollTop=99999;
+ const opts=alive().filter(p=>p.id!==0).map(p=>`<option value="${p.id}">${p.name}</option>`).join('');
+ let act='';
+ if(G.phase==='昼議論')act='<button class="primary" onclick="advance()">投票へ</button>';
+ if(G.phase==='投票')act=G.players[0].alive?`<select id="voteTarget">${opts}</select><button class="danger" onclick="advance()">投票する</button>`:'<span class="small">死亡中のため投票できません</span><button class="primary" onclick="advance()">投票結果へ</button>';
+ if(G.phase==='夜'){
+   if(G.players[0].role==='seer'&&G.players[0].alive)act+=`<span class="small">占い</span><select id="seeTarget">${opts}</select>`;
+   if(G.players[0].role==='knight'&&G.players[0].alive)act+=`<span class="small">護衛</span><select id="guardTarget">${alive().map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}</select>`;
+   act+='<button class="primary" onclick="advance()">夜を明かす</button>';
+ }
+ document.getElementById('actions').innerHTML=act;
+ document.getElementById('result').textContent=G.winner?`${G.winner}。進行ボタンで新規開始。`:'';
+}
+newGame(__AUTO_SIZE__);
+</script>
+</body>
+</html>"""
+    return html.replace("__AUTO_SIZE__", str(auto_size))
+
+
 # ===== 麻雀ゲーム =====
 _MAHJONG_HTML_PATH: str | None = None
 
@@ -10859,6 +11099,8 @@ def run() -> None:
         "ety": lambda a: handle_ety(a),
         "chess":       lambda a: handle_chess(a, persona=current_persona),
         "shogi":       lambda a: handle_shogi(a, persona=current_persona),
+        "wolf":        lambda a: handle_philosopher_wolf(a),
+        "jinro":       lambda a: handle_philosopher_wolf(a),
         "mj":          lambda a: handle_mahjong(a),
         # ★[v129] 新コマンド
         "think":       lambda a: handle_think_mode(a),
@@ -11713,7 +11955,3 @@ def run() -> None:
 if __name__ == "__main__":
     atexit.register(_cleanup)
     run()
-
-
-
-
