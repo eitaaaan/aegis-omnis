@@ -829,7 +829,7 @@ _SSRF_BLOCKED_HOSTS = frozenset([
     "169.254.169.254",   # AWS/GCP/Azure メタデータエンドポイント
     "metadata.google.internal",
 ])
-_SSRF_BLOCKED_PREFIXES = ("10.", "192.168.", "172.")
+_SSRF_BLOCKED_PREFIXES = ("10.", "192.168.")
 
 def _assert_safe_path(raw_path: str) -> str:
     """パストラバーサル防止: カレントディレクトリ外へのアクセスを拒否する。
@@ -842,8 +842,9 @@ def _assert_safe_path(raw_path: str) -> str:
 def _assert_safe_url(url: str) -> None:
     """SSRF防止: ローカルホスト・内部ネットワーク・非HTTPスキームをブロックする。
     ★[修正/#9] IPv6マップドアドレス (::ffff:127.0.0.1)・10進数IP (2130706433)・
-    ブラケット記法も遮断するよう強化。"""
-    import ipaddress
+    ブラケット記法も遮断するよう強化。
+    ★[v130.7] DNSリバインディング対策として、ホスト名の解決先IPも検査する。"""
+    import ipaddress, socket
     parsed = U.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"許可されていないスキーム: {parsed.scheme!r}")
@@ -859,22 +860,52 @@ def _assert_safe_url(url: str) -> None:
     for prefix in _SSRF_BLOCKED_PREFIXES:
         if host_lower.startswith(prefix):
             raise ValueError(f"アクセス禁止: プライベートIPレンジ ({host!r})")
+    if re.match(r"^172\.(1[6-9]|2\d|3[0-1])\.", host_lower):
+        raise ValueError(f"アクセス禁止: プライベートIPレンジ ({host!r})")
+
+    def _blocked_ip(ip_obj) -> bool:
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+            return _blocked_ip(ip_obj.ipv4_mapped)
+        return (
+            ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local
+            or ip_obj.is_reserved or ip_obj.is_unspecified or ip_obj.is_multicast
+        )
 
     # ★ IPv6マップドアドレス・純粋数値IP（10進/16進）をipaddressで検証
     try:
-        ip = ipaddress.ip_address(host_lower)
-        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved:
+        if host_lower.isdigit():
+            ip = ipaddress.ip_address(int(host_lower))
+        elif host_lower.startswith("0x"):
+            ip = ipaddress.ip_address(int(host_lower, 16))
+        else:
+            ip = ipaddress.ip_address(host_lower)
+        if _blocked_ip(ip):
             raise ValueError(f"アクセス禁止: プライベート/ループバックIPアドレス ({host!r})")
-        # IPv6マップドアドレス (::ffff:127.x.x.x 等) を追加チェック
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-            mapped = ip.ipv4_mapped
-            if mapped.is_loopback or mapped.is_private or mapped.is_link_local:
-                raise ValueError(f"アクセス禁止: IPv6マップドプライベートアドレス ({host!r})")
     except ValueError as e:
         if "アクセス禁止" in str(e):
             raise
         # ip_address() が失敗した場合はホスト名として続行（既に prefix チェック済み）
         pass
+
+    # ホスト名がlocalhost/社内IPに解決されるケースを遮断する。
+    # DNS解決に失敗するURLは実リクエストも成功しないため、安全側に倒す。
+    if not re.match(r"^\[?[0-9a-f:.]+\]?$", host_lower, re.I) and not host_lower.isdigit() and not host_lower.startswith("0x"):
+        try:
+            resolved = socket.getaddrinfo(host_lower, None, proto=socket.IPPROTO_TCP)
+        except socket.gaierror as e:
+            raise ValueError(f"ホスト名を解決できません: {host!r} ({e})")
+        checked = set()
+        for family, _, _, _, sockaddr in resolved:
+            ip_text = sockaddr[0]
+            if ip_text in checked:
+                continue
+            checked.add(ip_text)
+            try:
+                if _blocked_ip(ipaddress.ip_address(ip_text)):
+                    raise ValueError(f"アクセス禁止: ホスト名が内部IPに解決されます ({host!r} -> {ip_text})")
+            except ValueError as e:
+                if "アクセス禁止" in str(e):
+                    raise
 
 
 def _exec_tool(name: str, **kwargs) -> str:
@@ -917,12 +948,7 @@ def _exec_tool(name: str, **kwargs) -> str:
             url = kwargs.get("url", "")
             _assert_safe_url(url)   # SSRF防止（リクエスト前）
             # ★[修正/#9] リダイレクト先もSSRFチェックする
-            import urllib.request as _ur
-            class _NoRedirectHandler(_ur.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    _assert_safe_url(newurl)  # リダイレクト先を検証
-                    return super().redirect_request(req, fp, code, msg, headers, newurl)
-            text = fetch_html(url, timeout=8, silent=True)
+            text = fetch_html(url, timeout=8, silent=True, redirect_checker=_assert_safe_url)
             return strip_tags(text)[:2000] if text else "取得失敗"
 
         elif name == "file_read":
@@ -2269,7 +2295,8 @@ _ctx_unverified = _build_ssl_ctx(verify=False)
 _opener_verified   = R.build_opener(R.HTTPSHandler(context=_ctx_verified),   R.HTTPCookieProcessor(_cookie_jar))
 _opener_unverified = R.build_opener(R.HTTPSHandler(context=_ctx_unverified),  R.HTTPCookieProcessor(_cookie_jar))
 
-def fetch_html(url: str, data: bytes | None = None, timeout: int = 5, silent: bool = False, spoof_bot: bool = False) -> str:
+def fetch_html(url: str, data: bytes | None = None, timeout: int = 5, silent: bool = False,
+               spoof_bot: bool = False, redirect_checker=None) -> str:
     import random
     ua = random.choice([
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
@@ -2285,10 +2312,23 @@ def fetch_html(url: str, data: bytes | None = None, timeout: int = 5, silent: bo
             except UnicodeDecodeError: continue
         return raw.decode("utf-8", "ignore")
 
+    def _make_opener(ctx: ssl.SSLContext):
+        handlers = [R.HTTPSHandler(context=ctx), R.HTTPCookieProcessor(_cookie_jar)]
+        if redirect_checker:
+            class _CheckedRedirectHandler(R.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    redirect_checker(newurl)
+                    return super().redirect_request(req, fp, code, msg, headers, newurl)
+            handlers.append(_CheckedRedirectHandler())
+        return R.build_opener(*handlers) if redirect_checker else None
+
+    opener_verified = _make_opener(_ctx_verified) or _opener_verified
+    opener_unverified = _make_opener(_ctx_unverified) or _opener_unverified
+
     req = R.Request(url, data=data, headers=headers)
     # まず証明書検証ありで試みる（セキュアなデフォルト）
     try:
-        with _opener_verified.open(req, timeout=timeout) as resp:
+        with opener_verified.open(req, timeout=timeout) as resp:
             return _decode(resp.read())
     except ssl.SSLError:
         # SSL証明書エラー時のみ検証なしにフォールバック（警告を出す）
@@ -2296,7 +2336,7 @@ def fetch_html(url: str, data: bytes | None = None, timeout: int = 5, silent: bo
             print(f"{C['y']}[NET] SSL証明書エラー。検証なしでリトライ中...{C['w']}")
         try:
             req2 = R.Request(url, data=data, headers=headers)
-            with _opener_unverified.open(req2, timeout=timeout) as resp:
+            with opener_unverified.open(req2, timeout=timeout) as resp:
                 return _decode(resp.read())
         except Exception as e:
             if not silent: print(f"{C['r']}[NET] {e}{C['w']}")
@@ -8791,13 +8831,36 @@ def handle_philosopher_wolf(arg: str) -> str:
       9 : 人狼2・狂人1・占い師1・霊媒師1・騎士1・村人3
     """
     global _PHIL_WOLF_HTML_PATH
-    import tempfile, pathlib
+    import tempfile, pathlib, webbrowser
 
     arg = arg.strip().lower()
     village_size = 9 if "9" in arg else 6
     html_content = _build_philosopher_wolf_html(village_size)
 
-    save_dir = tempfile.gettempdir()
+    # ── ファイル確保（WSL対応: /mj と同じロジック）────────────────────
+    def _get_win_temp_dir() -> "str | None":
+        """WSL環境でWindowsのTEMPディレクトリを返す。非WSLならNone。"""
+        try:
+            import subprocess as _sp3
+            win_temp = _sp3.check_output(
+                ["cmd.exe", "/c", "echo", "%TEMP%"],
+                stderr=_sp3.DEVNULL).decode().strip()
+            if win_temp:
+                linux_temp = _sp3.check_output(
+                    ["wslpath", "-u", win_temp],
+                    stderr=_sp3.DEVNULL).decode().strip()
+                if os.path.isdir(linux_temp):
+                    return linux_temp
+        except Exception:
+            pass
+        for d in ["/mnt/c/Windows/Temp", "/mnt/c/Users/Public"]:
+            if os.path.isdir(d):
+                return d
+        return None
+
+    win_temp = _get_win_temp_dir()
+    save_dir = win_temp if win_temp else tempfile.gettempdir()
+
     if _PHIL_WOLF_HTML_PATH and pathlib.Path(_PHIL_WOLF_HTML_PATH).exists():
         html_path = _PHIL_WOLF_HTML_PATH
     else:
@@ -8810,48 +8873,165 @@ def handle_philosopher_wolf(arg: str) -> str:
 
     file_uri = pathlib.Path(html_path).as_uri()
 
-    def _try_open_browser(uri: str) -> tuple[bool, str]:
+    def _try_open_browser(uri: str) -> "tuple[bool, str]":
         import subprocess as _sp
         _sys = platform.system()
+
+        # ── Windows ──────────────────────────────────────────
         if _sys == "Windows":
             candidates = [
                 (os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"), "Brave"),
+                (os.path.expandvars(r"%PROGRAMFILES%\BraveSoftware\Brave-Browser\Application\brave.exe"), "Brave"),
+                (os.path.expandvars(r"%PROGRAMFILES(X86)%\BraveSoftware\Brave-Browser\Application\brave.exe"), "Brave"),
                 (os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"), "Chrome"),
+                (os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"), "Chrome"),
                 (os.path.expandvars(r"%PROGRAMFILES%\Mozilla Firefox\firefox.exe"), "Firefox"),
             ]
             for exe, name in candidates:
-                if exe and os.path.exists(exe):
+                if os.path.isfile(exe):
                     try:
-                        _sp.Popen([exe, uri], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                        S.Popen([exe, uri])
                         return True, name
                     except Exception:
-                        pass
+                        continue
+
+        # ── macOS ─────────────────────────────────────────────
+        elif _sys == "Darwin":
+            mac_candidates = [
+                (["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", uri], "Brave"),
+                (["open", "-a", "Brave Browser", uri], "Brave"),
+                (["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", uri], "Chrome"),
+                (["open", "-a", "Google Chrome", uri], "Chrome"),
+                (["open", "-a", "Firefox", uri], "Firefox"),
+            ]
+            for cmd, name in mac_candidates:
+                try:
+                    S.Popen(cmd)
+                    return True, name
+                except Exception:
+                    continue
+
+        # ── Linux / WSL ───────────────────────────────────────
+        else:
             try:
-                os.startfile(uri)  # type: ignore[attr-defined]
-                return True, "既定ブラウザ"
+                # Linuxパス → Windowsパスに変換してcmd.exeで開く（WSL対応）
+                linux_path = uri.replace("file://", "").replace("%20", " ")
+                _win_path = _sp.check_output(
+                    ["wslpath", "-w", linux_path],
+                    stderr=_sp.DEVNULL).decode().strip()
+                S.Popen(["cmd.exe", "/c", "start", "", _win_path],
+                        stdout=S.DEVNULL, stderr=S.DEVNULL)
+                return True, "ブラウザ"
             except Exception:
-                return False, "起動失敗"
+                pass
+            linux_bins = [
+                ("brave-browser", "Brave"), ("brave", "Brave"),
+                ("google-chrome", "Chrome"), ("firefox", "Firefox"),
+            ]
+            for bin_name, display_name in linux_bins:
+                if shutil.which(bin_name):
+                    try:
+                        S.Popen([bin_name, uri], stdout=S.DEVNULL, stderr=S.DEVNULL)
+                        return True, display_name
+                    except Exception:
+                        continue
+
+        # ── 最終フォールバック ────────────────────────────────
         try:
-            import webbrowser
-            return (webbrowser.open(uri), "既定ブラウザ")
-        except Exception:
-            return False, "起動失敗"
+            webbrowser.open(uri)
+            return True, "デフォルトブラウザ"
+        except Exception as e:
+            return False, str(e)
 
     ok, browser_name = _try_open_browser(file_uri)
     label = f"{village_size}人村"
     if ok:
         return (
-            f"\033[32m哲学者人狼 {label} を起動しました（{browser_name}）。\033[0m\n"
-            f"\033[36m{file_uri}\033[0m\n"
+            f"\033[32m哲学者人狼 {label} を {browser_name} で起動しました。\033[0m\n"
+            f"\033[90m   ファイル: {html_path}\033[0m\n"
             f"\033[33m   /wolf 6 → 6人村  /wolf 9 → 9人村\033[0m"
         )
     return (
         f"\033[33m哲学者人狼HTMLを作成しましたが、ブラウザ自動起動に失敗しました。\033[0m\n"
-        f"\033[36m{file_uri}\033[0m"
+        f"次のURLをBraveのアドレスバーに貼り付けてください:\n{file_uri}"
     )
+
+def _build_philosopher_wolf_cast() -> list[list[str]]:
+    """哲学者人狼の参加者候補を作る。
+    PERSONA_MAPとローカルRAGのヒットを使いつつ、最終的には許可リスト化した歴史上の偉人だけに絞る。
+    """
+    import random as _random
+
+    curated: dict[str, str] = {
+        "孔子": "礼を失った者の声は、群れの調和を乱す。私はそこを見る。",
+        "老子": "騒がしい者ほど道から遠い。無為の静けさに狼の足音が残る。",
+        "釈迦": "執着は疑いにも恐れにも宿る。苦の源を見れば狼も見える。",
+        "アレクサンドロス大王": "退路を断て。議論の戦場で逃げる者から崩れる。",
+        "カエサル": "賽は投げられた。票の流れこそ、この村のルビコンだ。",
+        "クレオパトラ": "魅了する言葉ほど危うい。私は沈黙の香りまで疑う。",
+        "始皇帝": "秩序を乱す者は一人で十分だ。名乗りと票を統一せよ。",
+        "卑弥呼": "闇に祈り、声の震えを聞く。狼は神託を恐れる。",
+        "聖徳太子": "和を乱す言葉は、どれほど整っていても響きが濁る。",
+        "紫式部": "人の心は文の端に漏れるもの。発言の綾を見ましょう。",
+        "ジャンヌ・ダルク": "恐れず名を挙げよ。沈む声に火を灯せ。",
+        "レオナルド・ダ・ヴィンチ": "観察せよ。筆跡よりも投票の構図だ。",
+        "ミケランジェロ": "余分な石を削れば像が出る。余分な弁明を削れば狼が出る。",
+        "ガリレオ": "それでも票は動く。観察なき断罪には従えない。",
+        "ニュートン": "小さな違和感にも力がある。疑惑は万有引力のように集まる。",
+        "ダーウィン": "生き残る発言には理由がある。適応しすぎた者を疑え。",
+        "ナイチンゲール": "記録を見ましょう。感情より、票と発言の統計です。",
+        "リンカーン": "分裂した村は立ち行かない。だが狼との妥協は平和ではない。",
+        "坂本龍馬": "時代を動かすには、まず腹の内を見抜かにゃならん。",
+        "福沢諭吉": "独立自尊の村に、他人任せの推理はいらない。",
+        "野口英世": "病巣は小さく始まる。発言の微熱を見逃すな。",
+        "マリー・キュリー": "光るものは真実だけではない。沈黙の放射も測りましょう。",
+        "アインシュタイン": "単純な疑いほど美しい。ただし単純すぎてはいけない。",
+        "テスラ": "空気の震えで分かる。嘘は電流のように乱れる。",
+        "エジソン": "推理は一パーセントの直感と九十九パーセントの検証だ。",
+        "チャーチル": "暗い夜ほど、我々は言葉で防衛線を築くのだ。",
+        "ガンディー": "暴力を拒むことと、狼を見逃すことは違う。",
+        "キング牧師": "私には夢がある。恐怖ではなく真実で票が動く村の夢だ。",
+    }
+
+    cast: dict[str, str] = {
+        "あなた": "沈黙もまた発言である。だが投票は沈黙を許さない。"
+    }
+    excluded_living = {"ハーバーマス"}
+    for p in PERSONA_MAP.values():
+        name = p.get("name", "").strip()
+        if name and name not in excluded_living:
+            cast.setdefault(name, f"{name}は自らの思想で発言の矛盾を照らす。")
+    cast.update(curated)
+
+    allowed_names = set(cast)
+    rag_queries = [
+        "歴史上の偉人 哲学者 科学者 作家 政治家",
+        "世界史 偉人 思想家 発明家 芸術家",
+        "日本史 偉人 思想家 政治家 作家",
+    ]
+    rag_names: list[str] = []
+    try:
+        cols = ["s01_memory"] + [c for c in vector_list_collections() if c != "s01_memory"]
+        for col in cols[:8]:
+            for q in rag_queries:
+                for hit in vector_search(q, n=5, collection=col):
+                    for name in allowed_names:
+                        if name != "あなた" and name in hit:
+                            if name not in rag_names:
+                                rag_names.append(name)
+    except Exception:
+        pass
+
+    rag_people = [[name, cast[name]] for name in rag_names if name in cast]
+    other_names = [name for name in cast if name not in ("あなた", *rag_names)]
+    _random.shuffle(rag_people)
+    _random.shuffle(other_names)
+    others = rag_people + [[name, cast[name]] for name in other_names]
+    return [["あなた", cast["あなた"]]] + others
 
 def _build_philosopher_wolf_html(village_size: int = 6) -> str:
     auto_size = 9 if village_size == 9 else 6
+    cast_json = json.dumps(_build_philosopher_wolf_cast(), ensure_ascii=False)
     html = r"""<!doctype html>
 <html lang="ja">
 <head>
@@ -8865,6 +9045,7 @@ button,select{font:inherit}button{border:1px solid var(--line);background:#302c2
 .app{max-width:1180px;margin:0 auto;padding:18px}.top{display:flex;gap:12px;align-items:end;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:12px}.title{font-size:26px;font-weight:800}.sub{color:var(--muted);font-size:13px}.controls{display:flex;gap:8px;flex-wrap:wrap}
 .grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px;margin-top:14px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}.status{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.stat{background:#1d1b17;border:1px solid var(--line);border-radius:7px;padding:9px}.stat b{display:block;color:var(--accent);font-size:12px}.players{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px;margin-top:12px}.card{border:1px solid var(--line);background:#1b1a17;border-radius:8px;padding:10px;min-height:116px}.card.dead{opacity:.48}.name{font-weight:800}.role{font-size:12px;color:var(--muted);margin-top:3px}.tag{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;font-size:11px;margin:6px 4px 0 0;color:var(--muted)}.tag.red{color:#ffd9d6;border-color:var(--red)}.tag.blue{color:#d7e9ff;border-color:var(--blue)}.tag.green{color:#ddf3d7;border-color:var(--green)}
 .talk{height:345px;overflow:auto;background:#161510;border:1px solid var(--line);border-radius:8px;padding:10px}.line{padding:7px 0;border-bottom:1px solid rgba(255,255,255,.06)}.speaker{color:var(--accent);font-weight:700}.system{color:var(--muted)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.voteRow{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;border-bottom:1px solid rgba(255,255,255,.06);padding:7px 0}.small{font-size:12px;color:var(--muted)}.result{font-size:18px;font-weight:800;color:var(--accent);margin-top:8px}
+.telop{position:fixed;left:50%;top:18px;transform:translate(-50%,-18px);z-index:20;max-width:min(820px,calc(100vw - 28px));padding:12px 18px;border:1px solid rgba(201,162,77,.72);background:rgba(22,18,12,.94);box-shadow:0 14px 42px rgba(0,0,0,.38);border-radius:8px;color:#fff2c7;font-weight:800;text-align:center;opacity:0;pointer-events:none;transition:opacity .24s ease,transform .24s ease}.telop.show{opacity:1;transform:translate(-50%,0)}.telop.danger{border-color:rgba(200,91,85,.8);color:#ffe0dc}.telop.blue{border-color:rgba(97,144,200,.8);color:#dcecff}
 @media(max-width:860px){.grid{grid-template-columns:1fr}.status{grid-template-columns:repeat(2,1fr)}.top{align-items:start;flex-direction:column}.talk{height:300px}}
 </style>
 </head>
@@ -8895,40 +9076,35 @@ button,select{font:inherit}button{border:1px solid var(--line);background:#302c2
     </section>
   </div>
 </div>
+<div class="telop" id="telop"></div>
 <script>
-const PEOPLE=[
- ['あなた','沈黙もまた発言である。だが投票は沈黙を許さない。'],
- ['ソクラテス','私は知らない。だからこそ、誰が知りすぎているかを問おう。'],
- ['プラトン','洞窟の影に紛れた狼を、理性の光で照らすべきだ。'],
- ['アリストテレス','証拠・性格・行為。この三つから推論しよう。'],
- ['カント','疑わしき者を処刑する格率は普遍化できるか。'],
- ['ニーチェ','群れの道徳に隠れる者こそ、もっとも狼らしい。'],
- ['孔子','言行一致せぬ者は、村の礼を乱す。'],
- ['マキャベリ','生き残るためなら美徳の仮面を疑え。'],
- ['ジャンヌ・ダルク','恐れず名を挙げよ。沈む声に火を灯せ。'],
- ['アインシュタイン','単純な疑いほど美しい。ただし単純すぎてはいけない。'],
- ['紫式部','人の心は文の端に漏れるもの。発言の綾を見ましょう。'],
- ['レオナルド','観察せよ。筆跡よりも投票の構図だ。']
-];
+const PEOPLE=__CAST_JSON__;
 const roleInfo={
  'werewolf':'人狼','madman':'狂人','seer':'占い師','medium':'霊媒師','knight':'騎士','villager':'村人'
 };
 let G;
 function shuffle(a){for(let i=a.length-1;i>0;i--){let j=Math.random()*(i+1)|0;[a[i],a[j]]=[a[j],a[i]]}return a}
+let telopTimer=null;
+function telop(msg,type=''){
+ const el=document.getElementById('telop'); if(!el)return;
+ el.textContent=msg; el.className='telop show '+type;
+ clearTimeout(telopTimer); telopTimer=setTimeout(()=>{el.className='telop '+type},2300);
+}
 function newGame(n){
  const roles=n===9?['werewolf','werewolf','madman','seer','medium','knight','villager','villager','villager']:['werewolf','seer','knight','villager','villager','villager'];
  const pool=[PEOPLE[0],...shuffle(PEOPLE.slice(1)).slice(0,n-1)];
  const assigned=shuffle([...roles]);
  G={n,day:1,phase:'昼議論',players:pool.map((p,i)=>({id:i,name:p[0],quote:p[1],role:assigned[i],alive:true,known:false,votes:0,suspicion:Math.random()})),log:[],lastExecuted:null,winner:null};
  G.players[0].known=true; say('system',`${n}人村開始。昼議論から始まります。`);
+ telop(`開廷: ${n}人の歴史的偉人が集う人狼裁判`, 'blue');
  discussion(); render();
 }
 function alive(){return G.players.filter(p=>p.alive)}
 function wolvesAlive(){return alive().filter(p=>p.role==='werewolf').length}
 function villagersAlive(){return alive().filter(p=>p.role!=='werewolf').length}
 function checkWin(){
- if(wolvesAlive()===0){G.winner='村人陣営の勝利';return true}
- if(wolvesAlive()>=villagersAlive()){G.winner='人狼陣営の勝利';return true}
+ if(wolvesAlive()===0){G.winner='村人陣営の勝利';telop('終幕: 村人陣営の勝利', 'blue');return true}
+ if(wolvesAlive()>=villagersAlive()){G.winner='人狼陣営の勝利';telop('終幕: 人狼陣営の勝利', 'danger');return true}
  return false;
 }
 function say(who,msg){G.log.push({who,msg}); if(G.log.length>160)G.log.shift()}
@@ -8954,9 +9130,9 @@ function discussion(){
 }
 function advance(){
  if(G.winner){newGame(G.n);return}
- if(G.phase==='昼議論'){G.phase='投票'; render(); return}
- if(G.phase==='投票'){resolveVote(); if(!checkWin())G.phase='夜'; render(); return}
- if(G.phase==='夜'){resolveNight(); if(!checkWin()){G.day++;G.phase='昼議論';discussion()} render(); return}
+ if(G.phase==='昼議論'){G.phase='投票'; telop('投票開始: 疑念を一票に変えよ'); render(); return}
+ if(G.phase==='投票'){resolveVote(); if(!checkWin()){G.phase='夜';telop('夜が来る: 偉人たちは沈黙する', 'danger')} render(); return}
+ if(G.phase==='夜'){resolveNight(); if(!checkWin()){G.day++;G.phase='昼議論';telop(`${G.day}日目: 議論再開`, 'blue');discussion()} render(); return}
 }
 function resolveVote(){
  alive().forEach(p=>p.votes=0);
@@ -8974,6 +9150,7 @@ function resolveVote(){
  const tied=alive().filter(p=>p.votes===max);
  const dead=shuffle(tied)[0]; dead.alive=false; G.lastExecuted=dead;
  say('system',`投票結果: ${dead.name}が処刑された。正体はまだ伏せられる。`);
+ telop(`処刑: ${dead.name}が歴史の法廷を去った`, 'danger');
  if(G.players[0].role==='medium'&&G.players[0].alive) say('system',`霊媒結果: ${dead.name}は${dead.role==='werewolf'?'人狼':'人狼ではない'}。`);
 }
 function resolveNight(){
@@ -8982,6 +9159,7 @@ function resolveNight(){
  const seeSel=Number((document.getElementById('seeTarget')||{}).value ?? -1);
  if(G.players[0].role==='seer'&&G.players[0].alive&&seeSel>=0){
    const t=G.players[seeSel]; t.known=true; say('system',`占い結果: ${t.name}は${t.role==='werewolf'?'人狼':'人狼ではない'}。`);
+   telop(`占い: ${t.name}は${t.role==='werewolf'?'人狼':'白'}判定`, t.role==='werewolf'?'danger':'blue');
  }
  let guard=-1;
  if(G.players[0].role==='knight'&&G.players[0].alive)guard=guardSel;
@@ -8989,9 +9167,15 @@ function resolveNight(){
    const k=alive().find(p=>p.role==='knight');
    if(k)guard=shuffle(alive().filter(p=>p.id!==k.id))[0].id;
  }
- let victim=shuffle(alive().filter(p=>p.role!=='werewolf'))[0];
- if(victim&&victim.id===guard){say('system',`夜明け。騎士の護衛が成功し、犠牲者は出なかった。`);return}
- if(victim){victim.alive=false;say('system',`夜明け。${victim.name}が無残な姿で発見された。`);}
+ const killSel=Number((document.getElementById('killTarget')||{}).value ?? -1);
+ let victim=null;
+ if(G.players[0].role==='werewolf'&&G.players[0].alive&&killSel>=0&&G.players[killSel]?.alive&&G.players[killSel].role!=='werewolf'){
+   victim=G.players[killSel];
+ } else {
+   victim=shuffle(alive().filter(p=>p.role!=='werewolf'))[0];
+ }
+ if(victim&&victim.id===guard){say('system',`夜明け。騎士の護衛が成功し、犠牲者は出なかった。`);telop('護衛成功: 歴史はまだ書き換わらない', 'blue');return}
+ if(victim){victim.alive=false;say('system',`夜明け。${victim.name}が無残な姿で発見された。`);telop(`襲撃: ${victim.name}、退場`, 'danger');}
 }
 function render(){
  document.getElementById('villageSize').textContent=G.n+'人村';
@@ -9006,8 +9190,9 @@ function render(){
  if(G.phase==='昼議論')act='<button class="primary" onclick="advance()">投票へ</button>';
  if(G.phase==='投票')act=G.players[0].alive?`<select id="voteTarget">${opts}</select><button class="danger" onclick="advance()">投票する</button>`:'<span class="small">死亡中のため投票できません</span><button class="primary" onclick="advance()">投票結果へ</button>';
  if(G.phase==='夜'){
-   if(G.players[0].role==='seer'&&G.players[0].alive)act+=`<span class="small">占い</span><select id="seeTarget">${opts}</select>`;
-   if(G.players[0].role==='knight'&&G.players[0].alive)act+=`<span class="small">護衛</span><select id="guardTarget">${alive().map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}</select>`;
+  if(G.players[0].role==='seer'&&G.players[0].alive)act+=`<span class="small">占い</span><select id="seeTarget">${opts}</select>`;
+  if(G.players[0].role==='knight'&&G.players[0].alive)act+=`<span class="small">護衛</span><select id="guardTarget">${alive().map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}</select>`;
+   if(G.players[0].role==='werewolf'&&G.players[0].alive)act+=`<span class="small">襲撃</span><select id="killTarget">${alive().filter(p=>p.role!=='werewolf').map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}</select>`;
    act+='<button class="primary" onclick="advance()">夜を明かす</button>';
  }
  document.getElementById('actions').innerHTML=act;
@@ -9017,7 +9202,7 @@ newGame(__AUTO_SIZE__);
 </script>
 </body>
 </html>"""
-    return html.replace("__AUTO_SIZE__", str(auto_size))
+    return html.replace("__AUTO_SIZE__", str(auto_size)).replace("__CAST_JSON__", cast_json)
 
 
 # ===== 麻雀ゲーム =====
@@ -9899,6 +10084,25 @@ function doKan(pi,tile,isAnkan){
   else setTimeout(()=>aiTurn(pi),600);
 }
 
+function doDaimikan(pi,discardTile){
+  // 大明槓: 手牌から3枚 + 捨て牌1枚 = 4枚でカン
+  const p=G.players[pi];
+  const kanTiles=[];let rm=0;
+  p.hand=p.hand.filter(t=>{if(rm<3&&tilesEqual(t,discardTile)){rm++;kanTiles.push(t);return false;}return true;});
+  if(rm<3){console.warn('doDaimikan: 牌不足 rm='+rm+' → 強制進行');advanceTurn(G.lastDiscardPlayer!=null?G.lastDiscardPlayer:0);return;}
+  kanTiles.push(discardTile);
+  p.melds.push({type:'kan',tiles:kanTiles,isAnkan:false});
+  if(G.deadWall.length){
+    p.drawn=G.deadWall.shift();
+    const _doraPos=4-G.doraIndicators.length;
+    if(_doraPos>=0&&_doraPos<G.deadWall.length)G.doraIndicators.push(G.deadWall[_doraPos]);
+  }
+  G.pendingClaims=[];
+  renderAll();log(`${p.name}が大明槓`);
+  if(p.isHuman){G.activePlayer=pi;G.phase='discard';G.waitingForPlayer=true;renderControls();}
+  else{G.activePlayer=pi;setTimeout(()=>aiTurn(pi),600);}
+}
+
 function checkClaims(tile,dpi){
   const claims=[];
   for(let i=0;i<G.numPlayers;i++){
@@ -9913,6 +10117,11 @@ function checkClaims(tile,dpi){
     if(!p.riichi&&canPon(p.hand,tile)&&!_isKitaTile3){
       if(p.isHuman)claims.push({type:'pon',player:i,priority:2});
       else if(Math.random()<0.4)claims.push({type:'pon',player:i,priority:2});
+    }
+    // ★[修正/kan] 大明槓クレーム（手牌に3枚ある場合）
+    if(!p.riichi&&canKan(p.hand,tile)&&!_isKitaTile3){
+      if(p.isHuman)claims.push({type:'kan',player:i,priority:2});
+      else if(Math.random()<0.25)claims.push({type:'kan',player:i,priority:2});
     }
     if(!p.riichi&&G.numPlayers===4){
       const co=canChi(p.hand,tile,i,dpi);
@@ -9974,9 +10183,11 @@ function executeAIClaim(claim,tile){
     renderAll();
     const _cpi=claim.player;
     setTimeout(()=>aiTurn(_cpi),600);
+  } else if(claim.type==='kan'){
+    // ★[修正/kan] AI大明槓
+    doDaimikan(claim.player,tile);
   } else {
-    // ★[修正/freeze-claim] 未知のクレームタイプ: 旧コードはここで何も呼ばずゲームが
-    // phase='claim' のまま永久凍結した。else 節を追加して強制進行する。
+    // ★[修正/freeze-claim] 未知のクレームタイプ
     console.warn('executeAIClaim: 未知タイプ='+claim.type+' → 強制進行');
     advanceTurn(G.lastDiscardPlayer!=null?G.lastDiscardPlayer:G.activePlayer||0);
   }
@@ -10114,6 +10325,46 @@ function humanSkip(){
   advanceTurn(G.lastDiscardPlayer);
 }
 
+// ── カン操作 ──
+function humanKan(){
+  // 大明槓: claim フェーズで呼ばれる
+  if(!G.waitingForPlayer)return;
+  const tile=G.lastDiscard;
+  doDaimikan(0,tile);
+}
+function humanAnkan(sn){
+  // 暗槓: discard フェーズで呼ばれる
+  if(!G.waitingForPlayer)return;
+  const p=G.players[0];
+  const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
+  const tile=all.find(t=>t.suit+t.num===sn);
+  if(!tile)return;
+  G.waitingForPlayer=false;
+  doKan(0,tile,true);
+}
+function humanKakan(sn){
+  // 加槓: discard フェーズで呼ばれる（既存のポンに4枚目を追加）
+  if(!G.waitingForPlayer)return;
+  const p=G.players[0];
+  const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
+  const addTile=all.find(t=>t.suit+t.num===sn);
+  if(!addTile)return;
+  const ponIdx=p.melds.findIndex(m=>m.type==='pon'&&tilesEqual(m.tiles[0],addTile));
+  if(ponIdx===-1)return;
+  if(p.drawn&&p.drawn.uid===addTile.uid){p.drawn=null;}
+  else{const idx=p.hand.findIndex(t=>t.uid===addTile.uid);if(idx!==-1)p.hand.splice(idx,1);}
+  p.melds[ponIdx].tiles.push(addTile);
+  p.melds[ponIdx].type='kan';
+  if(G.deadWall.length){
+    p.drawn=G.deadWall.shift();
+    const _doraPos=4-G.doraIndicators.length;
+    if(_doraPos>=0&&_doraPos<G.deadWall.length)G.doraIndicators.push(G.deadWall[_doraPos]);
+  }
+  G.waitingForPlayer=false;
+  G.activePlayer=0;G.phase='discard';G.waitingForPlayer=true;
+  log('加槓');renderAll();renderControls();
+}
+
 // ── 描画 ──
 function tileHTML(t,sz='medium'){
   if(!t)return'';
@@ -10183,13 +10434,21 @@ function renderControls(){
   }
   if(G.phase==='discard'&&G.activePlayer===0&&G.waitingForPlayer){
     if(canTsumo(p))html+=`<button class="action-btn btn-tsumo" onclick="humanTsumo()">ツモ</button>`;
+    // ★[修正/kan] 暗槓・加槓ボタン
+    if(!p.riichi){
+      const _ak=canAnkan([...p.hand,...(p.drawn?[p.drawn]:[])]);
+      for(const _sn of _ak){const _kt=[...p.hand,...(p.drawn?[p.drawn]:[])].find(t=>t.suit+t.num===_sn);html+=`<button class="action-btn btn-kan" onclick="humanAnkan('${_sn}')">暗槓(${_kt?tileStr(_kt):'?'})</button>`;}
+      const _allH=[...p.hand,...(p.drawn?[p.drawn]:[])];
+      for(const _m of p.melds){if(_m.type==='pon'&&_allH.some(t=>tilesEqual(t,_m.tiles[0]))){const _sn=_m.tiles[0].suit+_m.tiles[0].num;html+=`<button class="action-btn btn-kan" onclick="humanKakan('${_sn}')">加槓(${tileStr(_m.tiles[0])})</button>`;}}
+    }
     if(!p.riichi&&!p.melds.length&&p.score>=1000){
       const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
       if(all.some(t=>isTenpai(all.filter(x=>x.uid!==t.uid),p.melds)))
         html+=`<button class="action-btn btn-riichi" onclick="humanRiichi()">立直</button>`;
     }
     if(G.riichiCandidates.length){
-      html=`<span style="font-size:12px;color:var(--gold)">立直する牌を選んでください</span>`;
+      // ★[修正/dama-tsumo] 旧コード html=代入でツモボタンを上書きしていた→html+=に変更
+      html+=`<span style="font-size:12px;color:var(--gold)">立直する牌を選んでください</span>`;
       html+=`<button class="action-btn btn-skip" onclick="G.riichiCandidates=[];G.selectedTile=null;renderControls();renderHand(0);">キャンセル</button>`;
     } else if(G.selectedTile||p.riichi){
       html+=`<button class="action-btn btn-discard" onclick="humanDiscard(${p.riichi?(p.drawn?p.drawn.uid:-1):G.selectedTile?.uid})">${p.riichi?'ツモ切り':'捨てる'}</button>`;
@@ -10200,6 +10459,8 @@ function renderControls(){
     const cs=G.pendingClaims;
     if(cs.some(c=>c.type==='ron'))html+=`<button class="action-btn btn-ron" onclick="humanRon()">ロン</button>`;
     if(cs.some(c=>c.type==='pon'))html+=`<button class="action-btn btn-pon" onclick="humanPon()">ポン</button>`;
+    // ★[修正/kan] 大明槓ボタン
+    if(cs.some(c=>c.type==='kan'))html+=`<button class="action-btn btn-kan" onclick="humanKan()">カン</button>`;
     if(cs.some(c=>c.type==='chi')){
       cs.filter(c=>c.type==='chi')[0].options.forEach(o=>{
         html+=`<button class="action-btn btn-chi" onclick="humanChi([${o}])">チー(${o.join('-')})</button>`;
@@ -10803,38 +11064,39 @@ def _trusted_fetch(url: str, timeout: int = 8) -> str:
     Raises:
         ValueError: ホワイトリスト外ドメイン・安全でないURL
     """
-    import ipaddress as _ipa
-    # ① 基本SSRF検査（既存の強化済みチェック）
-    _assert_safe_url(url)
+    def _assert_trusted_reference_url(candidate: str) -> None:
+        # ① 基本SSRF検査（既存の強化済みチェック）
+        _assert_safe_url(candidate)
 
-    # ② ホワイトリストドメイン検査
-    parsed = U.urlparse(url)
-    host = (parsed.hostname or "").lower()
-    # サブドメインも許可（例: blog.openai.com, research.google.com）
-    allowed = any(
-        host == d or host.endswith("." + d)
-        for d in _TRUSTED_AI_DOMAINS
-    )
-    if not allowed:
-        raise ValueError(
-            f"[trusted_fetch] ホワイトリスト外ドメインへのアクセスを拒否: {host!r}\n"
-            f"許可ドメイン: {sorted(_TRUSTED_AI_DOMAINS)}"
+        # ② ホワイトリストドメイン検査
+        parsed = U.urlparse(candidate)
+        host = (parsed.hostname or "").lower()
+        # サブドメインも許可（例: blog.openai.com, research.google.com）
+        allowed = any(
+            host == d or host.endswith("." + d)
+            for d in _TRUSTED_AI_DOMAINS
         )
+        if not allowed:
+            raise ValueError(
+                f"[trusted_fetch] ホワイトリスト外ドメインへのアクセスを拒否: {host!r}\n"
+                f"許可ドメイン: {sorted(_TRUSTED_AI_DOMAINS)}"
+            )
 
-    # ③ HTTPSのみ許可（ホワイトリストでも HTTP は不可）
-    if parsed.scheme != "https":
-        raise ValueError(f"[trusted_fetch] HTTPS以外は許可しない: {parsed.scheme!r}")
+        # ③ HTTPSのみ許可（ホワイトリストでも HTTP は不可）
+        if parsed.scheme != "https":
+            raise ValueError(f"[trusted_fetch] HTTPS以外は許可しない: {parsed.scheme!r}")
 
-    # ④ URLパスのサニタイズ（パストラバーサル・制御文字）
-    path = parsed.path
-    if ".." in path or any(c in path for c in ("\x00", "\r", "\n")):
-        raise ValueError(f"[trusted_fetch] 不正なURLパス: {path!r}")
+        # ④ URLパスのサニタイズ（パストラバーサル・制御文字）
+        path = parsed.path
+        if ".." in path or any(c in path for c in ("\x00", "\r", "\n")):
+            raise ValueError(f"[trusted_fetch] 不正なURLパス: {path!r}")
 
-    # ⑤ クエリパラメータ長制限（ReDoS・過剰クエリ対策）
-    if len(parsed.query) > 512:
-        raise ValueError(f"[trusted_fetch] クエリパラメータが長すぎます: {len(parsed.query)} chars")
+        # ⑤ クエリパラメータ長制限（ReDoS・過剰クエリ対策）
+        if len(parsed.query) > 512:
+            raise ValueError(f"[trusted_fetch] クエリパラメータが長すぎます: {len(parsed.query)} chars")
 
-    return fetch_html(url, timeout=timeout, silent=True)
+    _assert_trusted_reference_url(url)
+    return fetch_html(url, timeout=timeout, silent=True, redirect_checker=_assert_trusted_reference_url)
 
 
 def _stop_files() -> str:
@@ -10853,6 +11115,7 @@ def _stop_files() -> str:
 
 def run() -> None:
     global POWER_MODE, TEMP_VOICE, KEYWORD_MEMORY, ROLEPLAY_ACTIVE, ROLEPLAY_SCENE, CUSTOM_PERSONA
+    global _SESSION_START_INTERACTIONS
     SESSION_STATS["start_time"] = time.time()
     messages: list[dict] = []
     persona_id: int = 2
@@ -11187,10 +11450,10 @@ def run() -> None:
         _REF_STATE["run_count"] += 1
 
         lines = [
-            f"{C['c']}{{'═'*64}}{C['w']}",
+            f"{C['c']}{'═'*64}{C['w']}",
             f"{C['c']}  /reference  AI技術インテリジェンス & 自己改善システム"
             f"  (#{_REF_STATE['run_count']}){C['w']}",
-            f"{C['c']}{{'═'*64}}{C['w']}",
+            f"{C['c']}{'═'*64}{C['w']}",
         ]
         if 0 < elapsed < 60:
             lines.append(
@@ -11547,13 +11810,13 @@ def run() -> None:
 
         # ══ フッター ══
         lines += [
-            f"\n{C['c']}{{'═'*64}}{C['w']}",
+            f"\n{C['c']}{'═'*64}{C['w']}",
             f"{C['dim']}  最適化履歴: {len(OPTIMIZATION_HISTORY)}件 | "
             f"評価ログ: {len(SELF_EVAL_LOG)}件 | "
             f"ディレクティブ: {total_directives}件 | "
             f"実行回数: #{_REF_STATE['run_count']}{C['w']}",
             f"{C['dim']}  反映された技術は次回の応答から自動適用されます{C['w']}",
-            f"{C['c']}{{'═'*64}}{C['w']}",
+            f"{C['c']}{'═'*64}{C['w']}",
         ]
         return "\n".join(lines)
 
