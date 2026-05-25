@@ -8915,6 +8915,49 @@ def _build_philosopher_wolf_cast() -> list[list[str]]:
             cast.setdefault(name, f"{name}は自らの思想で発言の矛盾を照らす。")
     cast.update(curated)
 
+    # PERSONA_MAPのキャラに人狼用セリフを補完
+    wolf_quotes = {
+        "ソクラテス": "吟味せよ。問われた者の目の動きに真実が宿る。",
+        "プラトン": "洞窟の影を信じる者ほど、狼の言葉に惑わされる。",
+        "アリストテレス": "中庸を欠いた発言は、どちらかに偏っている。それが手がかりだ。",
+        "デカルト": "われ疑う、ゆえにわれあり。この村でも疑うことが出発点だ。",
+        "スピノザ": "感情に流された票は、真理から遠ざかる。",
+        "ライプニッツ": "この村は最善の状態にない。ならば狼を見つけるほかない。",
+        "ヒューム": "習慣と印象に騙されるな。証拠なき断罪を戒める。",
+        "カント": "汝の行為の格率が、普遍的法則たりうるか問え。",
+        "ヘーゲル": "矛盾の中にこそ真理が宿る。対立を恐れるな。",
+        "マルクス": "構造を見よ。誰が得をするかを問えば狼が見える。",
+        "ニーチェ": "力への意志を持て。恐れから票を投じるな。",
+        "フレーゲ": "言葉の意味と指示対象を区別せよ。発言の裏を読め。",
+        "フッサール": "現象そのものへ。先入見を括弧に入れて観察せよ。",
+        "ハイデガー": "存在を問え。この村で何かを隠している者がいる。",
+        "ベルクソン": "直観を信じよ。知性だけでは狼を見抜けない。",
+        "ウィトゲンシュタイン": "語りえぬことについては沈黙せよ。だが沈黙も語る。",
+        "サルトル": "実存は本質に先立つ。役職ではなく行動で判断せよ。",
+        "カミュ": "不条理を直視せよ。この村の混乱も然り。",
+        "メルロ＝ポンティ": "身体の感覚を信じよ。違和感を無視するな。",
+        "レヴィナス": "他者の顔を見よ。狼は他者性を消そうとする。",
+        "デリダ": "テクストの外はない。発言の差異に狼の痕跡がある。",
+        "フーコー": "権力の作動を見よ。誰が議論を支配しているか。",
+        "ドゥルーズ": "差異と反復の中に真実がある。同じ言葉を繰り返す者を疑え。",
+        "ロールズ": "無知のヴェールの下では誰もが公平な票を投じるはずだ。",
+        "マルクス・アウレリウス": "自分のなすべきことをなせ。他者の言動に惑わされるな。",
+        "エピクテトス": "制御できるものと制御できないものを区別せよ。",
+        "パスカル": "人間は考える葦。この村でも思考が武器だ。",
+        "キルケゴール": "実存の飛躍を恐れるな。決断の時が来た。",
+        "ショーペンハウアー": "意志の盲目性を見よ。本能で動く者が狼かもしれない。",
+        "ウィリアム・ジェームズ": "真理とは有用なものだ。この村で役立つ推理をせよ。",
+        "デューイ": "経験から学べ。昨日の議論が今日の手がかりだ。",
+        "バートランド・ラッセル": "論理的に考えよ。感情論では狼は見つからない。",
+        "ポパー": "反証可能性を問え。証明できない主張を疑え。",
+        "クワイン": "信念の網を揺さぶれ。どこかに綻びがある。",
+        "ハーバーマス": "対話的理性を信じる。だし欺く者には通じない。",
+        "アドルノ": "啓蒙の弁証法を見よ。理性もまた狼の道具になりうる。",
+    }
+    for name, quote in wolf_quotes.items():
+        if name in cast and cast[name].endswith('発言の矛盾を照らす。'):
+            cast[name] = quote
+
     allowed_names = set(cast)
     rag_queries = [
         "歴史上の偉人 哲学者 科学者 作家 政治家",
@@ -9027,18 +9070,106 @@ function suspicionFor(p){
  if(G.lastExecuted&&p.role==='werewolf')s+=.05;
  return s+Math.random()*.35;
 }
-function discussion(){
- const list=shuffle(alive().filter(p=>p.id!==0)).slice(0,Math.min(5,alive().length-1));
- for(const p of list){
-   const target=shuffle(alive().filter(x=>x.id!==p.id))[0];
-   const lines=[
-    `${p.quote} 私は${target.name}の昨日の間合いが気になる。`,
-    `${target.name}を急いで信じるには、まだ根拠が薄い。`,
-    `今日は投票の連鎖を見るべきだ。${target.name}への票が集まるなら、その理由を問いたい。`,
-    `狼は正義を語る時ほど、言葉を飾る。${target.name}を注視する。`
-   ];
-   say(p.name,lines[Math.random()*lines.length|0]);
+function aiCO(){
+ for(const p of alive().filter(p=>p.id!==0)){
+  if(p.co)continue;
+  if(p.role==='seer'){
+   p.co=true;
+   say(p.name,'【CO】私は占い師です。');
+   const lastSee=G.log.filter(x=>x.who==='system'&&x.msg.includes('占い結果')&&x.msg.includes(p.name)).slice(-1)[0];
+   if(lastSee)say(p.name,lastSee.msg);
+  }else if(p.role==='medium'&&G.day>=2){
+   p.co=true;
+   say(p.name,'【CO】私は霊媒師です。');
+   const lastMed=G.log.filter(x=>x.who==='system'&&x.msg.includes('霊媒結果')).slice(-1)[0];
+   if(lastMed)say(p.name,lastMed.msg);
+  }else if((p.role==='werewolf'||p.role==='madman')&&Math.random()<0.3){
+   p.co=true;
+   const fakeCO=Math.random()<0.5?'占い師':'霊媒師';
+   p.fakeRole=fakeCO;
+   say(p.name,'【CO】私は'+fakeCO+'です。');
+   if(fakeCO==='占い師'){
+    const fakeTarget=alive().filter(x=>x.id!==p.id)[Math.random()*alive().filter(x=>x.id!==p.id).length|0];
+    if(fakeTarget)say(p.name,'占い結果: '+fakeTarget.name+'は'+(Math.random()<0.7?'村人':'人狼')+'です。');
+   }else{
+    const dead=G.players.filter(x=>!x.alive);
+    if(dead.length>0){
+     const fakeD=dead[Math.random()*dead.length|0];
+     say(p.name,'霊媒結果: '+fakeD.name+'は'+(Math.random()<0.7?'村人':'人狼')+'でした。');
+    }
+   }
+  }
  }
+}
+function discussion(){
+ aiCO();
+ const list=shuffle(alive().filter(p=>p.id!==0));
+ for(const p of list){
+  const recentLog=G.log.filter(x=>x.who!=='system').slice(-3);
+  const lastMsg=recentLog.length>0?recentLog[recentLog.length-1]:null;
+  const coers=G.players.filter(x=>x.co&&x.id!==p.id&&x.alive);
+  let msg='';
+
+  // COへの反応
+  if(coers.length>0&&Math.random()<0.5){
+   const coer=coers[Math.random()*coers.length|0];
+   const reactions=[
+    `${coer.name}のCOは信じられるか？私には疑問が残る。`,
+    `${coer.name}が名乗り出た。だが言葉は証拠にならない。`,
+    `${coer.name}のCOを踏まえると、票の動きを見直す必要がある。`,
+    `${coer.name}よ、その役職を証明してみせよ。`
+   ];
+   msg=p.quote+' '+reactions[Math.random()*reactions.length|0];
+  }
+  // 名指しされた人の反論
+  else if(lastMsg&&lastMsg.msg.includes(p.name)&&Math.random()<0.6){
+   const reactions=[
+    `私を疑うか。${lastMsg.who}こそ、その根拠を示せ。`,
+    `${lastMsg.who}が私を名指しした。だが真実は投票が明かす。`,
+    `${lastMsg.who}よ、私への疑念は的外れだ。`,
+    `私を狙うとは。${lastMsg.who}の意図を問いたい。`
+   ];
+   msg=p.quote+' '+reactions[Math.random()*reactions.length|0];
+  }
+  // 前の発言者への言及
+  else if(lastMsg&&Math.random()<0.4){
+   const reactions=[
+    `${lastMsg.who}の発言が引っかかる。もう少し掘り下げるべきだ。`,
+    `${lastMsg.who}よ、その言葉の裏を問いたい。`,
+    `${lastMsg.who}の論理には穴がある。`
+   ];
+   msg=p.quote+' '+reactions[Math.random()*reactions.length|0];
+  }
+  // 通常発言
+  else{
+   const target=shuffle(alive().filter(x=>x.id!==p.id))[0];
+   const suffixes=[
+    `私は${target.name}の昨日の間合いが気になる。`,
+    `${target.name}を急いで信じるには、まだ根拠が薄い。`,
+    `今日は${target.name}への票の理由を問いたい。`,
+    `${target.name}を注視する。`
+   ];
+   msg=p.quote+' '+suffixes[Math.random()*suffixes.length|0];
+  }
+  say(p.name,msg);
+ }
+}
+function playerCO(){
+ const me=G.players[0];
+ me.co=true;
+ if(me.role==='seer'){
+  say('あなた','【CO】私は占い師です。');
+  const lastSee=G.log.filter(x=>x.who==='system'&&x.msg.includes('占い結果')).slice(-1)[0];
+  if(lastSee)say('あなた',lastSee.msg);
+ }else if(me.role==='medium'){
+  say('あなた','【CO】私は霊媒師です。');
+  const lastMed=G.log.filter(x=>x.who==='system'&&x.msg.includes('霊媒結果')).slice(-1)[0];
+  if(lastMed)say('あなた',lastMed.msg);
+ }else if(me.role==='knight'){
+  const guardLog=G.log.filter(x=>x.who==='system'&&x.msg.includes('護衛')).slice(-1)[0];
+  say('あなた','【護衛公開】'+(guardLog?guardLog.msg:'まだ護衛していません。'));
+ }
+ render();
 }
 function advance(){
  if(G.winner){newGame(G.n);return}
@@ -9063,14 +9194,14 @@ function resolveVote(){
  const dead=shuffle(tied)[0]; dead.alive=false; G.lastExecuted=dead;
  say('system',`投票結果: ${dead.name}が処刑された。正体はまだ伏せられる。`);
  telop(`処刑: ${dead.name}が歴史の法廷を去った`, 'danger');
- if(G.players[0].role==='medium'&&G.players[0].alive) say('system',`霊媒結果: ${dead.name}は${dead.role==='werewolf'?'人狼':'人狼ではない'}。`);
+ if(G.players[0].role==='medium'&&G.players[0].alive) say('system',`霊媒結果: ${dead.name}は${dead.role==='werewolf'?'🐺黒（人狼）':'⬜白（村人）'}でした。`);
 }
 function resolveNight(){
  const wolves=alive().filter(p=>p.role==='werewolf');
  const guardSel=Number((document.getElementById('guardTarget')||{}).value ?? -1);
  const seeSel=Number((document.getElementById('seeTarget')||{}).value ?? -1);
  if(G.players[0].role==='seer'&&G.players[0].alive&&seeSel>=0){
-   const t=G.players[seeSel]; t.known=true; say('system',`占い結果: ${t.name}は${t.role==='werewolf'?'人狼':'人狼ではない'}。`);
+   const t=G.players[seeSel]; t.known=true; say('system',`占い結果: ${t.name}は${t.role==='werewolf'?'🐺黒（人狼）':'⬜白（村人）'}でした。`);
    telop(`占い: ${t.name}は${t.role==='werewolf'?'人狼':'白'}判定`, t.role==='werewolf'?'danger':'blue');
  }
  let guard=-1;
@@ -9099,7 +9230,16 @@ function render(){
  document.getElementById('log').scrollTop=99999;
  const opts=alive().filter(p=>p.id!==0).map(p=>`<option value="${p.id}">${p.name}</option>`).join('');
  let act='';
- if(G.phase==='昼議論')act='<button class="primary" onclick="advance()">投票へ</button>';
+ if(G.phase==='昼議論'){
+  act='<button class="primary" onclick="advance()">投票へ</button>';
+  const me=G.players[0];
+  if(me.alive&&!me.co){
+   if(me.role==='seer'||me.role==='medium')
+    act+='<button class="primary" onclick="playerCO()">COする</button>';
+   if(me.role==='knight')
+    act+='<button class="primary" onclick="playerCO()">護衛先を公開</button>';
+  }
+ }
  if(G.phase==='投票')act=G.players[0].alive?`<select id="voteTarget">${opts}</select><button class="danger" onclick="advance()">投票する</button>`:'<span class="small">死亡中のため投票できません</span><button class="primary" onclick="advance()">投票結果へ</button>';
  if(G.phase==='夜'){
   if(G.players[0].role==='seer'&&G.players[0].alive)act+=`<span class="small">占い</span><select id="seeTarget">${opts}</select>`;
@@ -9241,6 +9381,20 @@ def _open_html_in_browser(html_path: str) -> "tuple[bool, str, list[str]]":
     # ════════════════════════════════════════════════════════════════════
     elif is_wsl:
         target = win_html or file_uri
+
+        # PowerShell経由で起動（最も確実）
+        edge_path = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
+        brave_path = 'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe'
+        for _wp, _wn in [(edge_path, 'Edge'), (brave_path, 'Brave')]:
+            try:
+                import subprocess as _sub2
+                _sub2.Popen(
+                    ['powershell.exe', '-NoProfile', '-NonInteractive',
+                     '-Command', f"Start-Process '{_wp}' -ArgumentList '{win_html or file_uri}'"],
+                    stdout=_sub2.DEVNULL, stderr=_sub2.DEVNULL)
+                return True, f"{_wn}(PowerShell)", tried
+            except Exception as _e:
+                tried.append(f"{_wn} PowerShell: {_e}")
 
         # /mnt/c 直下でブラウザ実行ファイルを直接探す（ユーザー依存しない場所）
         wsl_direct = [
