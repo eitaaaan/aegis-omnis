@@ -2297,15 +2297,9 @@ _opener_unverified = R.build_opener(R.HTTPSHandler(context=_ctx_unverified),  R.
 
 def fetch_html(url: str, data: bytes | None = None, timeout: int = 5, silent: bool = False,
                spoof_bot: bool = False, redirect_checker=None) -> str:
-    import random
-    ua = random.choice([
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
-    ])
+# ★[v131.1] UAを正直な識別子に変更（ブラウザ偽装廃止）
+    ua = "aegis-omnis/131.1 (personal research tool; +https://github.com/eitaaaan/aegis-omnis)"
     headers = {"User-Agent": ua, "Accept-Language": "ja,en;q=0.9", "Accept": "text/html,*/*;q=0.8"}
-    if spoof_bot:
-        headers["Referer"] = "https://www.google.co.jp/"
-
     def _decode(raw: bytes) -> str:
         for enc in ("utf-8", "shift_jis", "euc-jp"):
             try: return raw.decode(enc)
