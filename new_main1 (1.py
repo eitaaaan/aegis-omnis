@@ -1,51 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# S-01 v131.0 Aegis Omnis — ADVANCED RAG + SPEED EDITION (2026)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 主な強化点 (v130.1 → v131.0):
-#   ★ Cross-Encoder Reranking: ms-marco-MiniLM-L-6-v2 で候補を精密スコアリング
-#       - LRUキャッシュ(512件)で高速化、sentence_transformers未インストール時は自動フォールバック
-#   ★ Reciprocal Rank Fusion (RRF): BM25ランクとChromaDBランクを融合して精度向上
-#       - k=60 (論文推奨値)、重複テキストを先頭60文字で同一視
-#   ★ HyDE (Query Expansion): クエリを仮想ドキュメントに変換してからベクトル検索
-#       - FASTモデル使用、キャッシュ付き、Ollama未起動時は元クエリで動作
-#   ★ Contextual Compression: 取得チャンクからクエリ関連文のみ抽出してノイズ削減
-#       - BM25センテンススコアで文選択、max_chars=300で圧縮
-#   ★ /kb search, /kb ask: hybrid_search_advanced パイプラインに統合
-#   ★ /debug: Advanced RAG v131 ステータス（CE有効/無効、キャッシュ統計等）表示
-#   ★ get_async_rag_data: 全5段階パイプライン適用（Web+Vector+RRF+Compress+CE）
-# ──────────────────────────────────────────────────────────
-# ★[v131] 生成速度最適化 (Speed Pack):
-#   1. num_ctx 半減 (CPU: mid 8192→4096): KVキャッシュ確保コスト削減
-#   2. num_batch CPU 1024→512: 最初のトークンまでのlatency削減
-#   3. top_k 80→40/30: サンプリング候補削減
-#   4. repeat_last_n 256→64: バッファスキャンコスト削減
-#   5. num_predict 2048→1024: 過剰生成を防止
-#   6. sanitize(): サロゲート検査を先行し不要な encode/decode を省略
-#   7. _single_gen(): 毎トークンflushを廃止、8文字バッファ+句読点でwrite
-#   8. _SYS_EXTRAS_TTL 0→8s: vector_search の毎ターン再実行を抑制
-#   9. _STATE_CACHE_TTL 5→30s: 状態ファイルの再読み込み削減
-#  10. RAGプリフェッチ: 入力直後にWeb取得をバックグラウンド開始
-#  11. HyDE並列化: Web取得と同時実行、ブロッキング除去
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 主な強化点 (v128.1 → v129.0):
-#   ★ AIエンジン: gemma3:12b/4b/1b 自動選択 + Thinking Mode
-#   ★ ハイブリッドRAG v2: BM25 + Vector + Cross-Encoder Reranking
-#   ★ 並列Multi-Agent: 非同期ツール実行 (asyncio)
-#   ★ Context Caching: KVキャッシュ最大活用・プリフィルキャッシュ
-#   ★ 将棋AI: Negamax + TranspositionTable + KillerHeuristic
-#   ★ チェスAI: MCTS (Monte Carlo Tree Search) 搭載
-#   ★ セキュリティ: プロンプトインジェクション多層防御
-#   ★ 新コマンド: /think /plan /code /reflect /mindmap /persona_edit
-#   ★ Structured Outputs: JSON Schema強制でハルシネーション削減
-#   ★ TokenBudget: 動的ctx割当・バックプレッシャー制御
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# S-01 v128.1 Aegis Omnis — ENHANCED EDITION
 from __future__ import annotations
 
 import atexit, glob, html as html_module, itertools, json, math, os, platform, re, shutil, ssl, traceback
 import subprocess as S, sys, threading, time, unicodedata, urllib.parse as U, urllib.request as R
-import asyncio, hashlib, queue, signal, weakref
-from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -65,78 +24,32 @@ from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-_ollama = None  # None=未試行, False=失敗確定（センチネル）
+_ollama = None
 def _get_ollama():
     global _ollama
-    # ★[修正/#2] 失敗済み(False)の場合は再試行しない。
-    # 旧コードは失敗後も None のままにしていたため毎ターン import を試みていた。
-    # また `import ollama, os` で os を関数内で毎回再 import していた点も修正。
-    if _ollama is False:
-        return None
     if _ollama is None:
-        try:
-            import ollama as _ollama_mod
-            # ★[修正/ollama-host] WSL2→Windows Ollama接続対応
-            # OLLAMA_HOST環境変数があればClientを明示的に初期化する。
-            # export OLLAMA_HOST=http://172.24.80.1:11434 を~/.bashrcに設定すること。
-            host = os.environ.get("OLLAMA_HOST", "")
-            if host:
-                _ollama = _ollama_mod.Client(host=host)
-            else:
-                _ollama = _ollama_mod
-        except Exception:
-            _ollama = False  # センチネル: 以降の再 import を抑止
-    return _ollama if _ollama is not False else None
+        try: import ollama; _ollama = ollama
+        except Exception: _ollama = None
+    return _ollama
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ★[v129] モデル設定 — 自動選択エンジン対応
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# モデルは POWER_MODE と入力の複雑度から自動選択される。
-# GPU環境 (OLLAMA_GPU=1) では 12b モデルが自動的に使用される。
-_GPU_AVAILABLE = os.environ.get("OLLAMA_GPU", "0") == "1" or os.environ.get("CUDA_VISIBLE_DEVICES", "") != ""
-_HAS_12B       = False  # 起動時に ollama list で確認 (check_ollama_connection内)
-
-# モデル優先順位: ultra/high=12b→4b, mid=4b, low=1b
-MODEL_TIERS = {
-    "ultra": ["gemma3:12b", "gemma3:4b"],
-    "high":  ["gemma3:12b", "gemma3:4b"],
-    "mid":   ["gemma3:4b"],
-    "low":   ["gemma3:1b", "gemma3:4b"],
-}
-MODEL_NAME    = "gemma3:4b"   # デフォルト（check_ollama_connectionで更新）
-DEEP_MODEL    = "gemma3:4b"   # complexモード用（同上）
-FAST_MODEL    = "gemma3:1b"   # 高速応答用（1b優先）
-MAX_HISTORY   = 6             # ★[v129] 4→6: 長い文脈での一貫性向上
-RAG_TIMEOUT   = 4.0           # ★[v129] 3.0→4.0: ハイブリッドRAGで取得量増加
+MODEL_NAME    = "gemma3:4b"
+DEEP_MODEL    = "llama3.1:8b"
+MAX_HISTORY   = 4
+RAG_TIMEOUT   = 2.5
 USER_NAME     = "先輩"
 OBSERVED_SUBJECT_NAME = USER_NAME
 STATE_FILE    = "s01_state.json"
-POWER_MODE    = "mid"
+POWER_MODE    = "high"  # ★[修正/ctx-5] mid(ctx=4096)→high(ctx=8192): 哲学者長文生成に必要な出力枠を確保
 TEMP_FACT     = 0.05
 TEMP_VOICE    = 0.72
-TEMP_HISTORY: list[float] = [0.72]
 FACT_MIN_CHARS = 20
-
-# ★[v129] Thinking Mode設定
-THINKING_MODE = False          # True: chain-of-thought強制 (/think で切替)
-THINKING_BUDGET = 1024        # thinking用トークン予算
-
-# ★[v129] TokenBudget — 動的ctx管理
-TOKEN_BUDGET_SAFETY = 128     # 安全マージン(tok)
-TOKEN_EST_JP  = 1.5           # 日本語1文字≒1.5トークン
-TOKEN_EST_EN  = 0.4           # 英数字1文字≒0.4トークン
-
 TEMP_MAP: dict[str, float] = {
     "/a": 0.68, "/w": 0.45, "/p": 0.30, "/c": 0.55,
     "/t": 0.82, "/q": 0.70, "/e": 0.40, "/sum": 0.40,
-    "/r": 0.85, "/d": 0.62, "/think": 0.20, "/plan": 0.35,
-    "/code": 0.15, "/reflect": 0.50,
+    "/r": 0.85, "/d": 0.62,
 }
 MAX_RETRIES   = 0
 RETRY_DELAY   = 0.6
-
-# ★[v129] ThreadPoolExecutor — 非同期RAG・ツール並列実行
-_THREAD_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="s01")
 
 # ===== オフラインモード設定 =====
 # OFFLINE_MODE = True にするとネット不要のパスだけ使う。
@@ -145,101 +58,30 @@ _THREAD_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="s01")
 OFFLINE_MODE  = False          # True でネット通信を完全無効化
 KIWIX_PORT    = 8888           # kiwix-serve のポート番号
 COMPLEXITY_KEYWORDS = {
-    "deep": ['分析', '比較', '考察', '原因', '影響', '関係性', '構造', 'メカニズム', '原理', '定義', '本質', '違い', '対比', '傾向', '推移', '背景', '要因', '過程', '仕組み', '意義', '評価', '検証', '論点', '議論', '批判', '展望', '課題', '示唆', 'シナジー', 'トレードオフ', 'アーキテクチャ', 'アプローチ', '手法', '戦略', 'フレームワーク', 'パラダイム'],  # ★[修正/#6] '展望' 重複を除去
+    "deep": ['分析', '比較', '考察', '原因', '影響', '関係性', '構造', 'メカニズム', '原理', '定義', '本質', '違い', '対比', '傾向', '推移', '背景', '要因', '過程', '仕組み', '意義', '評価', '検証', '論点', '議論', '批判', '展望', '課題', '展望', '示唆', 'シナジー', 'トレードオフ', 'アーキテクチャ', 'アプローチ', '手法', '戦略', 'フレームワーク', 'パラダイム'],
     "simple": ['こんにちは', 'おはよう', 'こんばんは', '元気', 'やあ', 'hey', 'hello', 'hi', 'おやすみ', 'またね', 'バイバイ', 'ねえ', 'ちょっと', 'ありがとう', 'すごい', 'なるほど', 'わかった', 'OK', 'はい', 'いいね'],
 }
 
+@lru_cache(maxsize=256)
 def estimate_complexity(text: str, cmd: str = "") -> str:
-    # ★[修正/#6] lru_cache を除去。COMPLEXITY_KEYWORDS（グローバル変数）を参照するため
-    # キャッシュが古い結果を返し続けるバグがあった。この関数は軽量なので毎回実行で問題なし。
-    # ★[修正/complexity] 閾値80文字が厳しすぎて哲学的な短い問いも全てDEEP_MODEL送りになっていた。
-    # gemma3:4b(15-20tok/s) vs llama3.1:8b(8tok/s) の速度差を考慮し、
-    # 明確に複雑な場合のみDEEP_MODELを使うよう閾値を緩和する。
     text_lower = text.lower()
-    # /a /c /sum /deep /midi は常にcomplex（二段階推論が必要）
     if any(text.startswith(c) for c in ("/a", "/c", "/sum", "/deep", "/midi")):
         return "complex"
+    if len(text) > 80: return "complex"
     if cmd in ("/a", "/c", "/sum"): return "complex"
     deep_hits = sum(1 for kw in COMPLEXITY_KEYWORDS["deep"] if kw in text)
     simple_hits = sum(1 for kw in COMPLEXITY_KEYWORDS["simple"] if kw in text_lower)
-    # ★[修正/complexity] deepキーワード2→3個以上でcomplex（閾値を緩和）
-    if deep_hits >= 3: return "complex"
+    if deep_hits >= 2: return "complex"
     if simple_hits >= 1 and deep_hits == 0: return "simple"
-    # 英数字比率が高い（コード・技術用語）場合はcomplex
     tech_ratio = sum(1 for c in text if c.isascii() and c.isalpha()) / max(len(text), 1)
-    if tech_ratio > 0.4: return "complex"
-    # ★[修正/complexity] 80→200文字に緩和: 哲学者への問いは長くなりがちだが
-    # gemma3:4bで十分な質が出る。200文字超の長文のみDEEP_MODELへ。
-    if len(text) > 200: return "complex"
-    return "simple"
+    if tech_ratio > 0.3: return "complex"
+    return "simple" if len(text) < 20 else "complex"
 
 def select_model(text: str, cmd: str = "") -> str:
-    """★[v129] 複雑度・長さ・コマンドでモデル自動選択 (CPU専用最適化)"""
-    c = estimate_complexity(text, cmd)
-    if c == "complex": return DEEP_MODEL
-    if c == "simple" and len(text) < 60 and not cmd:
-        return FAST_MODEL  # ★[v129] 短い単純質問→FASTモデルで高速応答
-    return MODEL_NAME
+    return DEEP_MODEL if estimate_complexity(text, cmd) == "complex" else MODEL_NAME
 
 RAG_CACHE: dict[str, tuple[float, str, int, float]] = {}
 _RAG_LOCK = threading.Lock()
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ★[v131] Advanced RAG 設定
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Cross-Encoder Reranking
-CROSS_ENCODER_ENABLED  = True   # False でスキップ（CPU負荷を下げたい場合）
-CROSS_ENCODER_MODEL    = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-CROSS_ENCODER_TOP_K    = 5      # rerank後に残す件数
-CROSS_ENCODER_CACHE_SIZE = 512  # LRUキャッシュエントリ数
-
-# Reciprocal Rank Fusion
-RRF_ENABLED = True
-RRF_K       = 60                # RRF定数 (論文推奨値)
-
-# HyDE (Hypothetical Document Embeddings) — クエリ拡張
-HYDE_ENABLED    = True
-HYDE_MAX_TOKENS = 120           # 仮想ドキュメント最大文字数
-HYDE_TEMPERATURE = 0.4
-
-# Contextual Compression
-CTXCOMP_ENABLED   = True
-CTXCOMP_MAX_CHARS = 300         # 圧縮後チャンクの最大文字数
-
-# Cross-Encoder 遅延ロード
-_cross_encoder_model = None
-_cross_encoder_lock  = threading.Lock()
-_cross_encoder_available = None  # None=未確認, True/False
-
-def _get_cross_encoder():
-    """Cross-Encoderモデルを遅延ロード。失敗時はNoneを返す。"""
-    global _cross_encoder_model, _cross_encoder_available
-    with _cross_encoder_lock:
-        if _cross_encoder_available is False:
-            return None
-        if _cross_encoder_model is not None:
-            return _cross_encoder_model
-        try:
-            from sentence_transformers import CrossEncoder
-            _cross_encoder_model = CrossEncoder(CROSS_ENCODER_MODEL)
-            _cross_encoder_available = True
-        except Exception as e:
-            _cross_encoder_available = False
-            print(f"\033[33m[WARN] CrossEncoder初期化失敗 ({e}) — フォールバック: BM25のみ\033[0m")
-        return _cross_encoder_model
-# ★[修正/#3] TEMP_VOICE をロックで保護。BackgroundOptimizer と
-# メインスレッドが同時に読み書きするためデータレースが発生していた。
-_TEMP_VOICE_LOCK = threading.Lock()
-
-def _get_temp_voice() -> float:
-    with _TEMP_VOICE_LOCK:
-        return TEMP_VOICE
-
-def _set_temp_voice(val: float) -> None:
-    global TEMP_VOICE
-    with _TEMP_VOICE_LOCK:
-        TEMP_VOICE = val
-
 KEYWORD_MEMORY: list[str] = []
 ROLEPLAY_ACTIVE = False
 ROLEPLAY_SCENE  = ""
@@ -248,7 +90,6 @@ CUSTOM_PERSONA: dict | None = None
 VECTOR_COL = None; VECTOR_AVAILABLE = False
 _VECTOR_CLIENT = None
 _VECTOR_COLS: dict[str, any] = {}  # コレクション名 -> Collectionオブジェクト
-_VECTOR_COLS_LOCK = threading.Lock()  # ★[修正/#5] 並列ワーカーからの同時アクセス防止
 
 def _init_vector_db():
     global VECTOR_COL, VECTOR_AVAILABLE, _VECTOR_CLIENT
@@ -256,31 +97,23 @@ def _init_vector_db():
     try:
         import chromadb
         _VECTOR_CLIENT = chromadb.PersistentClient(path="s01_vector_db")
-        # ★[修正/#1] VECTOR_AVAILABLE を True にしてから _get_or_create_col を呼ぶ。
-        # 旧コードは False のまま呼んでいたため _get_or_create_col → _init_vector_db →
-        # _get_or_create_col … の無限再帰 (RecursionError) が発生していた。
-        VECTOR_AVAILABLE = True
         VECTOR_COL = _get_or_create_col("s01_memory")
-    except Exception as e:
-        VECTOR_AVAILABLE = False          # 失敗時はフラグを戻す
-        print(f"{C['y']}[WARN] chromadb初期化失敗: {e}{C['w']}")
+        VECTOR_AVAILABLE = True
+    except Exception as e: print(f"{C['y']}[WARN] chromadb初期化失敗: {e}{C['w']}")
 
 def _get_or_create_col(name: str):
     """コレクションをキャッシュして返す。なければ作る。"""
     global _VECTOR_CLIENT, VECTOR_AVAILABLE, _VECTOR_COLS
     if not VECTOR_AVAILABLE: _init_vector_db()
     if not VECTOR_AVAILABLE: return None
-    # ★[修正/#5] dict への読み書きをロックで保護
-    with _VECTOR_COLS_LOCK:
-        if name not in _VECTOR_COLS:
-            try:
-                _VECTOR_COLS[name] = _VECTOR_CLIENT.get_or_create_collection(name)
-            except Exception:
-                return None
-        return _VECTOR_COLS[name]
+    if name not in _VECTOR_COLS:
+        try:
+            _VECTOR_COLS[name] = _VECTOR_CLIENT.get_or_create_collection(name)
+        except Exception:
+            return None
+    return _VECTOR_COLS[name]
 
 _VEC_ID = [0]
-_VEC_ID_LOCK = threading.Lock()  # ★[修正/#4] += はアトミックでないためロックが必要
 
 def vector_add(text: str, metadata: dict = None, collection: str = "s01_memory") -> bool:
     if not VECTOR_AVAILABLE: _init_vector_db()
@@ -288,12 +121,10 @@ def vector_add(text: str, metadata: dict = None, collection: str = "s01_memory")
     col = _get_or_create_col(collection)
     if col is None: return False
     try:
-        with _VEC_ID_LOCK:
-            _VEC_ID[0] += 1
-            vec_id = _VEC_ID[0]
+        _VEC_ID[0] += 1
         meta = {"text": text[:500], "time": now_stamp(), "collection": collection}
         if metadata: meta.update(metadata)
-        col.add(documents=[text], metadatas=[meta], ids=[f"{collection}_{vec_id}"])
+        col.add(documents=[text], metadatas=[meta], ids=[f"{collection}_{_VEC_ID[0]}"])
         return True
     except Exception: return False
 
@@ -325,183 +156,6 @@ def vector_list_collections() -> list[str]:
         return [c.name for c in _VECTOR_CLIENT.list_collections()]
     except Exception: return []
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ★[v131] Advanced RAG ユーティリティ
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# ─── Cross-Encoder Reranking ─────────────────────────────
-@lru_cache(maxsize=CROSS_ENCODER_CACHE_SIZE)
-def _ce_score_cached(query: str, doc: str) -> float:
-    """Cross-Encoderスコアをキャッシュ付きで計算。"""
-    ce = _get_cross_encoder()
-    if ce is None:
-        return 0.0
-    try:
-        return float(ce.predict([(query, doc)])[0])
-    except Exception:
-        return 0.0
-
-def cross_encoder_rerank(query: str, candidates: list[str], top_k: int = CROSS_ENCODER_TOP_K) -> list[str]:
-    """
-    候補テキストリストをCross-Encoderでスコアリングし直してtop_k件を返す。
-    sentence_transformers未インストール時はBM25スコア順のまま返す。
-    """
-    if not CROSS_ENCODER_ENABLED or not candidates:
-        return candidates[:top_k]
-    ce = _get_cross_encoder()
-    if ce is None:
-        return candidates[:top_k]
-    scored = [(doc, _ce_score_cached(query, doc[:512])) for doc in candidates]
-    scored.sort(key=lambda x: -x[1])
-    return [doc for doc, _ in scored[:top_k]]
-
-# ─── Reciprocal Rank Fusion ──────────────────────────────
-def reciprocal_rank_fusion(
-    ranked_lists: list[list[str]],
-    k: int = RRF_K
-) -> list[str]:
-    """
-    複数のランキングリスト（BM25, ChromaDB等）をRRFで統合。
-    各ドキュメントのRRFスコア = Σ 1/(k + rank_i)
-    重複テキストは先頭60文字で同一視する。
-    """
-    if not RRF_ENABLED or not ranked_lists:
-        return ranked_lists[0] if ranked_lists else []
-    scores: dict[str, float] = {}
-    key_to_doc: dict[str, str] = {}
-    for ranked in ranked_lists:
-        for rank, doc in enumerate(ranked, start=1):
-            key = doc[:60]
-            if key not in key_to_doc:
-                key_to_doc[key] = doc
-            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
-    sorted_keys = sorted(scores, key=lambda x: -scores[x])
-    return [key_to_doc[k] for k in sorted_keys]
-
-# ─── HyDE (Hypothetical Document Embeddings) ─────────────
-_HYDE_CACHE: dict[str, str] = {}
-_HYDE_LOCK  = threading.Lock()
-
-def hyde_expand_query(query: str, ollama_client=None, model: str = "") -> str:
-    """
-    クエリを仮想ドキュメント（HyDE）に変換してベクトル検索の精度を上げる。
-    Ollamaが使えない場合は元クエリをそのまま返す。
-    キャッシュにより同一クエリの重複生成を防ぐ。
-    """
-    if not HYDE_ENABLED:
-        return query
-    with _HYDE_LOCK:
-        if query in _HYDE_CACHE:
-            return _HYDE_CACHE[query]
-    o = ollama_client
-    if o is None:
-        return query
-    _model = model or FAST_MODEL
-    prompt = (
-        f"以下の質問に対して、ウィキペディアの記事の冒頭2〜3文のような、"
-        f"事実に基づく短いテキスト（{HYDE_MAX_TOKENS}文字以内）を日本語で書いてください。"
-        f"余計な前置き・箇条書き・見出しは不要。本文のみ出力。\n質問: {query}"
-    )
-    try:
-        resp = o.chat(
-            model=_model,
-            messages=[{"role": "user", "content": prompt}],
-            stream=False,
-            options={"temperature": HYDE_TEMPERATURE, "num_predict": 150},
-            keep_alive=-1,
-        )
-        if isinstance(resp, dict):
-            hypo = resp.get("message", {}).get("content", "")
-        else:
-            hypo = getattr(getattr(resp, "message", None), "content", "") or ""
-        hypo = hypo.strip()[:HYDE_MAX_TOKENS]
-        if len(hypo) < 20:
-            return query
-        with _HYDE_LOCK:
-            _HYDE_CACHE[query] = hypo
-        return hypo
-    except Exception:
-        return query
-
-# ─── Contextual Compression ──────────────────────────────
-def contextual_compress(query: str, chunks: list[str], max_chars: int = CTXCOMP_MAX_CHARS) -> list[str]:
-    """
-    取得チャンクからクエリに関連する文のみ抽出して圧縮する。
-    センテンス単位でBM25スコアを計算し、上位文をmax_chars以内で結合して返す。
-    """
-    if not CTXCOMP_ENABLED or not chunks:
-        return chunks
-    q_words = re.findall(r'[\u3040-\u9FFF\w]{2,}', query.lower())
-    if not q_words:
-        return [c[:max_chars] for c in chunks]
-
-    def _sent_score(sent: str) -> float:
-        s_lower = sent.lower()
-        return sum(s_lower.count(w) for w in q_words)
-
-    compressed = []
-    for chunk in chunks:
-        # 句点・改行で文分割
-        sents = re.split(r'(?<=[。\.\!\?！？\n])', chunk)
-        sents = [s.strip() for s in sents if len(s.strip()) > 10]
-        if not sents:
-            compressed.append(chunk[:max_chars])
-            continue
-        scored_sents = sorted(sents, key=_sent_score, reverse=True)
-        buf = ""
-        for s in scored_sents:
-            if len(buf) + len(s) > max_chars:
-                break
-            buf += s + " "
-        compressed.append(buf.strip() or chunk[:max_chars])
-    return compressed
-
-# ─── Hybrid Search with RRF + Cross-Encoder ──────────────
-def hybrid_search_advanced(
-    query: str,
-    n_candidates: int = 15,
-    top_k: int = CROSS_ENCODER_TOP_K,
-    collection: str = "s01_memory",
-    ollama_client=None,
-) -> list[str]:
-    """
-    BM25 + ChromaDB ベクトル検索 → RRF融合 → Contextual Compression → Cross-Encoder Reranking
-    の全パイプラインを一括実行。
-    """
-    # 1. HyDE: クエリを仮想ドキュメントに拡張してベクトル検索精度向上
-    hyde_query = hyde_expand_query(query, ollama_client)
-
-    # 2. ベクトル検索（ChromaDB）— HyDE拡張クエリを使用
-    vec_results = vector_search(hyde_query, n=n_candidates, collection=collection)
-
-    # 3. BM25風スコアリング（テキスト行に対してクエリキーワードマッチ）
-    def _bm25_rank(docs: list[str]) -> list[str]:
-        q_words = re.findall(r'[\u3040-\u9FFF\w]{2,}', query.lower())
-        if not q_words:
-            return docs
-        avg_len = sum(len(d) for d in docs) / max(len(docs), 1)
-        def _score(d: str) -> float:
-            d_lower = d.lower()
-            s = 0.0
-            for w in q_words:
-                tf = d_lower.count(w)
-                if tf:
-                    idf = math.log(1 + len(docs) / (1 + sum(1 for x in docs if w in x.lower())))
-                    s += idf * (tf * 2.5) / (tf + 1.5 * (0.25 + 0.75 * len(d) / max(avg_len, 1)))
-            return s
-        return [d for d, _ in sorted([(d, _score(d)) for d in docs], key=lambda x: -x[1])]
-
-    bm25_results = _bm25_rank(vec_results) if vec_results else []
-
-    # 4. RRF: BM25ランクとベクトルランクを融合
-    fused = reciprocal_rank_fusion([bm25_results, vec_results])
-
-    # 5. Contextual Compression: 各チャンクから関連文のみ抽出
-    compressed = contextual_compress(query, fused[:n_candidates])
-
-    # 6. Cross-Encoder Reranking: 最終スコアリング
-    return cross_encoder_rerank(query, compressed, top_k=top_k)
-
 # ===== 他AI参照型学習エンジン =====
 REFERENCE_PATTERNS = {
     "structure": ["結論→理由→具体例→まとめ", "冒頭で核心に触れる", "箇条書きで整理", "段落分けで可読性向上"],
@@ -514,9 +168,6 @@ REFERENCE_SCORES: dict[str, list[float]] = {}
 SELF_EVAL_LOG: list[dict] = []
 
 def self_evaluate(response: str, mode: str) -> dict[str, float]:
-    # ★[修正/#15] この評価は「評価基準文のキーワードが返答に含まれているか」を測るだけの
-    # 疑似評価であり、実際の応答品質を保証しない（循環評価）。
-    # 参考指標として使用し、絶対的品質指標として扱わないこと。
     scores = {}
     for category, patterns in REFERENCE_PATTERNS.items():
         score = 0.0
@@ -730,11 +381,10 @@ class BackgroundOptimizer:
         if now - self.last_auto_tune > 300 and LEARNING_STATS["total_interactions"] >= 10:
             best_temp = get_best_temp("d")
             if best_temp is not None:
-                # ★[修正/#3] ロック経由で TEMP_VOICE を更新（データレース防止）
-                old = _get_temp_voice()
-                _set_temp_voice((old + best_temp) / 2)
-                new = _get_temp_voice()
-                if abs(new - old) > 0.02: actions.append(f"温度調整: {old:.2f}→{new:.2f}")
+                global TEMP_VOICE
+                old = TEMP_VOICE
+                TEMP_VOICE = (TEMP_VOICE + best_temp) / 2
+                if abs(TEMP_VOICE - old) > 0.02: actions.append(f"温度調整: {old:.2f}→{TEMP_VOICE:.2f}")
             self.last_auto_tune = now
 
         for mode, scores in PROMPT_PERFORMANCE.items():
@@ -750,12 +400,8 @@ class BackgroundOptimizer:
             actions.extend(auto_optimize_prompts())
 
         if LEARNING_STATS["total_interactions"] % 10 == 0 and LEARNING_STATS["total_interactions"] > 0:
-            # ★[修正/#12] セッション開始後の増分が 0 のときは保存しない
-            # (_SESSION_START_INTERACTIONS は run() で設定。未定義の場合は 0 扱い)
-            _sess_start = globals().get("_SESSION_START_INTERACTIONS", 0)
-            if LEARNING_STATS["total_interactions"] - _sess_start > 0:
-                persist_learning()
-                actions.append("学習データ保存")
+            persist_learning()
+            actions.append("学習データ保存")
 
         for a in actions:
             self._log(a)
@@ -806,41 +452,17 @@ def _assert_safe_path(raw_path: str) -> str:
     return resolved
 
 def _assert_safe_url(url: str) -> None:
-    """SSRF防止: ローカルホスト・内部ネットワーク・非HTTPスキームをブロックする。
-    ★[修正/#9] IPv6マップドアドレス (::ffff:127.0.0.1)・10進数IP (2130706433)・
-    ブラケット記法も遮断するよう強化。"""
-    import ipaddress
+    """SSRF防止: ローカルホスト・内部ネットワーク・非HTTPスキームをブロックする。"""
     parsed = U.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"許可されていないスキーム: {parsed.scheme!r}")
     host = parsed.hostname or ""
     host_lower = host.lower()
-
-    # ブラケット除去（IPv6: [::1] → ::1）
-    if host_lower.startswith("[") and host_lower.endswith("]"):
-        host_lower = host_lower[1:-1]
-
     if host_lower in _SSRF_BLOCKED_HOSTS:
         raise ValueError(f"アクセス禁止: ローカルホストへのリクエストは許可されていません ({host!r})")
     for prefix in _SSRF_BLOCKED_PREFIXES:
         if host_lower.startswith(prefix):
             raise ValueError(f"アクセス禁止: プライベートIPレンジ ({host!r})")
-
-    # ★ IPv6マップドアドレス・純粋数値IP（10進/16進）をipaddressで検証
-    try:
-        ip = ipaddress.ip_address(host_lower)
-        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved:
-            raise ValueError(f"アクセス禁止: プライベート/ループバックIPアドレス ({host!r})")
-        # IPv6マップドアドレス (::ffff:127.x.x.x 等) を追加チェック
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-            mapped = ip.ipv4_mapped
-            if mapped.is_loopback or mapped.is_private or mapped.is_link_local:
-                raise ValueError(f"アクセス禁止: IPv6マップドプライベートアドレス ({host!r})")
-    except ValueError as e:
-        if "アクセス禁止" in str(e):
-            raise
-        # ip_address() が失敗した場合はホスト名として続行（既に prefix チェック済み）
-        pass
 
 
 def _exec_tool(name: str, **kwargs) -> str:
@@ -881,13 +503,7 @@ def _exec_tool(name: str, **kwargs) -> str:
 
         elif name == "web_fetch":
             url = kwargs.get("url", "")
-            _assert_safe_url(url)   # SSRF防止（リクエスト前）
-            # ★[修正/#9] リダイレクト先もSSRFチェックする
-            import urllib.request as _ur
-            class _NoRedirectHandler(_ur.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    _assert_safe_url(newurl)  # リダイレクト先を検証
-                    return super().redirect_request(req, fp, code, msg, headers, newurl)
+            _assert_safe_url(url)   # SSRF防止
             text = fetch_html(url, timeout=8, silent=True)
             return strip_tags(text)[:2000] if text else "取得失敗"
 
@@ -912,8 +528,7 @@ def _exec_tool(name: str, **kwargs) -> str:
                 "abs": abs, "round": round, "int": int, "float": float,
                 "str": str, "bool": bool, "list": list, "dict": dict,
                 "tuple": tuple, "set": set, "isinstance": isinstance,
-                # ★[修正/#8] type を除去: メタクラス操作 (type('x', (object,), {})) の入口になる
-                # ★[修正/#8] repr/format も MRO traversal を通じた脱出リスクあり → 除去
+                "type": type, "repr": repr, "format": format,
                 "True": True, "False": False, "None": None,
             }
             old = _sys.stdout
@@ -978,7 +593,7 @@ def tool_agent_chat(messages: list, is_logic: bool, text_len: int, temp: float |
 # ===== 自己進化型学習アルゴリズム =====
 INTERACTION_LOG: list[dict] = []
 FEEDBACK_PATTERNS = {
-    'positive': ['ありがとう', 'いいね', '役に立った', 'すごい', '助かった', 'さすが', '正解', 'なるほど', 'そうそう', 'それそれ', '素晴らしい', '完璧', '最高', 'やった', 'できた', 'わかった', '了解', 'グッド', 'ナイス', 'perfect', 'good', 'great', 'いい感じ', 'バッチリ', 'まさに', 'その通り', 'ぴったり'],
+    'positive': ['ありがとう', 'いいね', '役に立った', 'すごい', '助かった', 'さすが', '正解', 'なるほど', 'なる', 'そうそう', 'それそれ', 'いい', '素晴らしい', '完璧', '最高', 'やった', 'できた', 'わかった', '了解'],
     'negative': ['違う', '間違ってる', 'いや', '違います', 'ちがう', 'つまんない', 'もういい', '違うよ', '意味ない', '違ってる', 'ちげえ', 'ダメ', 'ダメだ', '違うんだ',
                  # ★[修正D] 話し方・口調指摘系を追加
                  'おかしい', 'へん', '変だ', '変です', 'おかしくない', 'なんか変', 'ちょっと変',
@@ -1615,27 +1230,23 @@ PERSONA_MAP = {
 
 @lru_cache(maxsize=None)
 def get_persona(per_id) -> dict:
-    # ★[修正/#7] lru_cache を除去。CUSTOM_PERSONA がグローバル変数のため、
-    # 一度キャッシュされると CUSTOM_PERSONA の変更が反映されないバグがあった。
     if CUSTOM_PERSONA is not None: return CUSTOM_PERSONA
     return PERSONA_MAP.get(per_id, PERSONA_MAP[2])
 
 C = {
     "r": "\033[91m", "g": "\033[92m", "y": "\033[93m",
     "b": "\033[94m", "p": "\033[95m", "c": "\033[96m",
-    "o": "\033[38;5;208m",  # オレンジ（256色）
     "w": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
 }
 
 BANNER = (
-    f"{C['c']}{C['bold']}\nPROJECT AEGIS [v130.1 NEXT GENERATION]{C['w']}\n"
-    f"  FAST: {FAST_MODEL} | MAIN: {MODEL_NAME} | DEEP: {DEEP_MODEL}\n"
-    f"  RAG: HYBRID(BM25+Vector) | MULTI-AGENT: ON | THINKING: {'ON' if THINKING_MODE else 'OFF'}\n"
-    f"  /h コマンド一覧 | /s 1〜36 西洋哲学者 | /think 思考モード切替\n"
+    f"{C['c']}{C['bold']}\nPROJECT AEGIS [v128.2 FIXED+ENHANCED]{C['w']}\n"
+    f"  CORE: {MODEL_NAME} | RAG: MULTI-SOURCE | 2PASS: ACTIVE | LEARN: ON\n"
+    f"  /h コマンド一覧 | /s 1〜36 西洋哲学者 | /s 自由入力でWeb検索生成\n"
 )
 
 HELP_TEXT = "\n".join([
-    f"{C['y']}=== コマンド一覧 (v130.1) ==={C['w']}",
+    f"{C['y']}=== コマンド一覧 (v128.1 ENHANCED) ==={C['w']}",
     f"  {C['c']}/a <キーワード>{C['w']}     RAG+2Pass分析",
     f"  {C['c']}/w <テキスト>{C['w']}       要約  {C['c']}/p <テキスト>{C['w']}       校正",
     f"  {C['c']}/c <仕様>{C['w']}           コード設計  {C['c']}/t <テキスト>{C['w']}       超訳",
@@ -1683,20 +1294,9 @@ HELP_TEXT = "\n".join([
     f"  {C['c']}/spi{C['w']}                SPI/玉手箱 対策（/spi 模擬 で10問連続）",
     f"  {C['c']}/comp <ID> <ID> [テーマ]{C['w']}  ヘーゲル弁証法対話（哲学者/カジュアル/ビジネス自動判定）",
     f"  {C['c']}/split <ID or 名前> [テーマ]{C['w']} 1ペルソナをテーゼ/アンチテーゼに分解して内的弁証法",
-    f"  {C['c']}/chess{C['w']}              ♟ チェス（MCTS強化・curses UI）\n              例: /chess easy  /chess middle  /chess hard  /chess very_hard",
-    f"  {C['c']}/shogi{C['w']}              将棋（Negamax+TT+Killer強化・curses UI）\n              例: /shogi easy  /shogi middle  /shogi hard  /shogi very_hard",
+    f"  {C['c']}/chess{C['w']}              ♟ チェス（完全ルール実装・ターミナル対戦）\n              例: /chess easy  /chess middle  /chess hard  /chess very_hard",
+    f"  {C['c']}/shogi{C['w']}              将棋（本将棋・curses UI・AI対戦対応）\n              例: /shogi easy  /shogi middle  /shogi hard  /shogi very_hard",
     f"  {C['c']}/mj{C['w']}                🀄 本格麻雀（ブラウザ起動・AI対戦・役/符計算完全実装）\n              例: /mj        → 4人麻雀東風戦\n                  /mj 3     → 3人麻雀\n                  /mj tonpu → 4人麻雀東南戦",
-    f"",
-    f"  {C['c']}━━━ v130.1 新機能 ━━━{C['w']}",
-    f"  {C['c']}/think [on|off]{C['w']}      思考モード切替（chain-of-thought強制）",
-    f"  {C['c']}/plan <目標>{C['w']}         段階的計画生成（OODA Loop）",
-    f"  {C['c']}/code <仕様>{C['w']}         高品質コード生成（テスト付き）",
-    f"  {C['c']}/reflect <内容>{C['w']}      自己批判的振り返り分析",
-    f"  {C['c']}/mindmap <テーマ>{C['w']}    マインドマップ生成（ASCIIアート）",
-    f"  {C['c']}/persona_edit{C['w']}        現在ペルソナのスタイル編集",
-    f"  {C['c']}/model [fast|main|deep]{C['w']} 使用モデル確認/切替",
-    f"  {C['c']}/ctx{C['w']}                コンテキスト使用量表示",
-    f"  {C['c']}/speedtest{C['w']}           モデル速度測定（tok/s）",
     f"  {C['c']}exit / 終了{C['w']}          終了",
 ])
 
@@ -1742,15 +1342,9 @@ class SystemSpinner:
     def __enter__(self): self.start(); return self
     def __exit__(self, *exc): self.stop()
 
-_RE_SURROGATE = re.compile(r'[\ud800-\udfff]')
-
 def sanitize(txt: str) -> str:
-    # ★[v131] サロゲートペアが無ければ encode/decode を省略（ストリーミング高速化）
-    s = str(txt)
-    if _RE_SURROGATE.search(s):
-        s = _RE_SURROGATE.sub('', s)
-        return s.encode("utf-8", "ignore").decode("utf-8")
-    return s
+    clean = re.sub(r'[\ud800-\udfff]', '', str(txt))
+    return clean.encode("utf-8", "ignore").decode("utf-8")
 
 def sanitize_obj(value):
     if isinstance(value, str):
@@ -1766,25 +1360,8 @@ def sanitize_obj(value):
 def normalize_input(txt: str) -> str:
     clean = re.sub(r'[\ud800-\udfff]', '', str(txt))
     clean = unicodedata.normalize("NFKC", clean)
-    # ★[v129] プロンプトインジェクション多層防御
-    # ★[修正/#10] Layer3（制御文字・ゼロ幅文字除去）を先に実行し、
-    # バイパス用のゼロ幅文字を除去してからパターンマッチを行う。
-    # 旧コードは Layer2 の後で除去していたため検出が機能しなかった。
-    # Layer 3: 制御文字・ゼロ幅文字除去（先行実行）
-    clean = re.sub(r'[\u200b\u200c\u200d\ufeff\u0000-\u001f]+', ' ', clean)
-    # Layer 1: XMLタグ無効化（エスケープ）
-    clean = re.sub(r'<(RAG_DATA|FACT|system|SYSTEM|INST|SYS|PROMPT|CONTEXT)>', r'&lt;\1&gt;', clean, flags=re.I)
-    # Layer 2: 役割変更インジェクション検出・除去
-    _injection_patterns = [
-        r'(?i)(ignore|forget|disregard)\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)',
-        r'(?i)you\s+are\s+now\s+(a|an)\s+\w+',
-        r'(?i)act\s+as\s+(if\s+you\s+are|a|an)\s+\w+',
-        r'(?i)(system|admin|root|sudo)\s*:\s*',
-        r'(?i)\[INST\]|\[SYS\]|\[SYSTEM\]',
-        r'###\s*(System|Instruction|Prompt)\s*:',
-    ]
-    for pat in _injection_patterns:
-        clean = re.sub(pat, '[FILTERED]', clean)
+    clean = re.sub(r'<(RAG_DATA|FACT|system|SYSTEM)>', r'&lt;\1&gt;', clean)
+    clean = re.sub(r'[\s\u200b\u200c\u200d\ufeff]+', ' ', clean)
     return clean.strip()
 
 def PurgeEvidence():
@@ -1800,7 +1377,7 @@ def now_stamp() -> str: return time.strftime("%Y-%m-%d %H:%M")
 
 _state_cache: dict | None = None
 _state_cache_time: float = 0.0
-_STATE_CACHE_TTL = 30.0  # ★[v131] 5.0→30.0: 状態ファイルの再読み込みを削減
+_STATE_CACHE_TTL = 5.0
 
 def load_state() -> dict:
     global _state_cache, _state_cache_time
@@ -1879,9 +1456,7 @@ def restore_learning():
     # ★[修正/power-persist] コードデフォルト(high)よりstateが格下なら上書きしない。
     # mid保存済み環境でも再起動後にhigh以上が維持される。
     _rank = {"low": 0, "mid": 1, "high": 2, "ultra": 3}
-    # ★[修正/#8] コードデフォルトは "mid"（旧コメントは "(high)" と誤記）。
-    # saved が現在の POWER_MODE 以上のランクなら上書きする。
-    if saved in _rank and _rank[saved] >= _rank.get(POWER_MODE, 1): POWER_MODE = saved
+    if saved in _rank and _rank[saved] >= _rank.get(POWER_MODE, 2): POWER_MODE = saved
     # ペルソナキャッシュを復元（前回Web取得済みをそのまま使い回せる）
     for k, v in state.get("persona_cache", {}).items():
         if isinstance(v, dict) and "name" in v and "style" in v:
@@ -1999,22 +1574,8 @@ def analyze_feedback(user_input: str) -> float:
 def log_interaction(user_input: str, response: str, mode: str, feedback: float):
     global LEARNING_STATS
     LEARNING_STATS["total_interactions"] += 1
-    if feedback > 0.3:
-        LEARNING_STATS["positive_count"] += 1
-        # ★[修正/#3] ロック経由で TEMP_VOICE を更新
-        _set_temp_voice(min(1.2, _get_temp_voice() + 0.02))
-        TEMP_HISTORY.append(round(_get_temp_voice(), 3))
-        if len(TEMP_HISTORY) > 30: TEMP_HISTORY[:] = TEMP_HISTORY[-30:]
-    elif feedback < -0.3:
-        LEARNING_STATS["negative_count"] += 1
-        neg = LEARNING_STATS["negative_count"]
-        pos = LEARNING_STATS["positive_count"]
-        if neg > pos:
-            _set_temp_voice(max(0.3, _get_temp_voice() - 0.03))
-        else:
-            _set_temp_voice(max(0.3, _get_temp_voice() - 0.01))
-        TEMP_HISTORY.append(round(_get_temp_voice(), 3))
-        if len(TEMP_HISTORY) > 30: TEMP_HISTORY[:] = TEMP_HISTORY[-30:]
+    if feedback > 0.3: LEARNING_STATS["positive_count"] += 1
+    elif feedback < -0.3: LEARNING_STATS["negative_count"] += 1
     entry = {"time": time.time(), "input": sanitize(user_input[:200]), "response_len": len(response), "mode": mode, "feedback": round(feedback, 2)}
     INTERACTION_LOG.append(entry)
     if len(INTERACTION_LOG) > 200: INTERACTION_LOG[:] = INTERACTION_LOG[-200:]
@@ -2159,14 +1720,14 @@ def _print_hallucination_warnings(response: str, strict: bool = False) -> None:
         print(f"  {C['r']}※ 局所参照外の情報が多く含まれる可能性。/kb search で原文を確認推奨。{C['w']}")
 
 def detect_repetition(text: str, window: int = 150) -> bool:
-    """★[v129] 繰り返し検出強化: フレーズ重複 + 文レベル重複を検出。"""
+    """繰り返し検出。"""
     if len(text) < window * 2: return False
     # バイナリ重複（完全一致）
     tail = text[-window * 2:]
     if tail[:len(tail)//2] == tail[len(tail)//2:]:
         return True
-    # 同一比喩構文の多用（4回以上に厳格化）
-    if len(re.findall(r'まるで.{5,50}(?:ようなもの|ような状況|ようだ|かのよう)', text)) >= 4:
+    # 同一比喩構文の多用（5回以上に緩和 — 3回だと豊かな散文も止まった）
+    if len(re.findall(r'まるで.{5,50}(?:ようなもの|ような状況|ようだ|かのよう)', text)) >= 5:
         return True
     # 400字ウィンドウで前半=後半
     if len(text) >= 400:
@@ -2174,26 +1735,23 @@ def detect_repetition(text: str, window: int = 150) -> bool:
         half = len(chunk) // 2
         if chunk[:half] == chunk[half:]:
             return True
-    # ★[v129] 文レベル重複検出: 同じ文が2回以上出てきたら繰り返し
-    sents = re.split(r'[。！？\n]', text)
-    sents = [s.strip() for s in sents if len(s.strip()) > 10]
-    seen_sents: set = set()
-    for s in sents:
-        norm = re.sub(r"\s+", "", s)[:35]
-        if norm in seen_sents: return True
-        seen_sents.add(norm)
+    # ★[修正/rep-3] 総文字数上限を8000→20000に緩和
+    # 哲学者モード(num_predict=-1)で長文生成時に8000字で強制終了していた。
+    # 7段落×5文×80字≒2800字が通常だが余裕を持って20000字に設定。
     if len(text) > 20000:
         return True
     return False
 
 def trim_history(ms: list, max_pairs: int = MAX_HISTORY, token_budget: int = 2000) -> list:
-    """★[v129] 件数上限 + トークン予算の両方でトリム。重要度スコアで古いペアを優先削除。"""
+    """件数上限 + トークン予算の両方でトリムする。
+    ★[修正/hist-1] 哲学者の長い返答が履歴に積み上がってctxを圧迫する問題を防止。
+    token_budget: 履歴全体に使えるトークン数の上限（デフォルト2000）。
+    """
     ms = ms[-(max_pairs * 2):]  # まず件数で絞る
     def _tok(s: str) -> int:
-        jp = sum(1 for c in s if ord(c) > 0x7F)
-        return int(jp * TOKEN_EST_JP + (len(s) - jp) * TOKEN_EST_EN)
-    # ★[v129] 予算超過なら古いペアから削除（最後の2ペアは必ず残す）
-    while len(ms) >= 6:  # 3ペア以上ある場合のみ削除対象
+        return int(sum(1.5 if ord(c) > 0x7F else 0.4 for c in s))
+    # 予算超過なら古いペアから削除
+    while len(ms) >= 2:
         total = sum(_tok(m.get("content", "")) for m in ms)
         if total <= token_budget:
             break
@@ -2421,7 +1979,7 @@ def _fetch_nhk_snippets(query: str) -> str:
         url = f"https://www3.nhk.or.jp/news/search/?keyword={U.quote(query)}"
         h = fetch_html(url, timeout=4, silent=True, spoof_bot=True)
         snips = re.findall(r'<p class="text--M"[^>]*>(.*?)</p>', h, re.I | re.S)
-        return "\n".join(f"[NEWS] {strip_tags(s)}" for s in snips[:3] if len(strip_tags(s)) > 20)
+        return "\n".join(f"[NHK] {strip_tags(s)}" for s in snips[:3] if len(strip_tags(s)) > 20)
     except Exception: return ""
 
 def _fetch_kotobank(query: str) -> str:
@@ -2443,11 +2001,6 @@ def _fetch_stackoverflow_snippets(query: str) -> str:
     except Exception: return ""
 
 def get_async_rag_data(query: str) -> str:
-    """
-    ★[v131] ハイブリッドRAG v3:
-      並列Web取得 → BM25スコアリング → ChromaDB vector_search
-      → RRF融合 → Contextual Compression → Cross-Encoder Reranking
-    """
     with _RAG_LOCK:
         cached = RAG_CACHE.get(query)
         if cached and time.time() - cached[0] < 1800:
@@ -2456,125 +2009,48 @@ def get_async_rag_data(query: str) -> str:
             return content
     res: dict[str, str] = {}
     lock = threading.Lock()
-
     def run_task(key: str, fn, *args):
         try:
             val = fn(*args)
             with lock: res[key] = val or ""
-        except Exception: pass  # サイレントフェイルアウト
-
+        except Exception as e: print(f"{C['y']}[WARN] RAGタスク'{key}'失敗: {e}{C['w']}")
     tasks = [
         ("wiki",     get_wikipedia,         query),
         ("yahoo",    _fetch_yahoo_snippets,  query + " 概要"),
         ("ddg",      _fetch_ddg_snippets,    query),
-        ("bing",     _fetch_bing_snippets,   query),
+        ("bing",     _fetch_bing_snippets,   query),          # バグ修正: 追加
         ("kotobank", _fetch_kotobank,        query),
-        ("nhk",      _fetch_nhk_snippets,    query),
     ]
-    # ★[v131] HyDE をWeb取得と並列実行（Ollama利用可能時のみ）
-    # RAG待機中にHyDE仮想ドキュメントを生成しておくことで遅延ゼロ
-    _hyde_future = None
-    if HYDE_ENABLED and VECTOR_AVAILABLE:
-        _o = _get_ollama()
-        if _o is not None:
-            _hyde_future = _THREAD_POOL.submit(hyde_expand_query, query, _o)
-    futures = {_THREAD_POOL.submit(run_task, k, fn, *a): k for k, fn, *a in tasks}
+    threads = [threading.Thread(target=run_task, args=(k, fn, *a), daemon=True) for k, fn, *a in tasks]
+    for t in threads: t.start()
     start_time = time.time()
-
     while time.time() - start_time < RAG_TIMEOUT:
         with lock:
             wiki_len = len(res.get("wiki", ""))
-            web_len  = sum(len(res.get(k, "")) for k in ["yahoo", "ddg", "bing", "kotobank", "nhk"])
-            if wiki_len > 800 or web_len > 800:
+            web_len  = sum(len(res.get(k, "")) for k in ["yahoo", "ddg", "bing", "kotobank"])
+            # Wikipedia単独で十分長い場合、またはWeb検索が十分集まった場合に早期終了
+            if wiki_len > 800 or web_len > 600:
                 break
-        time.sleep(0.1)
-
-    for f in futures:
-        remain = max(0.0, RAG_TIMEOUT - (time.time() - start_time))
-        try: f.result(timeout=remain)
-        except Exception: pass
-
-    # ★[v131] HyDE futureを回収（すでに完了しているはず）
-    if _hyde_future is not None:
-        try: _hyde_future.result(timeout=0.5)
-        except Exception: pass
-
+        time.sleep(0.15)
+    for t in threads: t.join(timeout=RAG_TIMEOUT)
     with lock:
         wiki = res.get("wiki", "").strip()
-        web_hits = [res.get(k, "").strip() for k in ["yahoo", "ddg", "bing", "kotobank", "nhk"]]
-
-    # ── 1. Web候補をBM25でスコアリング ──────────────────────────
-    def _bm25_score(text: str) -> float:
-        if not text: return 0.0
-        q_words = re.findall(r'[\u3040-\u9FFF\w]{2,}', query.lower())
-        if not q_words: return len(text) * 0.001
-        score = 0.0
-        text_lower = text.lower()
-        for w in q_words:
-            tf = text_lower.count(w)
-            if tf > 0:
-                score += (tf * 2.5) / (tf + 1.5 * (0.25 + 0.75 * len(text) / 500))
-        return score
-
+        web_hits = [res.get(k, "").strip() for k in ["yahoo", "ddg", "bing", "kotobank"]]
     all_lines = []
-    for block in web_hits:
-        for line in block.splitlines():
-            line = line.strip()
-            if len(line) > 20:
-                all_lines.append((line, _bm25_score(line)))
-
-    all_lines.sort(key=lambda x: -x[1])
-    seen: set[str] = set()
-    bm25_ranked: list[str] = []
-    for line, score in all_lines:
-        norm = re.sub(r'\s+', '', line.lower())[:40]
-        if norm not in seen and score > 0:
-            seen.add(norm)
-            bm25_ranked.append(line)
-        if len(bm25_ranked) >= 25:
-            break
-
-    # ── 2. ★[v131] ChromaDB ベクトル検索 (HyDE拡張クエリ — 並列実行)
-    # HyDE はWeb取得と並列に実行済みのため、ここではキャッシュ参照のみ
-    vec_ranked: list[str] = []
-    if VECTOR_AVAILABLE:
-        try:
-            # HyDEキャッシュを先に確認（Ollamaブロックを回避）
-            with _HYDE_LOCK:
-                hyde_q = _HYDE_CACHE.get(query, query)
-            vec_ranked = vector_search(hyde_q, n=10, collection="s01_memory")
-        except Exception:
-            vec_ranked = []
-
-    # ── 3. ★[v131] RRF: BM25ランクとベクトルランクを融合 ────────
-    if vec_ranked and RRF_ENABLED:
-        fused_candidates = reciprocal_rank_fusion([bm25_ranked, vec_ranked])
-    else:
-        fused_candidates = bm25_ranked
-
-    # ── 4. ★[v131] Contextual Compression ──────────────────────
-    compressed_candidates = contextual_compress(query, fused_candidates[:20])
-
-    # ── 5. ★[v131] Cross-Encoder Reranking ──────────────────────
-    final_web_lines = cross_encoder_rerank(query, compressed_candidates, top_k=CROSS_ENCODER_TOP_K)
-
-    merged_web = "\n".join(final_web_lines)
-
+    for block in web_hits: all_lines.extend(block.splitlines())
+    merged_web = "\n".join(_deduplicate_lines(all_lines))
     if len(wiki) < 10 and len(merged_web) < 20: return ""
     parts = []
     if wiki: parts.append(f"[Wikipedia JA]\n{wiki}")
-    tag = "BM25+Vector+RRF+CE" if (vec_ranked and CROSS_ENCODER_ENABLED) else "BM25 ranked"
-    if merged_web: parts.append(f"[Web Search ({tag})]\n{merged_web}")
+    if merged_web: parts.append(f"[Web Search]\n{merged_web}")
     final = "\n\n".join(parts)
-
-    has_wiki = bool(wiki)
-    has_web  = bool(merged_web)
-    # Cross-Encoderが使えた場合は信頼度ボーナス
-    ce_bonus = 0.05 if (_cross_encoder_available and CROSS_ENCODER_ENABLED) else 0.0
-    confidence = min(0.95, (0.8 if (has_wiki and has_web) else (0.6 if (has_wiki or has_web) else 0.2)) + ce_bonus)
-
+    # confidence計算: 実際に取得できたソースのみカウント（バグ修正）
+    has_wiki = bool(res.get("wiki", "").strip())
+    has_web  = bool(sum(len(res.get(k, "").strip()) for k in ["yahoo", "ddg", "bing", "kotobank"]))
+    confidence = 0.7 if (has_wiki and has_web) else (0.5 if (has_wiki or has_web) else 0.2)
     with _RAG_LOCK:
         if len(RAG_CACHE) > 200:
+            # アクセス数が少なく古いものから優先削除
             evict_keys = sorted(RAG_CACHE.items(), key=lambda x: (x[1][2], x[1][0]))[:20]
             for k, _ in evict_keys: RAG_CACHE.pop(k, None)
         RAG_CACHE[query] = (time.time(), final, 1, confidence)
@@ -2611,24 +2087,13 @@ def _build_no_data_prompt(query: str, persona: dict) -> list[dict]:
     return [{"role": "system", "content": f"あなたは{persona['name']}。口調: {persona['style']}。一人称: {persona.get('first_person','私')}。「情報がない」とだけ言え。推測・創作は一切するな。"}, {"role": "user", "content": f"「{query}」について調べたが見つからなかった。「情報がない」とだけ言え。"}]
 
 def two_pass_analysis(query: str, rag_data: str, persona: dict, text_len: int) -> str:
-    sp1 = SystemSpinner("RAG事実抽出(BM25)...", stage="pass1")
+    sp1 = SystemSpinner("RAG事実抽出中...", stage="pass1")
     sp1.start()
-    lines_rag = [re.sub(r'[^ -~　-鿿＀-￯]', '', ln.strip()) for ln in rag_data.splitlines()]
+    lines_rag = [re.sub(r'[^\x20-\x7E\u3000-\u9FFF\uFF00-\uFFEF]', '', ln.strip()) for ln in rag_data.splitlines()]
     lines_rag = [ln for ln in lines_rag if len(ln) >= FACT_MIN_CHARS and ln not in ("(empty)", "")]
-    q_words = [w for w in re.split(r'[\s　、。，．]+', query) if len(w) >= 2]
-    # ★[v129] BM25風スコアリング (k1=1.5, b=0.75)
-    avg_len = sum(len(ln) for ln in lines_rag) / max(len(lines_rag), 1)
-    def bm25(ln: str) -> float:
-        score = 0.0
-        ln_lower = ln.lower()
-        for w in q_words:
-            tf = ln_lower.count(w)
-            if tf > 0:
-                idf = math.log(1 + len(lines_rag) / (1 + sum(1 for l in lines_rag if w in l.lower())))
-                score += idf * (tf * 2.5) / (tf + 1.5 * (0.25 + 0.75 * len(ln) / max(avg_len, 1)))
-        return score
-    scored = sorted([(bm25(ln), ln) for ln in lines_rag], key=lambda x: -x[0])
-    facts = [ln[:250] for _, ln in scored[:10]]  # ★[v129] 8→10件, 200→250文字
+    q_words = [w for w in re.split(r'[\s\u3000\u3001\u3002\uff0c\uff0e]+', query) if len(w) >= 2]
+    scored = sorted([(sum(1 for w in q_words if w in ln) + len(ln) * 0.001, ln) for ln in lines_rag], key=lambda x: -x[0])
+    facts = [ln[:200] for _, ln in scored[:8]]
     raw_p1 = "\n".join(f"<FACT>[HIGH] {f}</FACT>" for f in facts[:4]) + "\n".join(f"<FACT>[MID] {f}</FACT>" for f in facts[4:])
     elapsed1 = sp1.stop()
     print(f"{C['dim']}  Pass1完了 ({elapsed1:.1f}s) / {len(facts)}件抽出{C['w']}")
@@ -2639,11 +2104,11 @@ def two_pass_analysis(query: str, rag_data: str, persona: dict, text_len: int) -
         if conf_str: print(f"{C['dim']}  FACT: {conf_str}{C['w']}")
     print(f"{C['c']}{persona['name']}{C['w']}: ", end="", flush=True)
     if data_found and len(facts_text) >= FACT_MIN_CHARS:
-        result = stream_response(_build_voice_cast_prompt(query, facts, persona), False, len(facts_text), _get_temp_voice(), False, model=DEEP_MODEL)
+        result = stream_response(_build_voice_cast_prompt(query, facts, persona), False, len(facts_text), TEMP_VOICE, False, model=DEEP_MODEL)
         if result and len(result.strip()) > 5:
             _print_hallucination_warnings(result)
             return result
-    result = stream_response(_build_no_data_prompt(query, persona), False, 50, _get_temp_voice(), False, model=DEEP_MODEL)
+    result = stream_response(_build_no_data_prompt(query, persona), False, 50, TEMP_VOICE, False, model=DEEP_MODEL)
     if result: _print_hallucination_warnings(result)
     return result
 
@@ -2658,21 +2123,6 @@ def _find_overlap(base: str, continuation: str, max_check: int = 80) -> int:
 def _single_gen(o, model: str, msgs: list, opts: dict, silent: bool, timeout: int) -> tuple:
     """1回分の生成。タイムアウトなしの直接ストリーミング。(テキスト, 成功フラグ) を返す。"""
     full = ""
-    # ★[v131] 出力バッファリング: 1文字ずつflushせず句読点・改行でまとめて出力
-    # これによりターミナル描画コストとシステムコール回数を削減
-    _BUF_FLUSH_CHARS = frozenset("。、\n！？!?\r")
-    _buf = []
-    _buf_len = 0
-    _FLUSH_AT = 8  # 8文字バッファが溜まったらflush
-
-    def _flush_buf():
-        nonlocal _buf, _buf_len
-        if _buf:
-            sys.stdout.write("".join(_buf))
-            sys.stdout.flush()
-            _buf = []
-            _buf_len = 0
-
     try:
         for chunk in o.chat(model=model, messages=msgs, stream=True, options=opts, keep_alive=-1):
             msg = chunk.get("message", {}) if isinstance(chunk, dict) else getattr(chunk, "message", None)
@@ -2681,23 +2131,16 @@ def _single_gen(o, model: str, msgs: list, opts: dict, silent: bool, timeout: in
             if not isinstance(t, str) or not t: continue
             t = sanitize(t)
             if not t: continue
+            if not silent: print(t, end="", flush=True)
             full += t
-            if not silent:
-                _buf.append(t)
-                _buf_len += len(t)
-                # 句読点・改行・一定量でflush
-                if _buf_len >= _FLUSH_AT or any(c in _BUF_FLUSH_CHARS for c in t):
-                    _flush_buf()
-        if not silent:
-            _flush_buf()
+        # ★[修正/eos-1] 末尾への「。」自動補完を廃止。
+        # モデルが文の途中でEOSを出した場合でも補完せずそのまま返す。
+        # 補完が「によって。」「我々が。」のような不自然な途切れを生んでいた。
         return full, True
     except KeyboardInterrupt:
-        if not silent: _flush_buf()
         return full, False
     except Exception as e:
-        if not silent:
-            _flush_buf()
-            print(f"\n{C['r']}[ERR] {e}{C['w']}")
+        if not silent: print(f"\n{C['r']}[ERR] {e}{C['w']}")
         return full, False
 
 
@@ -2713,71 +2156,48 @@ def stream_response(messages: list, is_logic: bool, text_len: int,
         last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         model = select_model(last)
 
-    # ★[v129] トークン推定（改良版: BPEベース近似）
+    # ★[修正/ctx-1] プロンプト長チェック＆古い履歴パージ
+    # Ollamaはトークン超過時に応答が途中で途切れるため、
+    # 送信前に総文字数を推定し、n_ctx上限に収まるよう履歴を削除する。
+    # 日本語は1文字≒1.5トークン、英数字は0.4トークンとして粗く見積もる。
     def _estimate_tokens(text: str) -> int:
-        if not text: return 0
         jp = sum(1 for c in text if ord(c) > 0x7F)
         en = len(text) - jp
-        # 句読点・記号の調整
-        punct = sum(1 for c in text if c in "。、！？.,!?;:「」『』【】")
-        return int(jp * TOKEN_EST_JP + en * TOKEN_EST_EN + punct * 0.2)
+        return int(jp * 1.5 + en * 0.4)
 
     def _msgs_token_estimate(msgs: list) -> int:
-        return sum(_estimate_tokens(m.get("content", "")) for m in msgs) + len(msgs) * 4  # +4=role overhead
+        return sum(_estimate_tokens(m.get("content", "")) for m in msgs)
 
     _opts_preview = get_llm_opt(is_logic, text_len, temp_override, max_tokens=max_tokens)
     _n_ctx = _opts_preview.get("num_ctx", 4096)
     _n_predict = _opts_preview.get("num_predict", 2000)
-
-    # ★[v129] TokenBudget: 動的コンテキスト管理
-    _n_predict_safe = max(0, _n_predict) if _n_predict != -1 else 2048
-    _prompt_budget = _n_ctx - _n_predict_safe - TOKEN_BUDGET_SAFETY
+    # システムプロンプト＋最新ユーザー発言は必ず残す（削除不可枠）
     _fixed = [m for m in messages if m.get("role") == "system"]
     _history = [m for m in messages if m.get("role") != "system"]
     _user_last = _history[-1:] if _history and _history[-1].get("role") == "user" else []
     _conv = _history[:-1] if _user_last else _history
+    # n_ctx から出力予約トークンを引いた残りをプロンプトに使える上限とする
+    # ★[修正/ctx-5] num_predict=-1は廃止済み。常に実値で計算する。
+    _n_predict_safe = max(0, _n_predict) if _n_predict != -1 else 2048
+    _prompt_budget = _n_ctx - _n_predict_safe - 64   # 64トークン: 特殊トークン余裕
     _fixed_tokens = _msgs_token_estimate(_fixed + _user_last)
     _budget_for_conv = max(0, _prompt_budget - _fixed_tokens)
-
-    # ★[v129] スマートプルーニング: 重要度スコアで古い会話を削除
+    # 予算内に収まるまで古いconvペアを先頭から削除
     _purged = 0
     while _conv and _msgs_token_estimate(_conv) > _budget_for_conv:
-        # 最初のuser/assistantペアを削除（最古の会話）
-        _conv = _conv[2:] if len(_conv) >= 2 else []
+        _conv = _conv[2:]   # user/assistant ペアを1組削除
         _purged += 1
     if _purged and not silent:
         print(f"{C['dim']}[ctx] 履歴{_purged}ペア削除 (ctx圧迫回避){C['w']}")
     messages = _fixed + _conv + _user_last
+    # ★[修正/ctx-1] ここまで
 
     opts = get_llm_opt(is_logic, text_len, temp_override, max_tokens=max_tokens)
 
-    # ★[v129] Thinking Mode: chain-of-thought prefix
-    if THINKING_MODE and is_logic:
-        # think タグを自動追加（対応モデルのみ）
-        _sys_idx = next((i for i, m in enumerate(messages) if m.get("role") == "system"), None)
-        if _sys_idx is not None:
-            _orig = messages[_sys_idx]["content"]
-            messages = list(messages)
-            messages[_sys_idx] = {
-                "role": "system",
-                "content": _orig + "\n\n【思考プロセス】まず<think>タグ内で段階的に考え、その後回答を出力せよ。"
-            }
-
     full_result, ok = _single_gen(o, model, messages, opts, silent, 0)
     if not full_result.strip():
-        # ★[v129] モデルフォールバック: FASTモデルで再試行
-        if model == DEEP_MODEL and DEEP_MODEL != MODEL_NAME:
-            if not silent: print(f"{C['y']}[WARN] {DEEP_MODEL}失敗 → {MODEL_NAME}で再試行{C['w']}")
-            full_result, ok = _single_gen(o, MODEL_NAME, messages, opts, silent, 0)
-        if not full_result.strip():
-            if not silent: print(f"\n{C['r']}[ERR] 応答がありません{C['w']}")
-            return ""
-
-    # ★[v129] <think>タグを除去して最終回答のみ返す
-    if "<think>" in full_result and "</think>" in full_result:
-        _think_end = full_result.rfind("</think>")
-        if _think_end != -1:
-            full_result = full_result[_think_end + 8:].strip()
+        if not silent: print(f"\n{C['r']}[ERR] 応答がありません{C['w']}")
+        return ""
 
     # 繰り返しループ検出 → 末尾を整形して返す
     if detect_repetition(full_result):
@@ -2788,80 +2208,60 @@ def stream_response(messages: list, is_logic: bool, text_len: int,
 
 def get_llm_opt(is_logic_mode: bool, text_len: int = 0, temp_override: float | None = None, max_tokens: int | None = None) -> dict:
     power = POWER_MODE
-    # ★[v131] GPU環境では大幅にctxを拡張
-    _gpu = _GPU_AVAILABLE or _HAS_12B
     configs = {
-        #          ctx     pl    pc    tl     tc    threads
-        # ★[v131] num_ctx を半減: KVキャッシュ確保コストが最大のボトルネック
-        # CPU推論では ctx が大きいほど prefill も遅くなる
-        "ultra": (65536 if _gpu else 8192,  4096, 4096, 0.10, 0.72, 16),
-        "high":  (32768 if _gpu else 6144,  2048, 2048, 0.15, 0.76, 16),
-        "mid":   (16384 if _gpu else 4096,  1024, 1024, 0.18, 0.78, 12),
-        "low":   (4096,                       512,  400, 0.20, 0.78,  8),
+        "ultra": (12288, 4096, 4096, 0.12, 0.74, 8),
+        "high":  (8192,  2048, 2000, 0.18, 0.78, 8),
+        "mid":   (4096,  2000, 2000, 0.18, 0.78, 6),  # pcを1600→2000: 途切れ防止
+        "low":   (2048,   700,  600, 0.20, 0.78, 4),
     }
     ctx, pl, pc, tl, tc, threads = configs.get(power, configs["high"])
-
-    # ★[v131] Thinking Mode: logicモードで低温・長いpredict
-    if THINKING_MODE and is_logic_mode:
-        ctx = max(ctx, 8192 if _gpu else 4096)
-        num_predict = min(max_tokens or 2048, 2048)
-        final_temp = temp_override if temp_override is not None else 0.10
-    elif is_logic_mode:
-        ctx = max(ctx, 6144 if _gpu else 4096)
-        num_predict = min(max_tokens or 1024, 1024 if not _gpu else 2048)
-        final_temp = temp_override if temp_override is not None else tl
+    if is_logic_mode:
+        # complexモード: ctx・num_predictをモデル実上限内に収める
+        # ★[修正/ctx-5] ctx=12288はllama3.1:8b/gemma3:4bの実上限(8192)を超えるため
+        # Ollamaに無視されプロンプト圧迫→途中途切れの直接原因だった。
+        # 8192に戻し、出力予約2048を確保することで「プロンプト≦6144トークン」を保証する。
+        ctx = 8192
+        # ★[修正/ctx-5] num_predict=-1（無制限）はctx残量ゼロでもEOS選択を強制するため
+        # かえって途切れを誘発する。2048固定で十分な出力長を確保しつつ安定させる。
+        num_predict = 2048
     elif text_len < 80:
-        # ★[v131] 短い入力はctxをさらに絞る
-        ctx = max(512, ctx // 8)
-        num_predict = 256
-        final_temp = temp_override if temp_override is not None else tc
-    elif text_len > 600:
-        ctx = max(ctx, 6144 if _gpu else 4096)
+        ctx = max(512, ctx // 2)
         num_predict = pc
-        final_temp = temp_override if temp_override is not None else tc
+    elif text_len > 600:
+        ctx = max(ctx, 8192)
+        num_predict = pc
     else:
         num_predict = pc
-        final_temp = temp_override if temp_override is not None else tc
-
+    final_temp = temp_override if temp_override is not None else (tl if is_logic_mode else tc)
     stop_words: list[str] = []
     actual_predict = max_tokens if max_tokens is not None else num_predict
     if actual_predict is None:
-        actual_predict = 1024
+        actual_predict = 2048
     elif actual_predict == -1:
-        actual_predict = 1024
+        # ★[修正/ctx-5] -1（無制限）はctx残量ゼロ時にEOS早期選択を招くため2048に差し替える。
+        # 呼び出し元が明示的に-1を渡した場合も同様に上書きする。
+        actual_predict = 2048
     else:
         actual_predict = max(1, int(actual_predict))
-
-    # ★[v131] num_batch最適化
-    # CPU: 大きいbatchは初回latencyを増やすだけ。512が最速のsweet spot
-    # GPU: 2048維持
-    _batch = 2048 if _gpu else 512
-
     if is_logic_mode:
         return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp,
-                    top_k=40,           # ★[v131] 80→40: サンプリング候補削減で高速化
-                    top_p=0.92,
-                    min_p=0.05,         # ★[v131] 0.02→0.05: 低品質トークンをより強くフィルタ
-                    repeat_penalty=1.30,
-                    repeat_last_n=64,   # ★[v131] 256→64: バッファスキャン削減
-                    num_thread=threads, num_batch=_batch,
-                    num_keep=64,        # ★[v131] 128→64: KVキャッシュ保持削減
-                    stop=stop_words)
+                    top_k=60,   # ★[修正/smp-1] 30→60: 候補枯渇によるeos早期選択を防止
+                    top_p=0.92, # ★[修正/smp-1] 0.86→0.92: サンプリング幅を拡大
+                    repeat_penalty=1.35,
+                    repeat_last_n=256,
+                    num_thread=threads, num_batch=512, stop=stop_words)
     return dict(num_ctx=ctx, num_predict=actual_predict, temperature=final_temp,
-                top_k=30,              # ★[v131] 50→30: 雑談は少ない候補で十分
-                top_p=0.90,
-                min_p=0.05,
-                repeat_penalty=1.20,   # ★[v131] 1.25→1.20: ペナルティ計算コスト削減
-                repeat_last_n=64,      # ★[v131] 128→64
-                num_thread=threads, num_batch=_batch,
-                num_keep=64,
-                stop=stop_words)
+                top_k=40,   # ★[修正/smp-1] 20→40
+                top_p=0.90, # ★[修正/smp-1] 0.85→0.90
+                repeat_penalty=1.30,
+                repeat_last_n=256,
+                num_thread=threads, num_batch=512, stop=stop_words)
 
 _SYS_PRM_CACHE: dict[str, str] = {}
 _SYS_PRM_CACHE_PERSONA: int = -1
 # ★[修正2] extrasキャッシュ（memory_context / dict_context 等を短期キャッシュ）
 _SYS_EXTRAS_CACHE: dict[str, tuple[float, str]] = {}
-_SYS_EXTRAS_TTL = 8.0  # ★[v131] 0.0→8.0: 8秒間キャッシュ再利用でvector_search省略
+_SYS_EXTRAS_TTL = 0.0  # キャッシュ無効化 — ターンごとに新鮮な文脈を使う
 
 def get_sys_prm(mode: str, data: str = "", key: str = "", per_id=2) -> dict:
     global _SYS_PRM_CACHE_PERSONA
@@ -2916,10 +2316,7 @@ def get_sys_prm(mode: str, data: str = "", key: str = "", per_id=2) -> dict:
         opt_block = inject_optimizations(mode, persona.get("name", ""))
         dict_block = dict_context(data or key or "")
         extras = "".join(p for p in [mem_block, session_block, opt_block, dict_block] if p)
-        # ★[修正/#5] TTL=0 のときはキャッシュに書き込まない。
-        # 旧コードは TTL=0 でも毎ターン _SYS_EXTRAS_CACHE に書き続けていた（メモリリーク）。
-        if _SYS_EXTRAS_TTL > 0:
-            _SYS_EXTRAS_CACHE[extras_key] = (now, extras)
+        _SYS_EXTRAS_CACHE[extras_key] = (now, extras)
     return dict(role="system", content=_SYS_PRM_CACHE[cache_key] + data + extras)
 
 @lru_cache(maxsize=512)
@@ -3269,47 +2666,6 @@ _SEC_TRAITS = {
 _GM = {"piano":0,"strings":48,"pad":88,"bass":32,"guitar":25}
 # ドラム MIDI音番号
 _DRUM = {"kick":36,"snare":38,"hihat":42,"open_hat":46,"crash":49,"ride":51,"tom":45}
-
-_MOOD_MAP = {
-    "悲しい":{"scale":"minor","bpm_mod":-15,"genre":"strings"},
-    "切ない":{"scale":"minor","bpm_mod":-10,"genre":"strings"},
-    "暗い":{"scale":"minor","bpm_mod":-10,"genre":"piano"},
-    "孤独":{"scale":"minor","bpm_mod":-20,"genre":"piano"},
-    "憂鬱":{"scale":"dorian","bpm_mod":-15,"genre":"piano"},
-    "楽しい":{"scale":"major","bpm_mod":+15,"genre":"piano"},
-    "明るい":{"scale":"major","bpm_mod":+10,"genre":"piano"},
-    "元気":{"scale":"pentatonic","bpm_mod":+20,"genre":"rock"},
-    "希望":{"scale":"major","bpm_mod":+5,"genre":"strings"},
-    "激しい":{"scale":"blues","bpm_mod":+30,"genre":"rock"},
-    "燃える":{"scale":"blues","bpm_mod":+35,"genre":"rock"},
-    "戦い":{"scale":"minor","bpm_mod":+25,"genre":"rock"},
-    "怒り":{"scale":"blues","bpm_mod":+20,"genre":"rock"},
-    "神秘":{"scale":"dorian","bpm_mod":-5,"genre":"pad"},
-    "幻想":{"scale":"dorian","bpm_mod":-10,"genre":"pad"},
-    "宇宙":{"scale":"dorian","bpm_mod":-15,"genre":"pad"},
-    "jazz":{"scale":"dorian","bpm_mod":+5,"genre":"jazz"},
-    "ジャズ":{"scale":"dorian","bpm_mod":+5,"genre":"jazz"},
-    "ロック":{"scale":"blues","bpm_mod":+20,"genre":"rock"},
-    "クラシック":{"scale":"major","bpm_mod":-5,"genre":"classical"},
-    "EDM":{"scale":"minor","bpm_mod":+30,"genre":"pad"},
-}
-_GENRE_INSTRUMENTS = {
-    "piano":{"melody":0,"chords":0,"bass":32},
-    "strings":{"melody":40,"chords":48,"bass":43},
-    "rock":{"melody":29,"chords":25,"bass":34},
-    "jazz":{"melody":0,"chords":25,"bass":33},
-    "pad":{"melody":88,"chords":89,"bass":38},
-    "classical":{"melody":40,"chords":48,"bass":43},
-}
-def _analyze_mood(theme):
-    result={"scale":"major","bpm_mod":0,"genre":"piano"}
-    for kw,mood in _MOOD_MAP.items():
-        if kw in theme: result=mood.copy(); break
-    return result
-def _transpose_key(key,semitones):
-    keys=["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"]
-    idx=keys.index(key) if key in keys else 0
-    return keys[(idx+semitones)%12]
 
 def _midi_scale(root: int, stype: str, oct_off: int) -> list[int]:
     """指定ルート・スケールのMIDIピッチリスト（48〜96範囲）"""
@@ -3793,14 +3149,12 @@ def handle_kb(arg: str, _chat_fn=None, _persona_id: int = 2) -> str:
         cols = [c for c in vector_list_collections() if c != "s01_memory"]
         if not cols: return f"{C['y']}取り込み済みファイルなし。{C['w']}"
 
-        # ── Pass1: ★[v131] hybrid_search_advanced (RRF+CE) ───────
+        # ── Pass1: 1次ベクトル検索 ────────────────────────────────
         cite_map: list[tuple[str, str]] = []  # (source_label, chunk_text)
-        o_cli = _get_ollama()
         for col in cols:
-            col_label = col.replace("book_", "")
-            hits = hybrid_search_advanced(rest, n_candidates=12, top_k=5, collection=col, ollama_client=o_cli)
-            for h in hits:
-                cite_map.append((col_label, h))
+            src = col.replace("book_", "")
+            for h in vector_search(rest, n=4, collection=col):
+                cite_map.append((src, h))
         if not cite_map:
             return f"{C['y']}「{rest}」に関連する箇所が知識ベースに見つかりませんでした。{C['w']}"
 
@@ -4353,7 +3707,7 @@ def _spi_pick_smart(filter_cat: str | None = None, use_llm: bool = True) -> dict
                 result_box.append(q)
         t = threading.Thread(target=_gen, daemon=True)
         t.start()
-        t.join(timeout=5)   # ★[修正/#7] 最大5秒待つ（旧コメントは「14秒」と誤記）
+        t.join(timeout=5)   # 最大14秒待つ
         if result_box:
             _spi_mark_used(result_box[0])
             return result_box[0]
@@ -4610,26 +3964,11 @@ def save_quest(goal: str, plan: str) -> None:
     quests.append({"time": now_stamp(), "goal": goal, "plan": plan, "done": False}); save_state(state)
 
 def debug_report() -> str:
-    rows = [f"{C['c']}=== S-01 DEBUG v131 Advanced RAG ==={C['w']}"]
+    rows = [f"{C['c']}=== S-01 DEBUG v128.1 ==={C['w']}"]
     rows.append(f"RAGキャッシュ: {len(RAG_CACHE)}")
     if RAG_CACHE:
         for key, (ts, val, acc, conf) in list(RAG_CACHE.items())[-5:]:
-            rows.append(f"  [{key[:20]}] age={int(time.time()-ts)}s len={len(val)} acc={acc} conf={conf:.2f}")
-    # ★[v131] Advanced RAG ステータス
-    ce_status = (
-        "有効" if _cross_encoder_available is True else
-        "無効(未インストール: pip install sentence-transformers)" if _cross_encoder_available is False else
-        "未初期化"
-    )
-    ce_cache_info = _ce_score_cached.cache_info() if _cross_encoder_available else None
-    rows.append(f"── Advanced RAG v131 ──")
-    rows.append(f"  Cross-Encoder : {ce_status} ({CROSS_ENCODER_MODEL})")
-    if ce_cache_info:
-        rows.append(f"    CEキャッシュ: hits={ce_cache_info.hits} misses={ce_cache_info.misses} size={ce_cache_info.currsize}/{ce_cache_info.maxsize}")
-    rows.append(f"  RRF           : {'有効' if RRF_ENABLED else '無効'} (k={RRF_K})")
-    rows.append(f"  HyDE          : {'有効' if HYDE_ENABLED else '無効'} (max={HYDE_MAX_TOKENS}文字, cached={len(_HYDE_CACHE)})")
-    rows.append(f"  Ctx Compress  : {'有効' if CTXCOMP_ENABLED else '無効'} (max={CTXCOMP_MAX_CHARS}文字/チャンク)")
-    rows.append(f"  CE top_k      : {CROSS_ENCODER_TOP_K}")
+            rows.append(f"  [{key[:20]}] age={int(time.time()-ts)}s len={len(val)} acc={acc} conf={conf:.1f}")
     rows.append(f"キーワード: {', '.join(KEYWORD_MEMORY) or 'なし'}")
     rows.append(f"モデル: {MODEL_NAME} | パワー: {POWER_MODE}")
     return "\n".join(rows)
@@ -4646,46 +3985,11 @@ def doctor_report() -> str:
 def set_power_mode(arg: str) -> str:
     global POWER_MODE
     mode = arg.strip().lower()
-    if not mode:
-        return (f"{C['c']}current: {POWER_MODE}{C['w']}\n"
-                f"  FAST={FAST_MODEL} | MAIN={MODEL_NAME} | DEEP={DEEP_MODEL}\n"
-                f"  Thinking={'ON' if THINKING_MODE else 'OFF'}")
-    if mode not in ("low", "mid", "high", "ultra"):
-        return f"{C['r']}usage: /power low|mid|high|ultra{C['w']}"
+    if not mode: return f"{C['c']}current: {POWER_MODE}{C['w']}"
+    if mode not in ("low", "mid", "high", "ultra"): return f"{C['r']}usage: /power low|mid|high|ultra{C['w']}"
     POWER_MODE = mode
-    # ★[v129] パワーモード変更時にモデル選択も更新
-    _update_model_for_power()
-    persist_learning()
-    label = {'low':'軽量(1b)','mid':'標準(4b)','high':'高推論(4b→12b)','ultra':'最大(12b)'}.get(mode,'')
-    return (f"{C['g']}power: {POWER_MODE} {label}{C['w']}\n"
-            f"  FAST={FAST_MODEL} | MAIN={MODEL_NAME} | DEEP={DEEP_MODEL}")
-
-
-def _update_model_for_power():
-    """★[v129] パワーモードに応じてモデルを動的選択"""
-    global MODEL_NAME, DEEP_MODEL, FAST_MODEL
-    tier = MODEL_TIERS.get(POWER_MODE, MODEL_TIERS["mid"])
-    o = _get_ollama()
-    if o is None: return
-    try:
-        models = o.list()
-        items = models.get("models", []) if isinstance(models, dict) else getattr(models, "models", [])
-        names = [_model_name(m) for m in items]
-        for t in tier:
-            if any(t.split(":")[0] in n for n in names):
-                MODEL_NAME = t; break
-        if _HAS_12B and POWER_MODE in ("high", "ultra"):
-            DEEP_MODEL = "gemma3:12b"
-        else:
-            DEEP_MODEL = MODEL_NAME
-        # ★[修正/fast-power] FASTモデルもパワーモードに連動させる
-        if POWER_MODE == "low":
-            FAST_MODEL = "gemma3:1b"
-        elif POWER_MODE in ("mid", "high"):
-            FAST_MODEL = "gemma3:4b"
-        elif POWER_MODE == "ultra":
-            FAST_MODEL = "gemma3:12b"
-    except Exception: pass
+    persist_learning()  # ★[修正/power-persist] 変更を即座にstateファイルへ保存。再起動後も維持される。
+    return f"{C['g']}power: {POWER_MODE} ({'軽量' if mode=='low' else '標準' if mode=='mid' else '高推論' if mode=='high' else '最大推論'}){C['w']}"
 
 def build_custom_persona(attr: str, hint: str = "") -> dict:
     name = attr.strip()[:40] or "CUSTOM"
@@ -4943,37 +4247,14 @@ def _model_name(m) -> str:
     return getattr(m, "name", "") or getattr(m, "model", "") or ""
 
 def check_ollama_connection() -> bool:
-    global MODEL_NAME, DEEP_MODEL, FAST_MODEL, _HAS_12B
     o = _get_ollama()
     if o is None: print(f"{C['r']}[FATAL] ollama not installed. pip install ollama{C['w']}"); return False
     try:
         models = o.list()
         items = models.get("models", []) if isinstance(models, dict) else getattr(models, "models", [])
         names = [_model_name(m) for m in items]
-
-        # ★[v129] モデル自動選択: 12b > 4b > 1b の優先順
-        has_12b  = any("12b" in n or "gemma3:12b" in n for n in names)
-        has_4b   = any("4b"  in n or "gemma3:4b"  in n for n in names)
-        has_1b   = any("1b"  in n or "gemma3:1b"  in n or "gemma3.1:1b" in n for n in names)
-        _HAS_12B = has_12b
-
-        tier = MODEL_TIERS.get(POWER_MODE, MODEL_TIERS["mid"])
-        selected = None
-        for t in tier:
-            if any(t in n or n.startswith(t.split(":")[0]) for n in names):
-                selected = t; break
-        if not selected:
-            # fallback: 何でもあれば使う
-            selected = next((n for n in names if "gemma" in n.lower()), None)
-            if not selected:
-                print(f"{C['y']}model not found. available: {', '.join(names) or 'none'}{C['w']}"); return False
-
-        MODEL_NAME  = selected
-        DEEP_MODEL  = "gemma3:12b" if has_12b else selected
-        FAST_MODEL  = "gemma3:1b"  if has_1b  else selected
-
-        gpu_tag = f" {C['g']}[GPU]{C['w']}" if _GPU_AVAILABLE else ""
-        print(f"{C['g']}[OK] FAST={FAST_MODEL} | MAIN={MODEL_NAME} | DEEP={DEEP_MODEL}{gpu_tag}{C['w']}")
+        found = any(MODEL_NAME in n or n.startswith(MODEL_NAME.split(":")[0]) for n in names)
+        if not found: print(f"{C['y']}model '{MODEL_NAME}' not found. available: {', '.join(names) or 'none'}{C['w']}"); return False
         return True
     except Exception as e: print(f"{C['r']}[FATAL] Ollama connection failed: {e}{C['w']}"); return False
 
@@ -5432,22 +4713,8 @@ def handle_color(hex_code: str) -> str:
     rows = [f"{C['c']}=== 色情報 #{hex_code.upper()} ==={C['w']}"]
     rows.append(f"  RGB: ({r}, {g}, {b})")
     rows.append(f"  サンプル: {block}")
-    # ★[修正/#4] HSL を正しい公式で計算。
-    # 旧コード: S=max-min(0〜255の生値), L=max/2.55 は実際のHSL定義と全く異なる式だった。
-    r_, g_, b_ = r / 255.0, g / 255.0, b / 255.0
-    cmax, cmin = max(r_, g_, b_), min(r_, g_, b_)
-    delta = cmax - cmin
-    if delta == 0:
-        hsl_h = 0.0
-    elif cmax == r_:
-        hsl_h = 60.0 * (((g_ - b_) / delta) % 6)
-    elif cmax == g_:
-        hsl_h = 60.0 * ((b_ - r_) / delta + 2)
-    else:
-        hsl_h = 60.0 * ((r_ - g_) / delta + 4)
-    hsl_l = (cmax + cmin) / 2.0
-    hsl_s = 0.0 if delta == 0 else delta / (1.0 - abs(2.0 * hsl_l - 1.0))
-    rows.append(f"  HSL: ({hsl_h:.0f}°, {hsl_s*100:.0f}%, {hsl_l*100:.0f}%)")
+    hsl_h = math.degrees(math.atan2(math.sqrt(3)*(g-b), 2*r-g-b)) % 360
+    rows.append(f"  HSL: ({hsl_h:.0f}°, {max(r,g,b)-min(r,g,b)}%, {max(r,g,b)/2.55:.0f}%)")
     return "\n".join(rows)
 
 def handle_sysinfo() -> str:
@@ -6554,134 +5821,125 @@ class ChessAI:
         ],
     }
 
-    # ★[v129] 難易度設定 — depth増強・Killer/TT有効
     DIFFICULTY_SETTINGS = {
-        "easy":      {"depth": 0, "random_rate": 1.0},
-        "middle":    {"depth": 2, "random_rate": 0.15},  # depth 1→2
-        "hard":      {"depth": 3, "random_rate": 0.0},
-        "very_hard": {"depth": 4, "random_rate": 0.0},
+        "easy":      {"depth": 0, "random_rate": 1.0},   # 完全ランダム
+        "middle":    {"depth": 1, "random_rate": 0.2},   # depth1 + 20%ランダム
+        "hard":      {"depth": 3, "random_rate": 0.0},   # depth3 alpha-beta
+        "very_hard": {"depth": 4, "random_rate": 0.0},   # depth4 alpha-beta
     }
 
     def __init__(self, difficulty: str = "middle", color: str = "b"):
         self.difficulty = difficulty
-        self.color = color
+        self.color = color  # AIが担当する色 ("w" or "b")
         s = self.DIFFICULTY_SETTINGS.get(difficulty, self.DIFFICULTY_SETTINGS["middle"])
         self.depth = s["depth"]
         self.random_rate = s["random_rate"]
-        self._tt: dict = {}          # ★[v129] Transposition Table
-        self._killer: dict = {}      # ★[v129] Killer Heuristic
 
     def _pst_score(self, piece: str, r: int, c: int) -> int:
+        """駒のポジションスコア (白視点)"""
         color, ptype = piece[0], piece[1]
         table = self._PST.get(ptype)
-        if table is None: return 0
-        return table[r][c] if color == "w" else table[7 - r][c]
+        if table is None:
+            return 0
+        if color == "w":
+            return table[r][c]
+        else:
+            return table[7 - r][c]
 
     def evaluate(self, g: "ChessEngine") -> int:
-        """盤面評価 (正=白有利, 負=黒有利) ★[v129] モビリティボーナス追加"""
+        """盤面評価 (正=白有利, 負=黒有利)"""
         score = 0
-        piece_count = 0
         for r in range(8):
             for c in range(8):
                 piece = g.board[r][c]
-                if not piece: continue
+                if not piece:
+                    continue
                 color, ptype = piece[0], piece[1]
                 val = self.PIECE_VALUE.get(ptype, 0) + self._pst_score(piece, r, c)
                 score += val if color == "w" else -val
-                piece_count += 1
-        # ★[v129] エンドゲーム補正: 駒が少ないほどキングを中央へ
-        if piece_count < 16:
-            for r in range(8):
-                for c in range(8):
-                    p = g.board[r][c]
-                    if p and p[1] == "K":
-                        center_bonus = (3 - abs(r - 3.5)) + (3 - abs(c - 3.5))
-                        score += int(center_bonus * 5) if p[0] == "w" else -int(center_bonus * 5)
         return score
 
-    def _mvv_lva_key(self, g: "ChessEngine", mv: tuple) -> int:
-        """★[v129] MVV-LVA: 高価値の駒を取る手を優先"""
-        fr, fc, tr, tc = mv
-        victim = g.board[tr][tc]
-        attacker = g.board[fr][fc]
-        if victim and attacker:
-            return -(self.PIECE_VALUE.get(victim[1], 0) * 10 - self.PIECE_VALUE.get(attacker[1], 0))
-        return 100  # 通常手
-
     def _all_legal_moves(self, g: "ChessEngine", color: str) -> list[tuple]:
-        moves = g.legal_moves(color)
-        # ★[v129] MVV-LVA + Killer ソート
-        killers = self._killer.get(0, [])
-        moves.sort(key=lambda mv: (
-            0 if mv in killers else 1,
-            self._mvv_lva_key(g, mv)
-        ))
-        return moves
+        return g.legal_moves(color)
 
     def _minimax(self, g: "ChessEngine", depth: int, alpha: int, beta: int, maximizing: bool) -> int:
-        if depth == 0 or g.game_over: return self.evaluate(g)
-
-        # ★[v129] Transposition Table lookup
-        bh = hash((str(g.board), g.turn, depth))
-        if bh in self._tt: return self._tt[bh]
+        if depth == 0 or g.game_over:
+            return self.evaluate(g)
 
         color = "w" if maximizing else "b"
         moves = self._all_legal_moves(g, color)
-        if not moves: return self.evaluate(g)
+        if not moves:
+            return self.evaluate(g)
 
         if maximizing:
             best = -10**9
             for fr, fc, tr, tc in moves:
                 saved = g._apply_move_temp(fr, fc, tr, tc)
-                prev_turn = g.turn; g.turn = "b"
+                prev_turn = g.turn
+                g.turn = "b"
                 val = self._minimax(g, depth - 1, alpha, beta, False)
-                g.turn = prev_turn; g._undo_move_temp(saved)
-                if val > best:
-                    best = val
-                    if val >= beta:  # ★[v129] Killer登録
-                        k = self._killer.setdefault(depth, [])
-                        if (fr,fc,tr,tc) not in k: k.insert(0, (fr,fc,tr,tc)); k[:] = k[:2]
-                        break
+                g.turn = prev_turn
+                g._undo_move_temp(saved)
+                best = max(best, val)
                 alpha = max(alpha, val)
-                if beta <= alpha: break
+                if beta <= alpha:
+                    break
+            return best
         else:
             best = 10**9
             for fr, fc, tr, tc in moves:
                 saved = g._apply_move_temp(fr, fc, tr, tc)
-                prev_turn = g.turn; g.turn = "w"
+                prev_turn = g.turn
+                g.turn = "w"
                 val = self._minimax(g, depth - 1, alpha, beta, True)
-                g.turn = prev_turn; g._undo_move_temp(saved)
+                g.turn = prev_turn
+                g._undo_move_temp(saved)
                 best = min(best, val)
                 beta = min(beta, val)
-                if beta <= alpha: break
-
-        # ★[v129] TT store (TTサイズ上限)
-        self._tt[bh] = best
-        if len(self._tt) > 30000: self._tt.clear()
-        return best
+                if beta <= alpha:
+                    break
+            return best
 
     def choose_move(self, g: "ChessEngine") -> tuple | None:
+        """AIが次の手を選んで (fr, fc, tr, tc) を返す。手がなければ None。"""
         moves = self._all_legal_moves(g, self.color)
-        if not moves: return None
-        if self.difficulty == "easy": return random.choice(moves)
-        if self.random_rate > 0 and random.random() < self.random_rate: return random.choice(moves)
+        if not moves:
+            return None
 
+        # easy: 完全ランダム
+        if self.difficulty == "easy":
+            return random.choice(moves)
+
+        # middle/hard/very_hard: random_rate の確率でランダム手
+        if self.random_rate > 0 and random.random() < self.random_rate:
+            return random.choice(moves)
+
+        # minimax で最善手を探す
         maximizing = (self.color == "w")
         best_val = -10**9 if maximizing else 10**9
         best_moves = []
-        self._tt.clear(); self._killer.clear()  # 新探索でリセット
 
         for fr, fc, tr, tc in moves:
             saved = g._apply_move_temp(fr, fc, tr, tc)
-            prev_turn = g.turn; g.turn = "b" if self.color == "w" else "w"
+            prev_turn = g.turn
+            g.turn = "b" if self.color == "w" else "w"
             val = self._minimax(g, self.depth - 1, -10**9, 10**9, not maximizing)
-            g.turn = prev_turn; g._undo_move_temp(saved)
+            g.turn = prev_turn
+            g._undo_move_temp(saved)
+
             if maximizing:
-                if val > best_val: best_val = val; best_moves = [(fr, fc, tr, tc)]
-                elif val == best_val: best_moves.append((fr, fc, tr, tc))
+                if val > best_val:
+                    best_val = val
+                    best_moves = [(fr, fc, tr, tc)]
+                elif val == best_val:
+                    best_moves.append((fr, fc, tr, tc))
             else:
-                if val < best_val: best_val = val; best_moves = [(fr, fc, tr, tc)]
-                elif val == best_val: best_moves.append((fr, fc, tr, tc))
+                if val < best_val:
+                    best_val = val
+                    best_moves = [(fr, fc, tr, tc)]
+                elif val == best_val:
+                    best_moves.append((fr, fc, tr, tc))
+
         return random.choice(best_moves) if best_moves else random.choice(moves)
 
 
@@ -7659,27 +6917,20 @@ class ShogiEngine:
 
 
 class ShogiAI:
-    """将棋AI v2.0 (v129) — Negamax + Transposition Table + Killer Heuristic + 詳細評価関数"""
+    """将棋AI。4段階難易度。"""
 
     PIECE_VALUE = {
-        "FU":100,"KY":220,"KE":270,"GI":380,"KI":480,
-        "KA":650,"HI":750,"OU":10000,
-        "+FU":320,"+KY":380,"+KE":380,"+GI":480,
-        "+KA":880,"+HI":980,
-    }
-
-    # ★[v129] ポジションボーナス(先手視点, row0=後手陣, row8=先手陣)
-    _POS_BONUS = {
-        "FU": [0,0,0,5,10,15,20,0,0],   # 前進するほど価値が上がる
-        "HI": [0,0,0,0,5,5,5,5,5],
-        "KA": [0,0,0,0,5,5,5,5,5],
+        "FU":100,"KY":200,"KE":250,"GI":350,"KI":450,
+        "KA":600,"HI":700,"OU":10000,
+        "+FU":300,"+KY":350,"+KE":350,"+GI":450,
+        "+KA":800,"+HI":900,
     }
 
     DIFFICULTY_SETTINGS = {
         "easy":      {"depth": 0, "random_rate": 1.0},
-        "middle":    {"depth": 2, "random_rate": 0.20},  # ★[v129] depth 1→2
-        "hard":      {"depth": 3, "random_rate": 0.0},
-        "very_hard": {"depth": 4, "random_rate": 0.0},   # ★[v129] depth 3→4
+        "middle":    {"depth": 1, "random_rate": 0.25},
+        "hard":      {"depth": 2, "random_rate": 0.0},
+        "very_hard": {"depth": 3, "random_rate": 0.0},
     }
 
     def __init__(self, difficulty: str = "middle", color: str = "g"):
@@ -7688,11 +6939,8 @@ class ShogiAI:
         s = self.DIFFICULTY_SETTINGS.get(difficulty, self.DIFFICULTY_SETTINGS["middle"])
         self.depth = s["depth"]
         self.random_rate = s["random_rate"]
-        self._tt: dict = {}        # ★[v129] Transposition Table
-        self._killer: dict = {}    # ★[v129] Killer Heuristic
 
     def evaluate(self, g: "ShogiEngine") -> int:
-        """★[v129] 詳細評価: 駒価値 + 位置ボーナス + 持ち駒ボーナス + 王の安全性"""
         score = 0
         for r in range(9):
             for c in range(9):
@@ -7700,64 +6948,33 @@ class ShogiAI:
                 if not cell: continue
                 color, ptype = cell
                 val = self.PIECE_VALUE.get(ptype, 0)
-                # ★[v129] 位置ボーナス
-                pos_arr = self._POS_BONUS.get(ptype)
-                if pos_arr:
-                    bonus = pos_arr[r] if color == ShogiEngine.SENTE else pos_arr[8 - r]
-                    val += bonus
                 score += val if color == ShogiEngine.SENTE else -val
-        # 持ち駒ボーナス (1.0→0.85: 手駒は多少割引)
         for ptype, cnt in g.hands[ShogiEngine.SENTE].items():
-            score += int(self.PIECE_VALUE.get(ptype, 0) * cnt * 0.85)
+            score += self.PIECE_VALUE.get(ptype, 0) * cnt * 0.8
         for ptype, cnt in g.hands[ShogiEngine.GOTE].items():
-            score -= int(self.PIECE_VALUE.get(ptype, 0) * cnt * 0.85)
-        # ★[v129] 王手ボーナス: 王手をかけている方が有利
-        if g.in_check(ShogiEngine.GOTE):  score += 50
-        if g.in_check(ShogiEngine.SENTE): score -= 50
+            score -= self.PIECE_VALUE.get(ptype, 0) * cnt * 0.8
         return int(score)
 
-    def _move_priority(self, g: "ShogiEngine", mv: tuple, depth: int) -> int:
-        """★[v129] 手のソートキー: Killer > 成り > 駒取り > 通常"""
-        fr, fc, tr, tc, promote, drop = mv
-        killers = self._killer.get(depth, [])
-        if mv in killers: return 0
-        if g.board[tr][tc]: return 1  # 駒取り
-        if promote: return 2
-        if drop: return 3
-        return 4
-
     def _minimax(self, g: "ShogiEngine", depth: int, alpha: int, beta: int, maximizing: bool) -> int:
-        if depth == 0 or g.game_over: return self.evaluate(g)
-
-        # ★[v129] Transposition Table
-        bh = hash((str([[str(c) for c in row] for row in g.board]), g.turn, depth))
-        if bh in self._tt: return self._tt[bh]
-
+        if depth == 0 or g.game_over:
+            return self.evaluate(g)
         color = ShogiEngine.SENTE if maximizing else ShogiEngine.GOTE
         moves = g.legal_moves(color)
-        if not moves: return self.evaluate(g)
-
-        # ★[v129] 手のソート
-        moves.sort(key=lambda mv: self._move_priority(g, mv, depth))
-
-        best = -10**9 if maximizing else 10**9
+        if not moves:
+            return self.evaluate(g)
         if maximizing:
+            best = -10**9
             for mv in moves:
                 fr, fc, tr, tc, promote, drop = mv
                 saved = g._apply_temp(fr, fc, tr, tc, promote, drop)
                 prev = g.turn; g.turn = ShogiEngine.GOTE
                 val = self._minimax(g, depth-1, alpha, beta, False)
                 g.turn = prev; g._undo_temp(saved)
-                if val > best:
-                    best = val
-                    if val >= beta:
-                        # ★[v129] Killer登録
-                        k = self._killer.setdefault(depth, [])
-                        if mv not in k: k.insert(0, mv); k[:] = k[:2]
-                        break
-                alpha = max(alpha, val)
+                best = max(best, val); alpha = max(alpha, val)
                 if beta <= alpha: break
+            return best
         else:
+            best = 10**9
             for mv in moves:
                 fr, fc, tr, tc, promote, drop = mv
                 saved = g._apply_temp(fr, fc, tr, tc, promote, drop)
@@ -7766,10 +6983,7 @@ class ShogiAI:
                 g.turn = prev; g._undo_temp(saved)
                 best = min(best, val); beta = min(beta, val)
                 if beta <= alpha: break
-
-        self._tt[bh] = best
-        if len(self._tt) > 20000: self._tt.clear()
-        return best
+            return best
 
     def choose_move(self, g: "ShogiEngine") -> tuple | None:
         moves = g.legal_moves(self.color)
@@ -7779,9 +6993,6 @@ class ShogiAI:
         maximizing = (self.color == ShogiEngine.SENTE)
         best_val = -10**9 if maximizing else 10**9
         best_moves = []
-        self._tt.clear(); self._killer.clear()  # ★[v129] 新探索でリセット
-        # ★[v129] 手を事前ソート
-        moves.sort(key=lambda mv: self._move_priority(g, mv, 0))
         for mv in moves:
             fr, fc, tr, tc, promote, drop = mv
             saved = g._apply_temp(fr, fc, tr, tc, promote, drop)
@@ -7925,9 +7136,6 @@ _SCP_STATUS_OK= 30
 _SCP_STATUS_WN= 31
 _SCP_DROP_HL  = 32
 _SCP_COMMENT  = 33  # テロップ（ペルソナコメント）
-_SCP_SENTE    = 34  # 先手駒
-_SCP_GOTE     = 35  # 後手駒
-_SCP_PROMOTED = 36  # 成り駒
 
 def _shogi_init_colors():
     curses.start_color()
@@ -7946,9 +7154,6 @@ def _shogi_init_colors():
     curses.init_pair(_SCP_STATUS_WN, curses.COLOR_WHITE,  curses.COLOR_RED)      # 警告
     curses.init_pair(_SCP_DROP_HL,   curses.COLOR_BLACK,  curses.COLOR_YELLOW)   # 持駒選択ハイライト
     curses.init_pair(_SCP_COMMENT,   curses.COLOR_BLACK,  curses.COLOR_MAGENTA)  # ペルソナテロップ
-    curses.init_pair(_SCP_SENTE,     curses.COLOR_WHITE,  curses.COLOR_BLACK)    # 先手駒
-    curses.init_pair(_SCP_GOTE,      curses.COLOR_YELLOW, curses.COLOR_BLACK)    # 後手駒
-    curses.init_pair(_SCP_PROMOTED,  curses.COLOR_RED,    curses.COLOR_BLACK)    # 成り駒
 
 
 def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
@@ -7961,20 +7166,19 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
     stdscr.keypad(True)
     stdscr.timeout(80)
 
-    # ── 端末サイズ自動調整 ──────────────────────────────────────────
+    # ── 端末サイズに合わせてレイアウトを動的調整 ──────────────────
     global _SBY, _SH, _SI_X
     term_h, term_w = stdscr.getmaxyx()
-    if term_h >= 37:
-        _SH = 3
-    elif term_h >= 24:
+    # _SH=3 の場合、必要行数 = 3+2+27+3+2 = 37行
+    # 端末が小さければ _SH=2 (=3+2+18+3+2=28行) に切り替え
+    if term_h < 37:
         _SH = 2
     else:
-        stdscr.clear()
-        msg = f"端末が小さすぎます ({term_w}x{term_h})。24行以上必要です。"
-        try: stdscr.addstr(term_h//2, max(0,(term_w-len(msg))//2), msg)
-        except curses.error: pass
-        stdscr.refresh(); stdscr.getch(); return
-    _SBY = 2
+        _SH = 3
+    # SBYを確保。収まらなければ2に縮小
+    _SBY = 3
+    if _SBY + 9 * _SH + 5 > term_h:
+        _SBY = 2
     _SI_X = _SBX + _SQ * 9 + 2
     # ──────────────────────────────────────────────────────────────
     selected: tuple | None = None      # 選択中マス (r, c) or ("hand", color, ptype)
@@ -8063,11 +7267,9 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                     color, ptype = cell
                     sym = ShogiEngine.PIECE_SYMBOLS[color].get(ptype, "?")
                     is_gote = (color == ShogiEngine.GOTE)
-                    is_promoted = ptype.startswith("+")
-                    if is_gote:
-                        mid_text = f"v{sym}"[:_SQ].ljust(_SQ)
-                    else:
-                        mid_text = f"^{sym}"[:_SQ].ljust(_SQ)
+                    # 後手駒: 上段に駒文字を置いて「逆向き」に見せる
+                    # 先手駒: 下段に駒文字を置く（_SH=2時は中段と同じ）
+                    mid_text = f" {sym} "[:_SQ].ljust(_SQ)  # 駒文字（センタリング）
                     blank    = " " * _SQ
                 else:
                     is_gote  = False
@@ -8088,37 +7290,34 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                 attr     = curses.color_pair(cp)
                 attr_b   = curses.color_pair(cp) | curses.A_BOLD
                 attr_dim = curses.color_pair(cp) | curses.A_DIM
-                if cell and cp in (_SCP_LIGHT, _SCP_DARK):
-                    if is_promoted:
-                        attr_piece = curses.color_pair(_SCP_PROMOTED) | curses.A_BOLD
-                    else:
-                        attr_piece = curses.color_pair(_SCP_GOTE if is_gote else _SCP_SENTE) | curses.A_BOLD
-                else:
-                    attr_piece = attr_b
 
                 try:
                     if _SH >= 3:
                         if cell:
                             if is_gote:
-                                stdscr.addstr(sy,   sx, mid_text, attr_piece)
+                                # 後手: 上段=駒文字(BOLD・暗め)、中段・下段=空白
+                                stdscr.addstr(sy,   sx, mid_text, attr_dim)
                                 stdscr.addstr(sy+1, sx, blank,    attr)
                                 stdscr.addstr(sy+2, sx, blank,    attr)
                             else:
+                                # 先手: 上段=空白、中段=空白、下段=駒文字(BOLD)
                                 stdscr.addstr(sy,   sx, blank,    attr)
                                 stdscr.addstr(sy+1, sx, blank,    attr)
-                                stdscr.addstr(sy+2, sx, mid_text, attr_piece)
+                                stdscr.addstr(sy+2, sx, mid_text, attr_b)
                         else:
+                            # 空マス: 中段にドット
                             stdscr.addstr(sy,   sx, blank,    attr)
                             stdscr.addstr(sy+1, sx, mid_text, attr)
                             stdscr.addstr(sy+2, sx, blank,    attr)
                     else:
+                        # _SH=2: 後手=上段、先手=下段
                         if cell:
                             if is_gote:
-                                stdscr.addstr(sy,   sx, mid_text, attr_piece)
+                                stdscr.addstr(sy,   sx, mid_text, attr_dim)
                                 stdscr.addstr(sy+1, sx, blank,    attr)
                             else:
                                 stdscr.addstr(sy,   sx, blank,    attr)
-                                stdscr.addstr(sy+1, sx, mid_text, attr_piece)
+                                stdscr.addstr(sy+1, sx, mid_text, attr_b)
                         else:
                             stdscr.addstr(sy,   sx, mid_text, attr)
                             stdscr.addstr(sy+1, sx, blank,    attr)
@@ -8339,16 +7538,12 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
         else:
             status_msg = f"✖ {msg}"
             status_warn = True
-        _needs_redraw = True
         return ok
 
     # ── メインループ ───────────────────────────────────────────
     import random as _rnd_game
     _ai_thread: threading.Thread | None = None   # AI思考スレッド
     _ai_result: list = []                        # [mv] or [] — スレッド間共有
-    _needs_redraw: bool = True                   # 再描画フラグ
-    _ai_thinking: bool = False                   # AI思考中フラグ（重複起動防止）
-    _last_ai_redraw: float = 0.0                 # AI思考中の最終再描画時刻
 
     def _ai_think_bg():
         """バックグラウンドでAIの手を計算。結果を_ai_resultに格納。"""
@@ -8370,8 +7565,6 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                     mv = _ai_result[0]
                     _ai_result.clear()
                     _ai_thread = None
-                    _ai_thinking = False
-                    _needs_redraw = True
                     snap = _snapshot()
                     fr, fc, tr, tc, promote, drop = mv
                     ok, msg = g.move(fr, fc, tr, tc, promote, drop)
@@ -8392,28 +7585,18 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                             elif _rnd_game.random() < 0.5:
                                 commentator.trigger("AIの指し手", f"AI: {msg} (手数:{len(g.move_history)})")
                 else:
-                    # 思考スレッドを起動（まだ起動していない場合のみ）
-                    if not _ai_thinking:
-                        _ai_result.clear()
-                        status_msg = f"AI [{_diff_labels.get(ai.difficulty,'')}] 思考中..."
-                        status_warn = False
-                        _ai_thinking = True
-                        _needs_redraw = True
-                        _ai_thread = threading.Thread(target=_ai_think_bg, daemon=True)
-                        _ai_thread.start()
-            # AI思考中は500ms間隔で最小限の再描画（ちらつき防止）
-            now = time.time()
-            if _needs_redraw or (now - _last_ai_redraw >= 0.5):
-                _redraw()
-                _needs_redraw = False
-                _last_ai_redraw = now
+                    # 思考スレッドを起動
+                    _ai_result.clear()
+                    status_msg = f"AI [{_diff_labels.get(ai.difficulty,'')}] 思考中..."
+                    status_warn = False
+                    _ai_thread = threading.Thread(target=_ai_think_bg, daemon=True)
+                    _ai_thread.start()
+            _redraw()
             stdscr.timeout(80)
-            stdscr.getch()
+            stdscr.getch()   # イベントを消化してCPUを解放（フリーズ防止）
             continue
 
-        if _needs_redraw:
-            _redraw()
-            _needs_redraw = False
+        _redraw()
         key = stdscr.getch()
 
         if key == curses.KEY_MOUSE:
@@ -8434,7 +7617,6 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                 selected = None; legal_moves_cache = []
                 ai_str = f"[AI:{_diff_labels.get(ai.difficulty,'')}] " if ai else ""
                 status_msg = f"新しい対局を開始しました {ai_str}"; status_warn = False
-                _needs_redraw = True
                 continue
             if action == "undo":
                 # AIモードの場合は2手戻す
@@ -8444,7 +7626,6 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                         _restore(undo_stack.pop())
                 selected = None; legal_moves_cache = []
                 status_msg = "待った！1手戻しました"; status_warn = False
-                _needs_redraw = True
                 continue
 
             if g.game_over:
@@ -8464,7 +7645,6 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                     _refresh_legal(selected)
                     status_msg = f"打ち駒: {ShogiEngine.PIECE_NAMES_JA.get(pt,'?')} — 打つ場所をクリック"
                     status_warn = False
-                _needs_redraw = True
                 continue
 
             # 盤面クリック
@@ -8488,7 +7668,6 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                     status_msg = f"{'先手' if g.turn==ShogiEngine.SENTE else '後手'}の番です"; status_warn = True
                 else:
                     status_msg = "その位置に駒がありません"; status_warn = True
-                _needs_redraw = True
 
             else:
                 # 移動先クリック
@@ -8544,7 +7723,6 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                             elif pk in (ord('q'), 27):
                                 selected = None; legal_moves_cache = []
                                 status_msg = "キャンセル"; status_warn = False; break
-                _needs_redraw = True
 
         elif key in (ord('q'), ord('Q'), 27):
             return "将棋終了"
@@ -8552,13 +7730,11 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
             g.reset(); undo_stack.clear()
             selected = None; legal_moves_cache = []
             status_msg = "新しい対局"; status_warn = False
-            _needs_redraw = True
         elif key in (ord('u'), ord('U')):
             if undo_stack:
                 _restore(undo_stack.pop())
                 selected = None; legal_moves_cache = []
                 status_msg = "待った！"; status_warn = False
-                _needs_redraw = True
             else:
                 status_msg = "戻せる手がありません"; status_warn = True
 
@@ -8619,42 +7795,25 @@ def handle_mahjong(arg: str) -> str:
     # ── HTML生成 ──────────────────────────────────────────────
     html_content = _build_mahjong_html(num_players, mode)
 
-    # ── ファイル確保（WSL対応: Windowsからアクセス可能な場所に保存）──
-    def _get_win_temp_dir() -> str | None:
-        """WSL環境でWindowsのTEMPディレクトリを返す。非WSLならNone。"""
-        try:
-            import subprocess as _sp3
-            win_temp = _sp3.check_output(
-                ["cmd.exe", "/c", "echo", "%TEMP%"],
-                stderr=_sp3.DEVNULL).decode().strip()
-            if win_temp:
-                linux_temp = _sp3.check_output(
-                    ["wslpath", "-u", win_temp],
-                    stderr=_sp3.DEVNULL).decode().strip()
-                if os.path.isdir(linux_temp):
-                    return linux_temp
-        except Exception:
-            pass
-        # フォールバック: /mnt/c/Windows/Temp
-        for d in ["/mnt/c/Windows/Temp", "/mnt/c/Users/Public"]:
-            if os.path.isdir(d):
-                return d
-        return None
-
-    win_temp = _get_win_temp_dir()
-    save_dir = win_temp if win_temp else tempfile.gettempdir()
-
+    # ── ファイル確保（同じパスを使い回してタブ増殖を防ぐ）──
+    # 注意: パスが存在してもHTMLは必ず上書きする（モード/人数変更に対応）
     if _MAHJONG_HTML_PATH and pathlib.Path(_MAHJONG_HTML_PATH).exists():
         html_path = _MAHJONG_HTML_PATH
     else:
-        import uuid
-        html_path = os.path.join(save_dir, f"s01_mahjong_{uuid.uuid4().hex[:8]}.html")
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".html", delete=False,
+            encoding="utf-8", prefix="s01_mahjong_"
+        )
+        html_path = tmp.name
         _MAHJONG_HTML_PATH = html_path
+        tmp.close()
 
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_content)
 
-    # ── file_uri はLinuxパスのまま保持し、ブラウザ起動時にWin変換 ──
+    # ── ブラウザ起動 ──────────────────────────────────────────
+    # Brave を優先して起動する（EdgeはローカルHTMLをブロックする場合があるため）。
+    # Brave が見つからなければ Chrome → Firefox → webbrowser.open() の順でフォールバック。
     file_uri = pathlib.Path(html_path).as_uri()
     label = f"{num_players}人麻雀({'東南戦' if mode == 'tonpu' else '東風戦'})"
 
@@ -8700,30 +7859,24 @@ def handle_mahjong(arg: str) -> str:
                 except Exception:
                     continue
 
-        # ── Linux / WSL ───────────────────────────────────────
+        # ── Linux ─────────────────────────────────────────────
         else:
-            try:
-                import subprocess as _sp
-                # Linuxパス → Windowsパスに変換してcmd.exeで開く
-                linux_path = uri.replace("file://", "").replace("%20", " ")
-                _win_path = _sp.check_output(
-                    ["wslpath", "-w", linux_path],
-                    stderr=_sp.DEVNULL).decode().strip()
-                S.Popen(["cmd.exe", "/c", "start", "", _win_path],
-                        stdout=S.DEVNULL, stderr=S.DEVNULL)
-                return True, "ブラウザ"
-            except Exception:
-                pass
             linux_bins = [
-                ("brave-browser", "Brave"), ("brave", "Brave"),
-                ("google-chrome", "Chrome"), ("firefox", "Firefox"),
+                ("brave-browser", "Brave"),
+                ("brave", "Brave"),
+                ("google-chrome", "Chrome"),
+                ("google-chrome-stable", "Chrome"),
+                ("chromium-browser", "Chromium"),
+                ("chromium", "Chromium"),
+                ("firefox", "Firefox"),
             ]
             for bin_name, display_name in linux_bins:
                 if shutil.which(bin_name):
                     try:
-                        S.Popen([bin_name, uri], stdout=S.DEVNULL, stderr=S.DEVNULL)
+                        S.Popen([bin_name, uri])
                         return True, display_name
-                    except Exception: continue
+                    except Exception:
+                        continue
 
         # ── 最終フォールバック: webbrowser モジュール ──────────
         try:
@@ -8806,8 +7959,6 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 .tile{background:var(--tile);color:#1a1a00;border-radius:4px;border:1px solid var(--tile-h);display:inline-flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;cursor:pointer;box-shadow:1px 2px 3px rgba(0,0,0,.4),inset 0 -1px 0 rgba(0,0,0,.2);transition:all .1s;position:relative;flex-shrink:0}
 .tile:hover{filter:brightness(1.1);transform:translateY(-2px)}
 .tile.selected{transform:translateY(-8px);box-shadow:0 6px 12px rgba(255,215,0,.4),1px 2px 3px rgba(0,0,0,.4);border-color:var(--gold)}
-.tile.riichi-cand{transform:translateY(-6px);box-shadow:0 0 12px rgba(255,80,80,.8);border-color:#ff4444;animation:riichi-pulse .8s infinite alternate}
-@keyframes riichi-pulse{from{box-shadow:0 0 8px rgba(255,80,80,.6)}to{box-shadow:0 0 18px rgba(255,80,80,1)}}
 .tile.man{color:#c62828}.tile.pin{color:#1565c0}.tile.sou{color:#2e7d32}.tile.honor{color:#4a148c}
 .tile.discarded{width:20px;height:28px;font-size:9px;cursor:default}
 .tile.discarded:hover{transform:none;filter:none}
@@ -8911,8 +8062,6 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
     </div>
     <div class="player-area" id="seat-0">
       <div class="melds-area" id="melds-0"></div>
-      <div style="font-size:9px;color:rgba(255,255,255,.4);text-align:center">あなたの河</div>
-      <div class="pond" id="pond-0" style="max-width:320px;max-height:80px;margin-bottom:4px"></div>
       <div class="player-hand" id="hand-0"></div>
       <div class="player-info-row">
         <div class="player-info">
@@ -8986,27 +8135,9 @@ function initGame(np,mode){
      pendingClaims:[],maxRound:mode==='tonpu'?8:4,
      gameOver:false,waitingForPlayer:false,
      selectedTile:null,riichiCandidates:[],_pendingNextRound:null};
-  const _philosopherPool=[
-    'ソクラテス','プラトン','アリストテレス','エピクロス','ピュロン',
-    'アウグスティヌス','トマス・アクィナス','オッカム',
-    'マキャベリ','モンテーニュ','エラスムス',
-    'デカルト','スピノザ','ライプニッツ','パスカル','ベーコン',
-    'ロック','ヒューム','バークリー','ルソー','ヴォルテール',
-    'カント','フィヒテ','シェリング','ヘーゲル',
-    'ショーペンハウアー','フォイエルバッハ','マルクス','エンゲルス',
-    'ミル','ベンサム','スペンサー','ニーチェ','キルケゴール',
-    'フレーゲ','ラッセル','ムーア','ウィトゲンシュタイン',
-    'フッサール','ハイデガー','サルトル','メルロ＝ポンティ','ボーヴォワール',
-    'デューイ','ジェームズ','パース',
-    'カルナップ','ポパー','クワイン','クーン',
-    'レヴィナス','デリダ','フーコー','ドゥルーズ','バタイユ',
-    'ロールズ','ノージック','サンデル','ハーバーマス',
-    'アーレント','ベンヤミン','アドルノ','ホルクハイマー',
-  ];
-  const _shuffled=[..._philosopherPool].sort(()=>Math.random()-.5);
-  const names=['あなた',_shuffled[0],_shuffled[1],_shuffled[2]];
+  const names=['あなた','AI-A','AI-B','AI-C'];
   for(let i=0;i<np;i++)
-    G.players.push({name:names[i],isHuman:i===0,score:np===3?35000:25000,
+    G.players.push({name:names[i],isHuman:i===0,score:25000,
       hand:[],drawn:null,pond:[],melds:[],riichi:false,riichiTurn:-1,wind:WIND_CHARS[i]});
   startRound();
 }
@@ -9117,42 +8248,16 @@ function tenpaiTiles(hand,melds){
 function isTenpai(hand,melds){return tenpaiTiles(hand,melds).length>0}
 
 // ── 役判定 ──
-function isSuuanko(decomp,isTsumo){if(!decomp.melds)return false;return decomp.melds.every(m=>m.type==='pon'||m.type==='kan')&&isTsumo;}
-function isDaisangen(allM){const drg=['白','発','中'];return drg.every(d=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===d));}
-function isTsuiso(hAll){return hAll.every(t=>t.suit==='honor');}
-function isChinroto(hAll){return hAll.every(t=>t.suit!=='honor'&&(t.num===1||t.num===9));}
-function isShousuushi(allM,pair){const winds=['東','南','西','北'];const ponWinds=allM.filter(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&winds.includes(m.tiles[0].num));const pairIsWind=pair&&pair[0]&&pair[0].suit==='honor'&&winds.includes(pair[0].num);return ponWinds.length===3&&pairIsWind;}
-function isDaisuushi(allM){const winds=['東','南','西','北'];return winds.every(w=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===w));}
-function isRyuiso(hAll){const green=['2','3','4','6','8'].map(Number);return hAll.every(t=>(t.suit==='bamboo'&&green.includes(t.num))||(t.suit==='honor'&&t.num==='発'));}
-function isChurenpoton(hAll){const suits=hAll.map(t=>t.suit);if(!suits.every(s=>s===suits[0])||suits[0]==='honor')return false;const nums=hAll.map(t=>t.num).sort((a,b)=>a-b);const base=[1,1,1,2,3,4,5,6,7,8,9,9,9];if(nums.length!==14)return false;return base.some((_,i)=>{const b=[...base];b.splice(i,1);return JSON.stringify(b)===JSON.stringify(nums.slice(0,13));});}
-function isSuukantsu(allM){return allM.filter(m=>m.type==='kan').length===4;}
-function isSananko(decomp,isTsumo,lastDiscard){if(!decomp.melds)return false;const pons=decomp.melds.filter(m=>m.type==='pon');if(isTsumo)return pons.length>=3;return pons.filter(m=>!m.tiles.some(t=>lastDiscard&&t.uid===lastDiscard.uid)).length>=3;}
-function isSankantsu(allM){return allM.filter(m=>m.type==='kan').length>=3;}
-function isShouSangen(allM,pair){const drg=['白','発','中'];const ponCount=drg.filter(d=>allM.some(m=>(m.type==='pon'||m.type==='kan')&&m.tiles[0].suit==='honor'&&m.tiles[0].num===d)).length;const pairIsDrg=pair&&pair[0]&&pair[0].suit==='honor'&&drg.includes(pair[0].num);return ponCount===2&&pairIsDrg;}
-function isHonroto(hAll){return hAll.every(t=>t.suit==='honor'||(t.num===1||t.num===9));}
-function isRyanpeikou(decomp,isMenzen){if(!isMenzen||!decomp.melds||decomp.melds.length<4)return false;const chis=decomp.melds.filter(m=>m.type==='chi');if(chis.length<4)return false;const keys=chis.map(m=>m.tiles.map(t=>t.suit+t.num).sort().join(','));const counts={};for(const k of keys)counts[k]=(counts[k]||0)+1;return Object.values(counts).filter(v=>v>=2).length>=2;}
-
 function getYaku(decomp,player,gameState,isTsumo){
   const yaku=[];const{melds,riichi}=player;const isMenzen=melds.length===0;
   const{type}=decomp;
-  const hAll=[...player.hand,...(player.drawn?[player.drawn]:[]),...melds.flatMap(m=>m.tiles)];
-  const allM=[...melds,...(decomp.melds||[])];
-  const yakuman=[];
-  if(type==='kokushi') yakuman.push({name:'国士無双',han:13,yakuman:true});
-  if(isSuuanko(decomp,isTsumo)) yakuman.push({name:'四暗刻',han:13,yakuman:true});
-  if(isDaisangen(allM)) yakuman.push({name:'大三元',han:13,yakuman:true});
-  if(isTsuiso(hAll)) yakuman.push({name:'字一色',han:13,yakuman:true});
-  if(isChinroto(hAll)) yakuman.push({name:'清老頭',han:13,yakuman:true});
-  if(isShousuushi(allM,decomp.pair)) yakuman.push({name:'小四喜',han:13,yakuman:true});
-  if(isDaisuushi(allM)) yakuman.push({name:'大四喜',han:26,yakuman:true});
-  if(isRyuiso(hAll)) yakuman.push({name:'緑一色',han:13,yakuman:true});
-  if(isChurenpoton(hAll)) yakuman.push({name:'九蓮宝燈',han:13,yakuman:true});
-  if(isSuukantsu(allM)) yakuman.push({name:'四槓子',han:13,yakuman:true});
-  if(yakuman.length>0) return yakuman;
   if(type==='chiitoitsu'){yaku.push({name:'七対子',han:2});}
+  else if(type==='kokushi'){yaku.push({name:'国士無双',han:13,yakuman:true});}
   else{
+    const allM=[...melds,...(decomp.melds||[])];
     if(isTsumo&&isMenzen)yaku.push({name:'門前清自摸和',han:1});
     if(riichi)yaku.push({name:'立直',han:1});
+    const hAll=[...player.hand,...(player.drawn?[player.drawn]:[]),...melds.flatMap(m=>m.tiles)];
     if(isTanyao(hAll))yaku.push({name:'断么九',han:1});
     if(isMenzen&&!isTsumo&&isPinfu(decomp,player,gameState))yaku.push({name:'平和',han:1});
     if(isMenzen&&isIipeiko(decomp.melds))yaku.push({name:'一盃口',han:1});
@@ -9170,14 +8275,6 @@ function getYaku(decomp,player,gameState,isTsumo){
     const uc=countDora([...player.hand,...(player.drawn?[player.drawn]:[])],player.melds,gameState.uraDoraIndicators);
     if(uc>0)yaku.push({name:`裏ドラ${uc}`,han:uc,isBonus:true});
   }
-  if(gameState.numPlayers===3&&player.kitaCount>0){
-    for(let k=0;k<player.kitaCount;k++) yaku.push({name:'北抜き',han:1});
-  }
-  if(isSananko(decomp,isTsumo,gameState.lastDiscard))yaku.push({name:'三暗刻',han:2});
-  if(isSankantsu(allM))yaku.push({name:'三槓子',han:2});
-  if(isShouSangen(allM,decomp.pair))yaku.push({name:'小三元',han:2});
-  if(isHonroto(hAll))yaku.push({name:'混老頭',han:2});
-  if(isRyanpeikou(decomp,isMenzen))yaku.push({name:'二盃口',han:3});
   return yaku;
 }
 function isTanyao(tiles){return tiles.every(t=>t.suit!=='honor'&&t.num>=2&&t.num<=8)}
@@ -9264,10 +8361,9 @@ function calcBasicPoints(han,fu){
   if(han>=6)return 3000;if(han===5||(han===4&&fu>=30)||(han===3&&fu>=70))return 2000;
   return Math.min(fu*Math.pow(2,han+2),2000);
 }
-function calcScore(yaku,decomp,isTsumo,isDealer,winnerMelds){
+function calcScore(yaku,decomp,isTsumo,isDealer){
   const han=yaku.reduce((s,y)=>s+y.han,0);
-  const isMenzen=!winnerMelds||winnerMelds.length===0;
-  const fu=calcFu(decomp,isTsumo,isMenzen);
+  const fu=calcFu(decomp,isTsumo,true);
   const basic=calcBasicPoints(han,fu);
   if(isTsumo)return{han,fu,basic,dealer:Math.ceil(basic*2/100)*100,nonDealer:Math.ceil(basic/100)*100,isTsumo:true};
   return{han,fu,basic,ron:Math.ceil(basic*(isDealer?6:4)/100)*100,isTsumo:false};
@@ -9303,22 +8399,8 @@ function canTsumo(player){
 }
 
 // ── ゲームフロー ──
-let _lastProgress=Date.now();
-function _touchProgress(){_lastProgress=Date.now();}
-setInterval(()=>{
-  if(G.gameOver||!G.phase||G.phase==='idle')return;
-  if(G.waitingForPlayer)return;
-  if(Date.now()-_lastProgress>5000){
-    console.warn('フリーズ検知: 強制進行');
-    G.waitingForPlayer=false;G.pendingClaims=[];
-    advanceTurn(G.activePlayer||0);
-    _touchProgress();
-  }
-},2000);
-
 function nextTurn(){
   if(G.gameOver)return;
-  _touchProgress();
   const p=G.players[G.activePlayer];
   if(!G.walls.length){handleRyukyoku();return;}
   const tile=drawTile(G.activePlayer);if(!tile){handleRyukyoku();return;}
@@ -9363,18 +8445,9 @@ function evaluateHand(hand,melds){
   }
   return score;
 }
-function chooseAIDiscard(pi,forRiichi){
+function chooseAIDiscard(pi){
   const p=G.players[pi];const all=[...p.hand,...(p.drawn?[p.drawn]:[])];
   if(!all.length)return null;
-  if(forRiichi){
-    // リーチ用: テンパイを維持できる捨て牌のみ候補にする
-    const riichiCands=all.filter(t=>{const test=all.filter(x=>x.uid!==t.uid);return tenpaiTiles(test,p.melds).length>0;});
-    if(riichiCands.length){
-      let best=null,bs=-Infinity;
-      for(const t of riichiCands){const test=all.filter(x=>x.uid!==t.uid);const sc=evaluateHand(test,p.melds);if(sc>bs){bs=sc;best=t;}}
-      return best;
-    }
-  }
   let best=null,bs=-Infinity;
   for(const t of all){
     const test=all.filter(x=>x.uid!==t.uid);const sc=evaluateHand(test,p.melds);
@@ -9425,7 +8498,7 @@ function checkClaims(tile,dpi){
       if(p.isHuman)claims.push({type:'pon',player:i,priority:2});
       else if(Math.random()<0.4)claims.push({type:'pon',player:i,priority:2});
     }
-    if(!p.riichi&&G.numPlayers===4){
+    if(!p.riichi){
       const co=canChi(p.hand,tile,i,dpi);
       if(co.length){
         if(p.isHuman)claims.push({type:'chi',player:i,priority:1,options:co});
@@ -9479,7 +8552,7 @@ function declareWin(wi,li,isTsumo){
   const decomp=decomps[0]||{type:'normal',pair:[],melds:[],tiles:allH};
   const yaku=getYaku(decomp,winner,G,isTsumo);
   const isDealer=wi===G.dealer;
-  const si=calcScore(yaku,decomp,isTsumo,isDealer,winner.melds);
+  const si=calcScore(yaku,decomp,isTsumo,isDealer);
   const deltas=Array(G.numPlayers).fill(0);
   if(isTsumo){
     for(let i=0;i<G.numPlayers;i++){
@@ -9622,20 +8695,6 @@ function renderPond(pi){
   const p=G.players[pi];const el=document.getElementById(`pond-${pi}`);if(!el)return;
   el.innerHTML=p.pond.map(t=>`<div class="tile discarded ${t.suit}">${tileStr(t)}</div>`).join('');
 }
-function doKita(){
-  const p=G.players[0];
-  const kitaIdx=p.hand.findIndex(t=>t.suit==='honor'&&t.num==='北');
-  if(kitaIdx<0)return;
-  const kita=p.hand.splice(kitaIdx,1)[0];
-  if(!p.kitaCount)p.kitaCount=0;
-  p.kitaCount++;
-  if(!G.kitaDora)G.kitaDora=[];
-  G.kitaDora.push(kita);
-  log(`あなたが北を抜いた（${p.kitaCount}枚目）`);
-  const drawn=drawTile(0);
-  if(drawn){p.hand.push(drawn);}
-  renderAll();renderControls();
-}
 function renderMelds(pi){
   const p=G.players[pi];const el=document.getElementById(`melds-${pi}`);if(!el)return;
   const sz=pi===0?'medium':'small';
@@ -9644,10 +8703,6 @@ function renderMelds(pi){
 function renderControls(){
   const el=document.getElementById('controls');if(!el)return;
   const p=G.players[0];let html='';showWaiting(false);
-  if(G.numPlayers===3&&G.phase==='discard'&&G.activePlayer===0&&G.waitingForPlayer){
-    const _ki=G.players[0].hand.findIndex(t=>t.suit==='honor'&&t.num==='北');
-    if(_ki>=0) html+=`<button class="action-btn" style="background:#1a6b1a" onclick="doKita()">北抜き</button>`;
-  }
   if(G.phase==='discard'&&G.activePlayer===0&&G.waitingForPlayer){
     if(canTsumo(p))html+=`<button class="action-btn btn-tsumo" onclick="humanTsumo()">ツモ</button>`;
     if(!p.riichi&&!p.melds.length&&p.score>=1000){
@@ -9736,514 +8791,7 @@ __AUTO_START__
     )
 
 
-# ===== v129.0 新コマンドハンドラ =====
-
-def handle_think_mode(arg: str) -> str:
-    """★[v129] /think: chain-of-thought思考モード切替"""
-    global THINKING_MODE
-    a = arg.strip().lower()
-    if a == "on":
-        THINKING_MODE = True
-        return (f"{C['g']}[思考モード ON]{C['w']} chain-of-thought強制。\n"
-                f"  AIは<think>タグ内で段階的思考を行い、最終回答のみ表示します。\n"
-                f"  複雑な推論・数学・コーディングで特に有効。/think off で解除。")
-    elif a == "off":
-        THINKING_MODE = False
-        return f"{C['y']}[思考モード OFF]{C['w']} 通常モードに戻しました。"
-    else:
-        status = f"{C['g']}ON{C['w']}" if THINKING_MODE else f"{C['dim']}OFF{C['w']}"
-        return (f"思考モード: {status}\n"
-                f"  /think on  → chain-of-thought強制\n"
-                f"  /think off → 通常モード")
-
-def handle_plan(arg: str, per_id: int) -> str:
-    """★[v129] /plan: OODAループ式段階的計画生成"""
-    if not arg: return f"{C['r']}usage: /plan <目標>{C['w']}"
-    persona = get_persona(per_id)
-    fp = persona.get("first_person", "私")
-    sys_content = (
-        f"あなたは{persona['name']}。口調: {persona['style']}。一人称: {fp}。\n"
-        "以下の目標を達成するための具体的な計画を立案せよ。\n"
-        "【出力形式】\n"
-        "1. 観察(Observe): 現状分析・制約・リソース\n"
-        "2. 方針決定(Orient): アプローチの選択肢と判断根拠\n"
-        "3. 決定(Decide): 最適戦略の選択\n"
-        "4. 実行(Act): 具体的なステップ（5〜7項目）\n"
-        "5. 検証指標: 成功の定義・KPI\n"
-        "捏造禁止。現実的かつ実行可能な内容のみ。"
-    )
-    print(f"{C['c']}[PLAN]{C['w']} {persona['name']}: ", end="", flush=True)
-    return stream_response(
-        [{"role": "system", "content": sys_content},
-         {"role": "user", "content": f"目標: {arg}"}],
-        True, len(arg), temp_override=0.35, model=DEEP_MODEL, max_tokens=2048
-    ) or ""
-
-def handle_code(arg: str, per_id: int) -> str:
-    """★[v130.1] /code: 世界最強コードエンジン
-    入力の意図を自動判定し、4つのモードを切り替える:
-      [generate]  コード生成（3パス: 設計分析 → 実装 → セルフレビュー）
-      [ideate]    発展案・アイデア出し・可能性探索
-      [architect] 設計相談・アーキテクチャ議論
-      [review]    既存コードのレビュー・改善提案
-    """
-    if not arg:
-        return (
-            f"{C['r']}usage: /code <入力>{C['w']}\n"
-            f"{C['dim']}例:\n"
-            f"  /code ユーザー認証APIを作って\n"
-            f"  /code このプロジェクトの発展案を教えて\n"
-            f"  /code 以下のコードをレビューして: ...\n"
-            f"  /code マイクロサービスとモノリスどちらが良い?{C['w']}"
-        )
-
-    # ── 意図判定 (Pass-0) ──────────────────────────────────────────
-    intent_sys = (
-        "ユーザーの入力を分析し、以下の4つのカテゴリのうち最も適切な1つを"
-        "英単語のみで出力せよ。説明・句読点は一切不要。\n\n"
-        "generate  : 新しいコード・関数・クラス・スクリプトの生成依頼\n"
-        "ideate    : アイデア出し・発展案・可能性・改善提案・brainstorm\n"
-        "architect : 設計相談・アーキテクチャ選択・技術選定・構成議論\n"
-        "review    : 既存コードのレビュー・バグ発見・リファクタリング依頼\n\n"
-        "出力は generate / ideate / architect / review のいずれか1語のみ。"
-    )
-    intent_raw = stream_response(
-        [{"role": "system", "content": intent_sys},
-         {"role": "user", "content": arg}],
-        False, len(arg), temp_override=0.0, model=DEEP_MODEL,
-        max_tokens=10, silent=True
-    ) or "generate"
-    intent = intent_raw.strip().lower().split()[0]
-    if intent not in ("generate", "ideate", "architect", "review"):
-        intent = "generate"
-
-    label_map = {
-        "generate":  f"{C['c']}[CODE: 生成モード]{C['w']}",
-        "ideate":    f"{C['m']}[CODE: アイデアモード]{C['w']}",
-        "architect": f"{C['y']}[CODE: 設計モード]{C['w']}",
-        "review":    f"{C['r']}[CODE: レビューモード]{C['w']}",
-    }
-    print(label_map[intent])
-
-    # ════════════════════════════════════════════════════════════════
-    # モード: generate（3パス コード生成）
-    # ════════════════════════════════════════════════════════════════
-    if intent == "generate":
-        # Pass-1: 設計分析
-        design_sys = (
-            "あなたはGoogleのPrincipal Engineer・元MITアルゴリズム研究者・セキュリティ専門家を"
-            "兼ねる世界最高峰のソフトウェアアーキテクト。\n"
-            "与えられた仕様を受け取り、実装前に以下を日本語で簡潔に分析せよ（コードはまだ書くな）:\n\n"
-            "【設計分析フォーマット】\n"
-            "1. 問題の本質と制約（エッジケース・スケール・並行性）\n"
-            "2. 最適データ構造・アルゴリズム選択と計算量(O表記)\n"
-            "3. アーキテクチャパターン（責務分離・依存関係）\n"
-            "4. セキュリティリスクと対策（入力検証・注入・リソース枯渇）\n"
-            "5. テスト戦略（正常系・異常系・境界値・モック対象）\n"
-            "6. パフォーマンスボトルネックと最適化方針\n\n"
-            "分析は箇条書きで簡潔に。実装コードは絶対に書くな。"
-        )
-        print(f"  Pass-1 設計分析中... ", end="", flush=True)
-        design_analysis = stream_response(
-            [{"role": "system", "content": design_sys},
-             {"role": "user", "content": f"仕様: {arg}"}],
-            True, len(arg), temp_override=0.0, model=DEEP_MODEL,
-            max_tokens=1024, silent=True
-        ) or ""
-        print(f"{C['g']}完了{C['w']}")
-
-        # Pass-2: 実装
-        impl_sys = (
-            "あなたはGoogleのPrincipal Engineer・元MITアルゴリズム研究者・セキュリティ専門家を"
-            "兼ねる世界最高峰のソフトウェアアーキテクト。\n"
-            "以下の設計分析に基づき、プロダクション品質の完全なPythonコードを生成せよ。\n\n"
-            "【絶対必須要件】\n"
-            "1. 型ヒント: 全関数・メソッド・変数に付ける（Python 3.10+ union構文 X|Y 推奨）\n"
-            "2. Docstring: Google形式。Args/Returns/Raises/Example を全関数に記載\n"
-            "3. エラーハンドリング: 具体的な例外クラス・適切なログ・リカバリ戦略\n"
-            "4. セキュリティ: 入力検証・サニタイズ・リソース制限・インジェクション対策\n"
-            "5. テスト: pytest形式で正常系2件・異常系2件・境界値1件以上（モック使用可）\n"
-            "6. パフォーマンス: 計算量コメント・不要なコピー回避・ジェネレータ活用\n"
-            "7. 可読性: 関数は単一責任・20行以内を目安・定数は大文字定義\n"
-            "8. 冪等性・スレッド安全性が必要な場合はロック・アトミック操作を明示\n\n"
-            "【出力フォーマット】\n"
-            "```python\n# 実装コード\n```\n\n```python\n# テストコード（pytest形式）\n```\n\n"
-            "コードブロック外の説明文は最小限にせよ。"
-            f"\n\n【設計分析】\n{design_analysis}"
-        )
-        print(f"  Pass-2 実装生成中... ", end="", flush=True)
-        implementation = stream_response(
-            [{"role": "system", "content": impl_sys},
-             {"role": "user", "content": f"仕様: {arg}"}],
-            True, len(arg), temp_override=0.0, model=DEEP_MODEL, max_tokens=4096
-        ) or ""
-        print()
-
-        # Pass-3: セルフレビュー
-        review_sys = (
-            "あなたはセキュリティ・パフォーマンス専門のシニアコードレビュアー。\n"
-            "以下のコードを厳格にレビューし、問題点のみ箇条書きで報告せよ。\n"
-            "問題がなければ「✅ レビュー通過」とだけ出力せよ。\n\n"
-            "チェック項目:\n"
-            "- バグ・ロジックエラー（off-by-one・型不一致・None参照）\n"
-            "- セキュリティホール（インジェクション・パストラバーサル・競合状態）\n"
-            "- 例外の握りつぶし（bare except / pass）\n"
-            "- テストの抜け漏れ（未テストのエッジケース）\n"
-            "- パフォーマンス問題（O(n²)以上のループ・不要なDB呼び出し）\n"
-            "- 型ヒント・docstringの欠落\n"
-            "問題点は '⚠ [重大度: 高/中/低] 説明' の形式で列挙。"
-        )
-        print(f"  Pass-3 セルフレビュー中... ", end="", flush=True)
-        review = stream_response(
-            [{"role": "system", "content": review_sys},
-             {"role": "user", "content": implementation}],
-            True, len(implementation), temp_override=0.0, model=DEEP_MODEL,
-            max_tokens=512, silent=True
-        ) or ""
-        print(f"{C['g']}完了{C['w']}\n")
-
-        lines = [
-            f"{C['dim']}{'─'*60}{C['w']}",
-            f"{C['y']}【設計分析】{C['w']}", design_analysis,
-            f"{C['dim']}{'─'*60}{C['w']}",
-            f"{C['g']}【実装】{C['w']}", implementation,
-            f"{C['dim']}{'─'*60}{C['w']}",
-        ]
-        if "✅" in review or not review.strip():
-            lines.append(f"{C['g']}【レビュー】✅ 問題なし{C['w']}")
-        else:
-            lines += [f"{C['y']}【レビュー指摘】{C['w']}", review]
-        lines += [
-            f"{C['dim']}{'─'*60}{C['w']}",
-            f"{C['dim']}  ヒント: /m add でメモ保存 | /convert md html でHTML変換{C['w']}",
-        ]
-        return "\n".join(lines)
-
-    # ════════════════════════════════════════════════════════════════
-    # モード: ideate（発展案・アイデア出し）
-    # ════════════════════════════════════════════════════════════════
-    elif intent == "ideate":
-        ideate_sys = (
-            "あなたはYCombinatorのトップメンター・元Google X / DeepMind研究者・"
-            "連続起業家を兼ねる世界最高のテクノロジーストラテジスト。\n"
-            "与えられたプロジェクト・テーマ・課題について、"
-            "実現可能性と革新性を両立した発展案・アイデアを提示せよ。\n\n"
-            "【出力フォーマット】\n"
-            "## 🔍 現状分析\n"
-            "（強み・弱み・機会・脅威を2〜3行で）\n\n"
-            "## 🚀 発展案（優先度順）\n"
-            "各案について:\n"
-            "- **案名**: 一行で本質を表すタイトル\n"
-            "- **概要**: 何をするか（2〜3行）\n"
-            "- **技術スタック**: 使う技術・ライブラリ（具体的に）\n"
-            "- **工数目安**: 1人が取り組む場合のざっくり見積もり\n"
-            "- **インパクト**: ユーザー・ビジネス・技術的価値\n"
-            "- **実装の入口**: 最初にやるべき具体的な1ステップ\n\n"
-            "## ⚡ クイックウィン（今すぐできる改善）\n"
-            "（1〜2日で実装できる小さいが効果的な改善を3つ）\n\n"
-            "## 🌐 長期ビジョン\n"
-            "（1〜2年後のあるべき姿・差別化ポイント）\n\n"
-            "具体的・実践的に。抽象論は避けよ。"
-        )
-        print(f"  アイデア生成中... ", end="", flush=True)
-        result = stream_response(
-            [{"role": "system", "content": ideate_sys},
-             {"role": "user", "content": arg}],
-            True, len(arg), temp_override=0.0, model=DEEP_MODEL, max_tokens=3072
-        ) or ""
-        print()
-        return (
-            f"{C['dim']}{'─'*60}{C['w']}\n"
-            f"{C['m']}【発展案・アイデア】{C['w']}\n"
-            f"{result}\n"
-            f"{C['dim']}{'─'*60}{C['w']}\n"
-            f"{C['dim']}  ヒント: /code <案名> で即座に実装へ移行できます{C['w']}"
-        )
-
-    # ════════════════════════════════════════════════════════════════
-    # モード: architect（設計相談・技術選定）
-    # ════════════════════════════════════════════════════════════════
-    elif intent == "architect":
-        arch_sys = (
-            "あなたはAWS/GCP/Azureのチーフアーキテクト・分散システム専門家・"
-            "元Netflix・Airbnb・Stripe のスタッフエンジニアを兼ねる世界最高峰のアーキテクト。\n"
-            "設計上の問いに対して、トレードオフを正直に示しながら最適解を提示せよ。\n\n"
-            "【出力フォーマット】\n"
-            "## 🏗️ 問題の本質\n"
-            "（何を解決しようとしているか・制約条件の整理）\n\n"
-            "## ⚖️ 選択肢とトレードオフ\n"
-            "各選択肢について:\n"
-            "| 項目 | 選択肢A | 選択肢B | ... |\n"
-            "（スケール・複雑性・コスト・チーム習熟度・将来性で比較）\n\n"
-            "## ✅ 推奨アーキテクチャ\n"
-            "（理由付きで最適解を明示）\n\n"
-            "## 📐 具体的な構成図（テキストで）\n"
-            "（コンポーネント・データフロー・インターフェースを図示）\n\n"
-            "## ⚠️ 落とし穴と対策\n"
-            "（この選択でよくある失敗と回避策）\n\n"
-            "## 🗺️ 移行ロードマップ\n"
-            "（Phase 1/2/3 に分けて段階的な実装順序）"
-        )
-        print(f"  設計分析中... ", end="", flush=True)
-        result = stream_response(
-            [{"role": "system", "content": arch_sys},
-             {"role": "user", "content": arg}],
-            True, len(arg), temp_override=0.0, model=DEEP_MODEL, max_tokens=3072
-        ) or ""
-        print()
-        return (
-            f"{C['dim']}{'─'*60}{C['w']}\n"
-            f"{C['y']}【アーキテクチャ設計】{C['w']}\n"
-            f"{result}\n"
-            f"{C['dim']}{'─'*60}{C['w']}\n"
-            f"{C['dim']}  ヒント: /code <コンポーネント名> で実装に移行できます{C['w']}"
-        )
-
-    # ════════════════════════════════════════════════════════════════
-    # モード: review（既存コードのレビュー）
-    # ════════════════════════════════════════════════════════════════
-    else:  # review
-        review_sys = (
-            "あなたはGoogle・Meta・Stripe のシニアエンジニアが兼任するコードレビュー委員会。\n"
-            "提出されたコードを多角的かつ建設的にレビューせよ。\n\n"
-            "【出力フォーマット】\n"
-            "## 📊 総合評価\n"
-            "（A〜Fのグレードと一言評価）\n\n"
-            "## 🐛 バグ・ロジックエラー\n"
-            "（行番号・再現条件・修正コード例）\n\n"
-            "## 🔐 セキュリティ指摘\n"
-            "（重大度: 高/中/低 で列挙・CVE番号があれば付記）\n\n"
-            "## ⚡ パフォーマンス改善\n"
-            "（計算量・メモリ・I/O 観点で指摘・改善後の計算量も示す）\n\n"
-            "## 🧹 リファクタリング提案\n"
-            "（可読性・保守性・テスト容易性の改善案・改善後コード例）\n\n"
-            "## ✅ 良い点\n"
-            "（積極的に評価すべき実装・パターン）\n\n"
-            "## 🔧 修正後の完全コード\n"
-            "（全指摘を反映した改善版を ```python ブロックで出力）"
-        )
-        print(f"  コードレビュー中... ", end="", flush=True)
-        result = stream_response(
-            [{"role": "system", "content": review_sys},
-             {"role": "user", "content": arg}],
-            True, len(arg), temp_override=0.0, model=DEEP_MODEL, max_tokens=4096
-        ) or ""
-        print()
-        return (
-            f"{C['dim']}{'─'*60}{C['w']}\n"
-            f"{C['r']}【コードレビュー】{C['w']}\n"
-            f"{result}\n"
-            f"{C['dim']}{'─'*60}{C['w']}\n"
-            f"{C['dim']}  ヒント: /m add でレビュー結果を保存できます{C['w']}"
-        )
-
-def handle_reflect(arg: str, per_id: int) -> str:
-    """★[v129] /reflect: 自己批判的振り返り分析"""
-    if not arg: return f"{C['r']}usage: /reflect <振り返りたい内容・経験>{C['w']}"
-    persona = get_persona(per_id)
-    fp = persona.get("first_person", "私")
-    sys_content = (
-        f"あなたは{persona['name']}。口調: {persona['style']}。一人称: {fp}。\n"
-        "以下の内容について批判的・建設的な振り返りを行え。\n"
-        "【分析フレームワーク】\n"
-        "1. 何がうまくいったか（強み）\n"
-        "2. 何が課題だったか（改善点）\n"
-        "3. なぜそうなったか（根本原因分析）\n"
-        "4. 次回どう変えるか（具体的アクション）\n"
-        "5. より深い洞察（哲学的・本質的な気づき）\n"
-        "自己批判と自己肯定のバランスを保ち、建設的に分析せよ。"
-    )
-    print(f"{C['c']}[REFLECT]{C['w']} {persona['name']}: ", end="", flush=True)
-    return stream_response(
-        [{"role": "system", "content": sys_content},
-         {"role": "user", "content": f"振り返り対象: {arg}"}],
-        True, len(arg), temp_override=0.50, model=DEEP_MODEL, max_tokens=2048
-    ) or ""
-
-def handle_mindmap(arg: str, per_id: int) -> str:
-    """★[v129] /mindmap: ASCIIアートマインドマップ生成"""
-    if not arg: return f"{C['r']}usage: /mindmap <テーマ>{C['w']}"
-    persona = get_persona(per_id)
-    sys_content = (
-        f"あなたは{persona['name']}。一人称: {persona.get('first_person','私')}。\n"
-        "以下のテーマについてASCIIアートのマインドマップを生成せよ。\n"
-        "フォーマット:\n"
-        "[中心テーマ]\n"
-        "├── 主要概念1\n"
-        "│   ├── サブ概念1-1\n"
-        "│   └── サブ概念1-2\n"
-        "├── 主要概念2\n"
-        "│   ├── サブ概念2-1\n"
-        "│   └── サブ概念2-2\n"
-        "└── 主要概念3\n"
-        "    └── サブ概念3-1\n"
-        "主要概念は4〜6個、各サブ概念は2〜3個。捏造禁止。"
-    )
-    print(f"{C['c']}[MINDMAP]{C['w']} ", end="", flush=True)
-    return stream_response(
-        [{"role": "system", "content": sys_content},
-         {"role": "user", "content": f"テーマ: {arg}"}],
-        True, len(arg), temp_override=0.25, model=MODEL_NAME, max_tokens=1024
-    ) or ""
-
-def handle_persona_edit(current_persona: dict) -> dict:
-    """★[v129] /persona_edit: 現在ペルソナのスタイルをインタラクティブに編集"""
-    print(f"{C['c']}=== ペルソナ編集 ==={C['w']}")
-    print(f"現在: {current_persona['name']}")
-    print(f"口調: {current_persona['style'][:100]}...")
-    print(f"一人称: {current_persona.get('first_person', '私')}")
-    print(f"{C['dim']}編集する項目を選択（Enter でスキップ）:{C['w']}")
-    try:
-        print(f"1. 一人称 [{current_persona.get('first_person', '私')}]: ", end="", flush=True)
-        fp_new = sys.stdin.readline().strip()
-        if fp_new: current_persona["first_person"] = fp_new
-
-        print(f"2. 口調追加指示（現在の口調に追加）: ", end="", flush=True)
-        style_add = sys.stdin.readline().strip()
-        if style_add:
-            current_persona["style"] = current_persona.get("style", "") + " " + style_add
-
-        print(f"{C['g']}ペルソナ更新完了: {current_persona['name']}{C['w']}")
-    except EOFError:
-        pass
-    return current_persona
-
-def handle_model_cmd(arg: str) -> str:
-    """★[v129] /model: モデル確認・切替"""
-    a = arg.strip().lower()
-    if not a:
-        return (f"{C['c']}=== モデル状態 ==={C['w']}\n"
-                f"  FAST  : {FAST_MODEL}\n"
-                f"  MAIN  : {MODEL_NAME}\n"
-                f"  DEEP  : {DEEP_MODEL}\n"
-                f"  Power : {POWER_MODE}\n"
-                f"  Thinking: {'ON' if THINKING_MODE else 'OFF'}\n"
-                f"  GPU   : {'検出済' if _GPU_AVAILABLE else 'なし(CPU専用)'}\n"
-                f"  12b   : {'利用可' if _HAS_12B else '未検出'}")
-    if a == "fast":
-        return f"{C['g']}FAST={FAST_MODEL} (高速応答用){C['w']}"
-    if a == "main":
-        return f"{C['g']}MAIN={MODEL_NAME} (標準用){C['w']}"
-    if a == "deep":
-        return f"{C['g']}DEEP={DEEP_MODEL} (複雑推論用){C['w']}"
-    return f"{C['r']}usage: /model [fast|main|deep]{C['w']}"
-
-def handle_speedtest() -> str:
-    """★[v129] /speedtest: モデルのトークン速度測定"""
-    o = _get_ollama()
-    if o is None: return f"{C['r']}Ollama未接続{C['w']}"
-    test_models = list(dict.fromkeys([FAST_MODEL, MODEL_NAME, DEEP_MODEL]))
-    results = []
-    test_prompt = "1から10まで数字を日本語で書け。"
-    for m in test_models:
-        try:
-            start = time.time()
-            full = ""
-            for chunk in o.chat(model=m, messages=[{"role": "user", "content": test_prompt}],
-                                stream=True, options={"num_predict": 50, "num_ctx": 512}):
-                msg = chunk.get("message", {}) if isinstance(chunk, dict) else getattr(chunk, "message", None)
-                t = (msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")) or ""
-                full += t
-            elapsed = max(time.time() - start, 0.01)
-            toks = len(full) * 0.7  # rough estimate
-            tps = toks / elapsed
-            results.append(f"  {m:25s} {tps:5.1f} tok/s ({elapsed:.1f}s)")
-        except Exception as e:
-            results.append(f"  {m:25s} エラー: {e}")
-    return f"{C['c']}=== 速度測定 ==={C['w']}\n" + "\n".join(results)
-
-def handle_ctx_status(messages: list) -> str:
-    """★[v129] /ctx: コンテキスト使用量表示"""
-    def _est(text):
-        jp = sum(1 for c in text if ord(c) > 0x7F)
-        return int(jp * 1.5 + (len(text) - jp) * 0.4)
-    total = sum(_est(m.get("content", "")) for m in messages)
-    opts = get_llm_opt(True, total)
-    n_ctx = opts.get("num_ctx", 4096)
-    pct = min(100, int(total / n_ctx * 100))
-    bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-    return (f"{C['c']}=== コンテキスト状態 ==={C['w']}\n"
-            f"  使用: ~{total:,} tok / {n_ctx:,} tok ({pct}%)\n"
-            f"  [{bar}]\n"
-            f"  履歴: {len([m for m in messages if m['role']=='user'])}ターン\n"
-            f"  RAGキャッシュ: {len(RAG_CACHE)}件\n"
-            f"  /g で履歴クリア推奨 (使用率>70%)")
-
-# ===== COMMAND REGISTRY & MAIN RUNNER v129.0 =====
-def setattr_return(name: str, val):
-    """★[v129] lambdaでnonlocal変数を返すためのヘルパー"""
-    return val
-
-# ドメイン単位で管理。ここにないドメインへのアクセスは _trusted_fetch が拒否する。
-_TRUSTED_AI_DOMAINS: frozenset[str] = frozenset([
-    "arxiv.org",
-    "huggingface.co",
-    "openai.com",
-    "anthropic.com",
-    "deepmind.google",
-    "deepmind.com",
-    "ai.googleblog.com",
-    "research.google",
-    "simonwillison.net",
-    "lilianweng.github.io",
-    "github.io",           # 個人技術ブログ（github.io サブドメイン）
-    "sebastian-raschka.com",
-    "newsletter.theaiedge.io",
-    "aitidbits.substack.com",
-    "promptingguide.ai",
-    "learnprompting.org",
-    "mlabonne.github.io",
-])
-
-# arxiv の信頼済みカテゴリ（クエリパラメータレベルで限定）
-_ARXIV_SAFE_CATEGORIES: frozenset[str] = frozenset([
-    "cs.AI", "cs.LG", "cs.CL", "cs.CR", "cs.NE", "stat.ML"
-])
-
-def _trusted_fetch(url: str, timeout: int = 8) -> str:
-    """★[v130.1] /reference 専用のセキュアフェッチ。
-    ホワイトリスト (_TRUSTED_AI_DOMAINS) 外のドメインは完全拒否。
-    SSRF防止 (_assert_safe_url) も二重で適用する。
-
-    Returns:
-        取得テキスト（失敗時は空文字）
-    Raises:
-        ValueError: ホワイトリスト外ドメイン・安全でないURL
-    """
-    import ipaddress as _ipa
-    # ① 基本SSRF検査（既存の強化済みチェック）
-    _assert_safe_url(url)
-
-    # ② ホワイトリストドメイン検査
-    parsed = U.urlparse(url)
-    host = (parsed.hostname or "").lower()
-    # サブドメインも許可（例: blog.openai.com, research.google.com）
-    allowed = any(
-        host == d or host.endswith("." + d)
-        for d in _TRUSTED_AI_DOMAINS
-    )
-    if not allowed:
-        raise ValueError(
-            f"[trusted_fetch] ホワイトリスト外ドメインへのアクセスを拒否: {host!r}\n"
-            f"許可ドメイン: {sorted(_TRUSTED_AI_DOMAINS)}"
-        )
-
-    # ③ HTTPSのみ許可（ホワイトリストでも HTTP は不可）
-    if parsed.scheme != "https":
-        raise ValueError(f"[trusted_fetch] HTTPS以外は許可しない: {parsed.scheme!r}")
-
-    # ④ URLパスのサニタイズ（パストラバーサル・制御文字）
-    path = parsed.path
-    if ".." in path or any(c in path for c in ("\x00", "\r", "\n")):
-        raise ValueError(f"[trusted_fetch] 不正なURLパス: {path!r}")
-
-    # ⑤ クエリパラメータ長制限（ReDoS・過剰クエリ対策）
-    if len(parsed.query) > 512:
-        raise ValueError(f"[trusted_fetch] クエリパラメータが長すぎます: {len(parsed.query)} chars")
-
-    return fetch_html(url, timeout=timeout, silent=True)
-
-
+# ===== COMMAND REGISTRY & MAIN RUNNER v128.1 =====
 def run() -> None:
     global POWER_MODE, TEMP_VOICE, KEYWORD_MEMORY, ROLEPLAY_ACTIVE, ROLEPLAY_SCENE, CUSTOM_PERSONA
     SESSION_STATS["start_time"] = time.time()
@@ -10251,24 +8799,12 @@ def run() -> None:
     persona_id: int = 2
     current_persona: dict = get_persona(persona_id)
     restore_learning()
-    # ★[修正/#12] 再起動直後に total_interactions が 25 の倍数の場合に
-    # 1ターン目から persist_learning が走るバグを防ぐ。
-    # restore_learning() 後の値をセッション開始ベースラインとして記録する。
-    _SESSION_START_INTERACTIONS = LEARNING_STATS["total_interactions"]
     if not check_ollama_connection():
         print(f"{C['r']}ollama接続不可。終了します。{C['w']}"); return
-    # ★[v129] vector_db初期化・OPTIMIZER・バックグラウンドで並列起動
+    # ★[修正4] vector_db初期化とOPTIMIZER起動をバックグラウンドで実行（起動遅延を解消）
     threading.Thread(target=_init_vector_db, daemon=True).start()
     OPTIMIZER.start()
-    # ★[v129] BANNER動的更新（check_ollama_connectionでモデル名が確定した後）
-    _dynamic_banner = (
-        f"{C['c']}{C['bold']}\nPROJECT AEGIS [v130.1 NEXT GENERATION]{C['w']}\n"
-        f"  FAST: {FAST_MODEL} | MAIN: {MODEL_NAME} | DEEP: {DEEP_MODEL}\n"
-        f"  RAG: HYBRID(BM25+Vector) | SECURITY: MultiLayer | THINKING: {'ON' if THINKING_MODE else 'OFF'}\n"
-        f"  新コマンド: /think /plan /code /reflect /mindmap /model /ctx /speedtest\n"
-        f"  /h:コマンド一覧 | /s 1〜36:西洋哲学者 | /think:思考モード切替\n"
-    )
-    print(_dynamic_banner)
+    print(BANNER)
     # 起動時：保存済みペルソナ件数を表示
     _saved = list_personas()
     if _saved:
@@ -10281,7 +8817,7 @@ def run() -> None:
         if ROLEPLAY_ACTIVE:
             sys_msg = {"role": "system", "content": f"あなたは{p['name']}。口調:{p['style']}。一人称:{p.get('first_person','私')}。ユーザー:{USER_NAME}。ロールプレイ中: {ROLEPLAY_SCENE}。3文以内。"}
             msgs = trim_history(messages[-MAX_HISTORY * 2:]) + [{"role": "user", "content": user_text}]
-            return stream_response([sys_msg] + msgs, False, len(user_text), _get_temp_voice()) or ""
+            return stream_response([sys_msg] + msgs, False, len(user_text), TEMP_VOICE) or ""
         if mode == "d":
             # ★ デフォルトペルソナ(ID=1)以外はcomplexとして扱う
             # estimate_complexityは短い入力を「simple」と誤判定するため、
@@ -10309,7 +8845,7 @@ def run() -> None:
                             # ★[修正/ctx-2] RAGデータをctx予算に合わせてトリミング
                             # complexモード(ctx=8192, n_predict=4096)では残り≒4096トークン≒2700文字
                             # RAGが長すぎるとシステムプロンプト+履歴でctxを圧迫して途切れる原因になる
-                            _rag_chars_limit = 1200  # ★[v129] 800→1200: ハイブリッドRAG情報増加に対応
+                            _rag_chars_limit = 800  # 約530トークン相当: 情報密度と安全余裕のバランス
                             _rag_trimmed = _rag[:_rag_chars_limit]
                             if len(_rag) > _rag_chars_limit:
                                 _rag_trimmed += "\n…(省略)"
@@ -10415,7 +8951,7 @@ def run() -> None:
             # ★[修正/hist-1] 哲学者complexモードはtrim_historyにトークン予算を渡す
             # 哲学者の長い返答(~1500tok)が4ペア分積み上がるとプロンプト枠を圧迫するため
             # 履歴全体を1500tok以内に抑えてSP+RAG+出力の余裕を確保する
-            _hist_budget = 2000 if is_complex else 1000  # ★[v129] 1500→2000: 長期対話の一貫性向上
+            _hist_budget = 1500 if is_complex else 800
             cm = [sys_msg] + trim_history(messages[-MAX_HISTORY * 2:], token_budget=_hist_budget) + [{"role": "user", "content": user_text}]
             # total_len: システムプロンプト込みの総文字数をctx計算に渡す
             total_len = sum(len(m.get("content","")) for m in cm)
@@ -10463,9 +8999,7 @@ def run() -> None:
         "export": lambda a: handle_export(a, messages),
         "template": lambda a: handle_template(a),
         "tts": lambda a: handle_tts(a),
-        # ★[修正/#3] /tr <言語> <テキスト> 書式に対応。
-        # 旧コードは引数全体を text として渡し target_lang が常に "en" 固定だった。
-        "tr": lambda a: (lambda p: handle_translate(p[1], p[0]) if len(p) >= 2 else handle_translate(a))(a.split(None, 1)) if a else handle_translate(""),
+        "tr": lambda a: handle_translate(a),
         "reference": lambda _: _handle_reference(),
         "stop": lambda _: _handle_stop(),
         "s": lambda a: _handle_persona_switch(a),
@@ -10488,19 +9022,9 @@ def run() -> None:
         "split": lambda a: handle_split(a),
         "offline": lambda a: _handle_offline(a),
         "ety": lambda a: handle_ety(a),
-        "chess":       lambda a: handle_chess(a, persona=current_persona),
-        "shogi":       lambda a: handle_shogi(a, persona=current_persona),
-        "mj":          lambda a: handle_mahjong(a),
-        # ★[v129] 新コマンド
-        "think":       lambda a: handle_think_mode(a),
-        "plan":        lambda a: handle_plan(a, persona_id),
-        "code":        lambda a: handle_code(a, persona_id),
-        "reflect":     lambda a: handle_reflect(a, persona_id),
-        "mindmap":     lambda a: handle_mindmap(a, persona_id),
-        "persona_edit":lambda _: (setattr_return("current_persona", handle_persona_edit(current_persona)), "")[1] or f"{C['g']}編集完了{C['w']}",
-        "model":       lambda a: handle_model_cmd(a),
-        "ctx":         lambda _: handle_ctx_status(messages),
-        "speedtest":   lambda _: handle_speedtest(),
+        "chess": lambda a: handle_chess(a, persona=current_persona),
+        "shogi": lambda a: handle_shogi(a, persona=current_persona),
+        "mj":    lambda a: handle_mahjong(a),
     }
 
     def _handle_quest(arg: str) -> str:
@@ -10544,307 +9068,19 @@ def run() -> None:
         out.append(f"{C['b']}  ※歌詞の著作権は権利者に帰属します。{C['w']}")
         return "\n".join(out)
 
-# ★[v130.1] /reference 専用: 信頼済みAI技術ソースのホワイトリスト
     def _handle_reference() -> str:
-        """★[v130.1] /reference 超強化版 + セキュリティ強化
-        セキュリティ:
-          - _trusted_fetch でホワイトリスト外ドメインを完全拒否
-          - HTTPS専用・パストラバーサル防止・クエリ長制限
-          - コンテンツハッシュで重複取得を排除
-          - レート制限（前回実行から60秒未満は警告）
-        機能:
-          1. 信頼済みソースから最新AI技術をリアルタイム収集
-          2. LLMで技術を抽出・応用可能性スコアリング
-          3. PROMPT_OPTIMIZATIONS に自動反映（重複排除）
-          4. 非循環LLM品質診断（カテゴリ別トレンド + 行動指針）
-          5. モード別パフォーマンスダッシュボード
-          6. セキュリティ監査ログ表示
-        """
-        import json as _json
-        import hashlib as _hl
-        import time as _time
-
-        # ── レート制限: 連続実行防止 ─────────────────────────────
-        _REF_STATE = globals().setdefault("_REFERENCE_STATE", {
-            "last_run": 0.0,
-            "content_hashes": set(),
-            "run_count": 0,
-        })
-        now_ts = _time.time()
-        elapsed = now_ts - _REF_STATE["last_run"]
-        _REF_STATE["last_run"] = now_ts
-        _REF_STATE["run_count"] += 1
-
-        lines = [
-            f"{C['c']}{{'═'*64}}{C['w']}",
-            f"{C['c']}  /reference  AI技術インテリジェンス & 自己改善システム"
-            f"  (#{_REF_STATE['run_count']}){C['w']}",
-            f"{C['c']}{{'═'*64}}{C['w']}",
-        ]
-        if 0 < elapsed < 60:
-            lines.append(
-                f"  {C['y']}⚠ 前回実行から{elapsed:.0f}秒。"
-                f"キャッシュ済みデータを一部再利用します。{C['w']}"
-            )
-
-        # ══ SECTION 1: 信頼済みソースから最新AI技術を収集 ══
-        lines.append(f"\n{C['y']}【1】最新AI技術 収集 (ホワイトリスト限定){C['w']}")
-
-        _TRUSTED_SOURCES = [
-            ("arxiv/cs.CL (LLM・プロンプト)",
-             "https://arxiv.org/search/?searchtype=all&query=LLM+prompt+RAG+agent&start=0",
-             "🔬"),
-            ("arxiv/cs.AI (推論・自己改善)",
-             "https://arxiv.org/search/?searchtype=all&query=reasoning+chain-of-thought+self-improvement&start=0",
-             "🔬"),
-            ("HuggingFace Blog",
-             "https://huggingface.co/blog",
-             "🤗"),
-            ("HuggingFace Papers",
-             "https://huggingface.co/papers",
-             "🤗"),
-            ("Simon Willison",
-             "https://simonwillison.net/",
-             "📝"),
-            ("Lilian Weng (OpenAI)",
-             "https://lilianweng.github.io/",
-             "📝"),
-            ("Prompting Guide",
-             "https://www.promptingguide.ai/",
-             "💡"),
-            ("Anthropic News",
-             "https://www.anthropic.com/news",
-             "🏢"),
-        ]
-
-        collected_texts = []
-        fetch_report = []
-
-        for src_name, src_url, src_tag in _TRUSTED_SOURCES:
-            print(f"  {src_tag} {src_name} ... ", end="", flush=True)
-            try:
-                html = _trusted_fetch(src_url, timeout=8)
-                if not html:
-                    print(f"{C['r']}空レスポンス{C['w']}")
-                    fetch_report.append(f"  ✗ {src_name}: 空レスポンス")
-                    continue
-                text = strip_tags(html)[:2500]
-                h = _hl.sha256(text.encode()).hexdigest()[:12]
-                if h in _REF_STATE["content_hashes"]:
-                    print(f"{C['dim']}キャッシュ済み{C['w']}")
-                    fetch_report.append(f"  ↩ {src_name}: キャッシュ済み")
-                    continue
-                _REF_STATE["content_hashes"].add(h)
-                collected_texts.append(f"==[{src_name}]==\n{text}")
-                print(f"{C['g']}OK ({len(text)}chars){C['w']}")
-                fetch_report.append(f"  ✓ {src_name}")
-            except ValueError as e:
-                print(f"{C['r']}🔒 セキュリティブロック{C['w']}")
-                fetch_report.append(f"  🔒 {src_name}: {str(e)[:60]}")
-            except Exception as e:
-                print(f"{C['r']}エラー{C['w']}")
-                fetch_report.append(f"  ✗ {src_name}: {str(e)[:60]}")
-
-        lines.append("\n".join(fetch_report))
-
-        if not collected_texts:
-            lines.append(f"  {C['r']}全ソースの取得失敗 — ネット確認または /offline on を検討{C['w']}")
-            raw_tech_summary = ""
-        else:
-            print(f"\n  → LLMで技術抽出中... ", end="", flush=True)
-            tech_extract_sys = (
-                "あなたは最先端AI研究のキュレーター兼エンジニア。\n"
-                "以下の信頼済みWebソースから取得したテキストを分析し、\n"
-                "LLM・プロンプトエンジニアリング・RAG・エージェント・推論・安全性に関する\n"
-                "最新技術トレンドを抽出せよ。\n\n"
-                "【出力フォーマット — 1行1技術、最大12件、重要度順】\n"
-                "技術名 | 概要(30字以内) | 分類(prompt/rag/reasoning/safety/memory/output) "
-                "| 自律AIへの応用可能性(高/中/低) | 実装難易度(易/中/難)\n\n"
-                "余分な説明・前置き・番号は不要。フォーマット通りに出力せよ。"
-            )
-            raw_tech_summary = stream_response(
-                [{"role": "system", "content": tech_extract_sys},
-                 {"role": "user", "content": "\n\n".join(collected_texts)}],
-                False, 500, temp_override=0.0, model=DEEP_MODEL,
-                max_tokens=1200, silent=True
-            ) or ""
-            print(f"{C['g']}完了{C['w']}")
-
-            lines.append(f"\n  {C['c']}{{'技術名':<22}} {{'分類':<12}} {{'応用性':<6}} {{'難易度'}}{C['w']}")
-            lines.append(f"  {{'─'*56}}")
-            for row in raw_tech_summary.splitlines():
-                parts = [p.strip() for p in row.split("|")]
-                if len(parts) >= 4:
-                    name = parts[0]; summary = parts[1]; cat = parts[2]
-                    applicability = parts[3]; diff = parts[4] if len(parts) > 4 else "─"
-                    app_color = C['g'] if "高" in applicability else C['y'] if "中" in applicability else C['dim']
-                    lines.append(
-                        f"  {name:<22} {C['c']}{cat:<12}{C['w']} "
-                        f"{app_color}{applicability:<6}{C['w']} {diff}"
-                    )
-                    lines.append(f"    {C['dim']}{summary}{C['w']}")
-
-        # ══ SECTION 2: 適用可能技術を自動でPROMPT_OPTIMIZATIONSに反映 ══
-        if raw_tech_summary:
-            lines.append(f"\n{C['y']}【2】自AI適用 & PROMPT_OPTIMIZATIONS 自動反映{C['w']}")
-            print(f"  → 適用分析中... ", end="", flush=True)
-            apply_sys = (
-                "あなたはPythonベースの自律AI（RAG・ベクターDB・哲学者ペルソナ36体・"
-                "MIDI生成・BM25・背景最適化スレッド・web検索・codeサンドボックス搭載）の開発者。\n"
-                "以下のAI技術リストから今すぐ取り入れられる技術を選び実装方針をJSONで出力せよ。\n\n"
-                "【出力 — JSONのみ、マークダウン不要】\n"
-                "[\n"
-                "  {\"tech\": \"技術名\",\n"
-                "   \"category\": \"prompt|rag|memory|reasoning|safety|output\",\n"
-                "   \"directive\": \"具体的指示(日本語・50字以内)\",\n"
-                "   \"rationale\": \"なぜ有効か(20字以内)\",\n"
-                "   \"priority\": 1~5}\n"
-                "]\n\n"
-                "応用可能性「高」を優先。3〜6件出力せよ。"
-            )
-            apply_raw = stream_response(
-                [{"role": "system", "content": apply_sys},
-                 {"role": "user", "content": raw_tech_summary}],
-                False, 200, temp_override=0.0, model=DEEP_MODEL,
-                max_tokens=768, silent=True
-            ) or "[]"
-            print(f"{C['g']}完了{C['w']}")
-
-            try:
-                clean_json = re.sub(r'```json|```', '', apply_raw).strip()
-                tech_directives = _json.loads(clean_json)
-                applied, skipped = [], []
-                for td in sorted(tech_directives, key=lambda x: -x.get("priority", 0)):
-                    cat = td.get("category", "prompt")
-                    directive = td.get("directive", "")
-                    tech_name = td.get("tech", "unknown")
-                    rationale = td.get("rationale", "")
-                    pri = td.get("priority", 1)
-                    if not directive or not cat: continue
-                    if cat not in PROMPT_OPTIMIZATIONS:
-                        PROMPT_OPTIMIZATIONS[cat] = []
-                    if any(directive[:20] in d for d in PROMPT_OPTIMIZATIONS[cat]):
-                        skipped.append(tech_name); continue
-                    PROMPT_OPTIMIZATIONS[cat].append(directive)
-                    OPTIMIZATION_HISTORY.append(
-                        f"[/reference #{_REF_STATE['run_count']}] {tech_name}: {directive[:60]}"
-                    )
-                    stars = "★" * pri + "☆" * (5 - pri)
-                    applied.append(
-                        f"  {C['g']}✓{C['w']} {stars} {C['c']}{tech_name}{C['w']}"
-                        f" [{cat}] {directive[:48]}"
-                        f"\n    {C['dim']}理由: {rationale}{C['w']}"
-                    )
-                if applied:
-                    lines.append(f"{C['g']}  反映済み ({len(applied)}件):{C['w']}")
-                    lines.extend(applied)
-                if skipped:
-                    lines.append(f"  {C['dim']}スキップ（既反映）: {', '.join(skipped)}{C['w']}")
-            except Exception as e:
-                lines.append(f"  {C['r']}JSON解析失敗: {e}{C['w']}")
-                lines.append(f"  {C['dim']}{apply_raw[:200]}{C['w']}")
-
-        # ══ SECTION 3: 非循環 LLM品質診断 ══
-        lines.append(f"\n{C['y']}【3】自己評価ログ 品質診断{C['w']}")
-        if len(SELF_EVAL_LOG) < 2:
-            lines.append(
-                f"  {C['dim']}評価ログ不足 ({len(SELF_EVAL_LOG)}件)"
-                f" — 会話を重ねると分析が開始されます{C['w']}"
-            )
-        else:
-            recent = SELF_EVAL_LOG[-20:]
-            cat_data = {}
-            for entry in recent:
-                for cat, score in entry.get("scores", {}).items():
-                    cat_data.setdefault(cat, []).append(score)
-            lines.append(f"  {C['c']}{{'カテゴリ':<14}} {{'平均':>5}}  {{'バー':^14}}  トレンド{C['w']}")
-            lines.append(f"  {{'─'*54}}")
-            for cat, scores in sorted(cat_data.items()):
-                avg = sum(scores) / len(scores)
-                half = max(1, len(scores) // 2)
-                delta = (sum(scores[half:]) / max(len(scores[half:]), 1)) - (sum(scores[:half]) / half)
-                trend = (f"{C['g']}↑ +{delta:.2f}{C['w']}" if delta > 0.05
-                         else f"{C['r']}↓ {delta:.2f}{C['w']}" if delta < -0.05
-                         else f"{C['dim']}→  0.00{C['w']}")
-                filled = int(avg * 14)
-                bar_str = f"{C['g']}{{'█'*filled}}{C['dim']}{{'░'*(14-filled)}}{C['w']}"
-                lines.append(f"  {cat:<14} {avg:>5.2f}  {bar_str}  {trend}")
-
-            if len(SELF_EVAL_LOG) >= 5:
-                print(f"\n  → LLM品質診断中... ", end="", flush=True)
-                log_summary = _json.dumps(
-                    [{"mode": e["mode"], "avg": round(e["avg"], 2),
-                      "scores": {k: round(v, 2) for k, v in e["scores"].items()}}
-                     for e in recent[-10:]], ensure_ascii=False
-                )
-                quality_sys = (
-                    "あなたはAI品質評価の専門家。スコアの羅列でなく洞察を述べよ。\n"
-                    "以下の自律AIの自己評価ログを分析し:\n"
-                    "1. 【最重要改善点】最も改善が必要な領域と具体的改善策（2〜3行）\n"
-                    "2. 【強み】最も安定して高いカテゴリとその要因（1行）\n"
-                    "3. 【次の行動指針】次の10回で意識すべき具体的な1つのアクション\n"
-                    "4. 【危険信号】スコアが0.3以下があれば緊急アラートを出せ\n"
-                    "日本語・簡潔に。"
-                )
-                quality_comment = stream_response(
-                    [{"role": "system", "content": quality_sys},
-                     {"role": "user", "content": log_summary}],
-                    False, 100, temp_override=0.0, model=DEEP_MODEL,
-                    max_tokens=300, silent=True
-                ) or ""
-                print(f"{C['g']}完了{C['w']}")
-                lines.append(f"\n  {C['c']}◆ LLM品質診断{C['w']}")
-                for ln in quality_comment.splitlines():
-                    lines.append(f"  {ln}")
-
-        # ══ SECTION 4: PROMPT_OPTIMIZATIONS ダッシュボード ══
-        lines.append(f"\n{C['y']}【4】現在の最適化ディレクティブ{C['w']}")
-        total_directives = sum(len(v) for v in PROMPT_OPTIMIZATIONS.values())
-        if PROMPT_OPTIMIZATIONS:
-            for cat, directives in sorted(PROMPT_OPTIMIZATIONS.items()):
-                lines.append(f"  {C['c']}[{cat}]{C['w']} {len(directives)}件")
-                for d in directives[-3:]:
-                    lines.append(f"    {C['dim']}• {d[:72]}{C['w']}")
-        else:
-            lines.append(f"  {C['dim']}まだ最適化ディレクティブなし{C['w']}")
-
-        # ══ SECTION 5: モード別パフォーマンスランキング ══
-        if REFERENCE_SCORES:
-            lines.append(f"\n{C['y']}【5】モード別パフォーマンス{C['w']}")
-            sorted_modes = sorted(
-                REFERENCE_SCORES.items(),
-                key=lambda x: sum(x[1]) / max(len(x[1]), 1), reverse=True
-            )
-            for i, (mode, scores) in enumerate(sorted_modes[:8]):
-                avg = sum(scores) / len(scores)
-                filled = int(avg * 12)
-                medal = ["🥇", "🥈", "🥉"][i] if i < 3 else "  "
-                bar = f"{C['g']}{{'█'*filled}}{C['dim']}{{'░'*(12-filled)}}{C['w']}"
-                lines.append(f"  {medal} {mode:<12} {bar} {avg:.2f} ({len(scores)}回)")
-
-        # ══ SECTION 6: セキュリティ監査ログ ══
-        lines.append(f"\n{C['y']}【6】セキュリティ状態{C['w']}")
-        lines += [
-            f"  {C['g']}✓{C['w']} ホワイトリスト: {len(_TRUSTED_AI_DOMAINS)}ドメイン限定",
-            f"  {C['g']}✓{C['w']} プロトコル: HTTPS専用",
-            f"  {C['g']}✓{C['w']} SSRF防御: IPv6マップド・10進IP・リダイレクト先検証",
-            f"  {C['g']}✓{C['w']} 重複排除: SHA-256ハッシュ ({len(_REF_STATE['content_hashes'])}件キャッシュ)",
-            f"  {C['g']}✓{C['w']} レート制限: 60秒クールダウン",
-            f"  {C['g']}✓{C['w']} パストラバーサル防止・クエリ長上限512chars",
-        ]
-
-        # ══ フッター ══
-        lines += [
-            f"\n{C['c']}{{'═'*64}}{C['w']}",
-            f"{C['dim']}  最適化履歴: {len(OPTIMIZATION_HISTORY)}件 | "
-            f"評価ログ: {len(SELF_EVAL_LOG)}件 | "
-            f"ディレクティブ: {total_directives}件 | "
-            f"実行回数: #{_REF_STATE['run_count']}{C['w']}",
-            f"{C['dim']}  反映された技術は次回の応答から自動適用されます{C['w']}",
-            f"{C['c']}{{'═'*64}}{C['w']}",
-        ]
-        return "\n".join(lines)
-
+        if len(SELF_EVAL_LOG) < 2: return f"{C['y']}自己評価データ不足{C['w']}"
+        recent = SELF_EVAL_LOG[-5:]
+        rows = [f"{C['c']}=== 自己評価 (直近{len(recent)}回) ==={C['w']}"]
+        avg_scores: dict[str, list[float]] = {}
+        for entry in recent:
+            for cat, score in entry.get("scores", {}).items():
+                avg_scores.setdefault(cat, []).append(score)
+        for cat, scores in avg_scores.items():
+            avg = sum(scores) / len(scores)
+            bar = "█" * int(avg * 10) + "░" * (10 - int(avg * 10))
+            rows.append(f"  {cat:12s} {bar} {avg:.1f}")
+        return "\n".join(rows)
 
     def _handle_stop() -> str:
         removed = 0
@@ -11042,44 +9278,12 @@ def run() -> None:
         total = sum(len(v) for b in PROMPT_OPTIMIZATIONS.values()
                     if isinstance(b, dict) for v in b.values())
         directive_str = ("\n" + "\n".join(directive_lines)) if directive_lines else " なし"
-        def _temp_graph(hist):
-            if len(hist) < 2: return "  (データ不足)"
-            mn,mx=min(hist),max(hist); rng=mx-mn if mx!=mn else 0.1
-            H,W=5,min(len(hist),30); data=hist[-W:]
-            # 新しい点ほど暖色：最新=赤、1つ前=オレンジ、2つ前=黄、3つ前=緑、それ以前=シアン
-            def _dot_color(idx, total):
-                age = total - 1 - idx  # 0=最新
-                if   age == 0: return C['r']            # 赤（最新）
-                elif age == 1: return C['o']            # オレンジ
-                elif age == 2: return C['y']            # 黄
-                elif age <= 5: return C['g']            # 緑
-                else:          return C['c']            # シアン（古い）
-            rows=[]
-            for row in range(H,-1,-1):
-                thr=mn+rng*(row/H)
-                next_thr=mn+rng*((row-1)/H) if row>0 else mn
-                line=""
-                for i,v in enumerate(data):
-                    if next_thr<=v<thr or (row==0 and v<=thr) or (row==H and v>=thr):
-                        line += _dot_color(i, len(data)) + "●" + C['w']
-                    else:
-                        line += " "
-                label=f"{thr:.2f}|" if row in (0,H) else "     |"
-                rows.append(label+line)
-            rows.append("     +"+"─"*W)
-            # 凡例
-            rows.append(f"  凡例: {C['r']}●最新{C['w']} {C['o']}●1つ前{C['w']} {C['y']}●2つ前{C['w']} {C['g']}●3〜5前{C['w']} {C['c']}●古い{C['w']}")
-            return "\n".join(rows)
-        trend=""
-        if len(TEMP_HISTORY)>1:
-            trend="↓低下中" if TEMP_HISTORY[-1]<TEMP_HISTORY[-2] else "↑上昇中" if TEMP_HISTORY[-1]>TEMP_HISTORY[-2] else "→安定"
         return "\n".join([
             f"{C['c']}=== 学習状態 ==={C['w']}",
             f"対話数: {LEARNING_STATS['total_interactions']}",
             f"肯定/否定: {LEARNING_STATS['positive_count']}/{LEARNING_STATS['negative_count']}",
             f"自己修正: {LEARNING_STATS['self_correction_count']}",
-            f"温度: {TEMP_VOICE:.2f} (最適候補: {get_best_temp('d') or 'none'}) {trend}",
-            f"温度推移:\n{_temp_graph(TEMP_HISTORY)}",
+            f"温度: {TEMP_VOICE:.2f} (最適候補: {get_best_temp('d') or 'none'})",
             f"キーワード: {', '.join(KEYWORD_MEMORY[-5:]) or 'なし'}",
             f"最適化: {OPTIMIZER.status()}",
             f"ユーザー指摘 全{total}件 / 現在ペルソナ({current_persona.get('name','')}):{directive_str}",
@@ -11100,11 +9304,6 @@ def run() -> None:
             cmd: str = ""
             cmd_arg: str = ""
             is_cmd = raw.startswith("/")
-            # ★[v131] RAGプリフェッチ: ユーザー入力直後・コマンド解析前にWeb取得を開始
-            # /コマンド以外かつオフラインモード無効の場合のみ
-            _prefetch_future = None
-            if not is_cmd and not OFFLINE_MODE and not ROLEPLAY_ACTIVE:
-                _prefetch_future = _THREAD_POOL.submit(get_async_rag_data, raw)
             if is_cmd:
                 parts = raw[1:].strip().split(maxsplit=1)
                 if not parts:
@@ -11217,7 +9416,9 @@ def run() -> None:
                 if not is_cmd:
                     fb = analyze_feedback(raw)
                     log_interaction(raw, result, "d", fb)
-                    update_param_performance("d", _get_temp_voice(), fb)
+                    update_param_performance("d", TEMP_VOICE, fb)
+                    if fb < -0.3:
+                        LEARNING_STATS["negative_count"] += 1
                     # ★[修正A+B] ユーザー指摘を即時にPROMPT_OPTIMIZATIONSへ反映
                     applied = apply_user_directive(raw, current_persona.get("name", ""))
                     if applied:
@@ -11240,11 +9441,7 @@ def run() -> None:
                 SESSION_STATS["response_times"] = SESSION_STATS["response_times"][-250:]
                 SESSION_STATS["token_estimates"] = SESSION_STATS["token_estimates"][-250:]
             if LEARNING_STATS["total_interactions"] % 25 == 0 and LEARNING_STATS["total_interactions"] > 0:
-                # ★[修正/#12] 再起動直後に総数が25の倍数の場合、1ターン目から
-                # persist_learning が走るバグを修正。セッション内の増分が0より大きい場合のみ保存する。
-                _session_delta = LEARNING_STATS["total_interactions"] - _SESSION_START_INTERACTIONS
-                if _session_delta > 0:
-                    persist_learning()
+                persist_learning()
         except Exception as e:
             print(f"{C['r']}[ERR] {sanitize(e)}{C['w']}")
             if POWER_MODE == "ultra" or isinstance(e, (NameError, AttributeError)):

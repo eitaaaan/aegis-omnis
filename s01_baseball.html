@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>甲子園列伝</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#08050a;color:#f0e8d0;font-family:'Meiryo','Yu Gothic',sans-serif;height:100vh;overflow:hidden;user-select:none}
+#bg{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse at 50% 30%,rgba(255,140,0,0.08) 0%,transparent 60%),linear-gradient(180deg,#0a0308 0%,#120508 50%,#0a0205 100%)}
+#title{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:24px;background:#08050a}
+.t-badge{border:1px solid #c8a030;padding:5px 20px;font-size:10px;letter-spacing:.5em;color:#c8a030}
+.t-main{font-family:'Yu Mincho','MS Mincho',serif;font-size:clamp(52px,10vw,96px);font-weight:800;color:#f0c040;text-shadow:0 0 60px rgba(240,192,64,.4),4px 4px 0 rgba(120,60,0,.8);line-height:1.1;text-align:center}
+.t-sub{font-size:12px;letter-spacing:.4em;color:#a08060}
+.t-btn{background:linear-gradient(135deg,#7a1800,#c02800);border:none;color:#f0e8d0;font-family:'Meiryo',sans-serif;font-size:15px;font-weight:700;letter-spacing:.3em;padding:13px 44px;cursor:pointer;border-radius:2px;box-shadow:0 4px 20px rgba(180,40,0,.4);transition:all .2s}
+.t-btn:hover{transform:translateY(-2px);box-shadow:0 8px 28px rgba(180,40,0,.6)}
+#game{position:fixed;inset:0;z-index:5;display:none;flex-direction:column}
+#scoreboard{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px;padding:8px 16px;background:rgba(0,0,0,.85);border-bottom:2px solid #c8a030;flex-shrink:0}
+.team-blk{text-align:center}
+.team-nm{font-size:11px;letter-spacing:.2em;color:#a08060;margin-bottom:2px}
+.team-sc{font-family:'Yu Mincho',serif;font-size:40px;font-weight:800;color:#f0c040;line-height:1;text-shadow:0 0 20px rgba(240,192,64,.4)}
+.inn-blk{text-align:center;border-left:1px solid rgba(200,160,48,.3);border-right:1px solid rgba(200,160,48,.3);padding:0 16px}
+.inn-num{font-family:'Yu Mincho',serif;font-size:28px;font-weight:800;color:white}
+.inn-sub{font-size:10px;color:#a08060;letter-spacing:.2em}
+#countbar{display:flex;align-items:center;justify-content:center;gap:24px;padding:6px;background:rgba(0,0,0,.7);border-bottom:1px solid rgba(200,160,48,.15);flex-shrink:0}
+.cnt{text-align:center}
+.cnt-lbl{font-size:9px;letter-spacing:.3em;color:#a08060;margin-bottom:3px}
+.dots{display:flex;gap:5px;justify-content:center}
+.dot{width:11px;height:11px;border-radius:50%;border:1px solid rgba(200,160,48,.3);transition:all .25s}
+.dot.on{background:#f0c040;border-color:#f0c040;box-shadow:0 0 6px rgba(240,192,64,.7)}
+.dot.out.on{background:#cc2200;border-color:#cc2200;box-shadow:0 0 6px rgba(200,34,0,.7)}
+.dot.ball.on{background:#00cc44;border-color:#00cc44;box-shadow:0 0 6px rgba(0,200,68,.7)}
+#minidiamond{position:relative;width:36px;height:36px}
+.md{position:absolute;width:11px;height:11px;background:rgba(200,160,48,.2);border:1px solid rgba(200,160,48,.35);transform:rotate(45deg);transition:all .3s}
+.md.on{background:#f0c040;box-shadow:0 0 8px rgba(240,192,64,.8)}
+#md1{bottom:4px;right:0}
+#md2{top:0;left:50%;transform:translateX(-50%) rotate(45deg)}
+#md3{bottom:4px;left:0}
+#field-wrap{flex:1;position:relative;overflow:hidden}
+#field-canvas{position:absolute;inset:0;width:100%;height:100%}
+#pitch-ui{position:absolute;bottom:90px;left:50%;transform:translateX(-50%);text-align:center;z-index:20;pointer-events:none}
+.ui-hint{font-size:11px;letter-spacing:.2em;color:#a08060;margin-bottom:4px;background:rgba(0,0,0,.5);padding:4px 12px;border-radius:20px}
+.ui-action{font-size:14px;font-weight:700;color:#f0c040;letter-spacing:.2em}
+#player-cards{position:absolute;bottom:0;left:0;right:0;display:grid;grid-template-columns:1fr 1fr;gap:1px;background:rgba(0,0,0,.9);border-top:1px solid rgba(200,160,48,.2);z-index:15}
+.p-card{padding:8px 12px;display:flex;align-items:center;gap:10px}
+.p-role{font-size:9px;letter-spacing:.3em;color:#a08060;margin-bottom:2px}
+.p-emoji{font-size:22px;line-height:1}
+.p-name{font-family:'Yu Mincho',serif;font-size:13px;font-weight:700;color:#f0c040}
+.p-cat{font-size:9px;color:#a08060;letter-spacing:.15em}
+.p-stat{font-size:10px;color:#706050;margin-top:2px}
+#speech{position:absolute;top:8px;left:8px;right:8px;background:rgba(0,0,0,.75);border-left:3px solid #f0c040;padding:7px 12px;border-radius:0 4px 4px 0;z-index:20;pointer-events:none}
+.sp-nm{font-size:9px;color:#f0c040;letter-spacing:.3em;margin-bottom:3px}
+.sp-tx{font-family:'Yu Mincho',serif;font-size:12px;color:#f0e8d0;line-height:1.6;font-style:italic}
+#flash{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font-family:'Yu Mincho',serif;font-size:64px;font-weight:800;pointer-events:none;z-index:200;display:none;text-align:center;text-shadow:0 0 40px currentColor}
+@keyframes fa{0%{opacity:0;transform:translate(-50%,-50%) scale(.4)}20%{opacity:1;transform:translate(-50%,-50%) scale(1.3)}70%{opacity:1;transform:translate(-50%,-50%) scale(1)}100%{opacity:0;transform:translate(-50%,-58%) scale(.9)}}
+#log{position:absolute;right:8px;bottom:90px;width:180px;background:rgba(0,0,0,.6);border:1px solid rgba(200,160,48,.1);border-radius:4px;padding:6px;max-height:100px;overflow-y:auto;font-size:10px;color:#a08060;line-height:1.7;z-index:20}
+.lh{color:#f0c040}.lo{color:#ff6666}.lhr{color:#ff4400;font-weight:700}.lw{color:#44bb66}.ls{color:#556}
+#result{position:fixed;inset:0;z-index:50;display:none;flex-direction:column;align-items:center;justify-content:center;gap:20px;background:rgba(8,5,10,.95);text-align:center}
+.r-title{font-family:'Yu Mincho',serif;font-size:44px;font-weight:800;color:#f0c040;text-shadow:0 0 30px rgba(240,192,64,.5)}
+.r-score{font-family:'Yu Mincho',serif;font-size:60px;font-weight:800;color:white}
+.r-winner{font-size:16px;color:#a08060;letter-spacing:.3em}
+</style>
+</head>
+<body>
+<div id="bg"></div>
+<div id="title">
+  <div class="t-badge">KOSHIEN LEGENDS</div>
+  <div class="t-main">甲子園<br>列伝</div>
+  <div class="t-sub">偉人たちの夏 — マウスで投げて、振れ</div>
+  <button class="t-btn" onclick="startGame()">試合開始</button>
+</div>
+<div id="game">
+  <div id="scoreboard">
+    <div class="team-blk"><div class="team-nm" id="away-nm">ビジター</div><div class="team-sc" id="away-sc">0</div></div>
+    <div class="inn-blk">
+      <div class="inn-num" id="inn-n">1</div>
+      <div class="inn-sub" id="inn-h">表</div>
+      <div style="font-size:9px;color:#a08060;margin-top:2px" id="out-lbl">0アウト</div>
+    </div>
+    <div class="team-blk"><div class="team-nm" id="home-nm">ホーム</div><div class="team-sc" id="home-sc">0</div></div>
+  </div>
+  <div id="countbar">
+    <div class="cnt"><div class="cnt-lbl">BALL</div>
+      <div class="dots" id="db"><div class="dot ball"></div><div class="dot ball"></div><div class="dot ball"></div></div>
+    </div>
+    <div class="cnt"><div class="cnt-lbl">STRIKE</div>
+      <div class="dots" id="ds"><div class="dot"></div><div class="dot"></div></div>
+    </div>
+    <div class="cnt"><div class="cnt-lbl">OUT</div>
+      <div class="dots" id="do"><div class="dot out"></div><div class="dot out"></div></div>
+    </div>
+    <div id="minidiamond">
+      <div class="md" id="md2"></div>
+      <div class="md" id="md3"></div>
+      <div class="md" id="md1"></div>
+    </div>
+  </div>
+  <div id="field-wrap">
+    <canvas id="field-canvas"></canvas>
+    <div id="speech"><div class="sp-nm" id="sp-nm">— 実況 —</div><div class="sp-tx" id="sp-tx">偉人たちの夏が始まる。</div></div>
+    <div id="pitch-ui"><div class="ui-hint" id="ui-hint">マウスをドラッグして投球</div><div class="ui-action" id="ui-action"></div></div>
+    <div id="log"></div>
+  </div>
+  <div id="player-cards">
+    <div class="p-card"><div class="p-emoji" id="pe-p">⚾</div><div><div class="p-role">PITCHER</div><div class="p-name" id="pn-p">—</div><div class="p-cat" id="pc-p">—</div><div class="p-stat" id="ps-p"></div></div></div>
+    <div class="p-card"><div class="p-emoji" id="pe-b">🏏</div><div><div class="p-role">BATTER</div><div class="p-name" id="pn-b">—</div><div class="p-cat" id="pc-b">—</div><div class="p-stat" id="ps-b"></div></div></div>
+  </div>
+</div>
+<div id="flash"></div>
+<div id="result">
+  <div class="t-badge">GAME OVER</div>
+  <div class="r-title" id="r-title">試合終了</div>
+  <div class="r-score" id="r-score">0 — 0</div>
+  <div class="r-winner" id="r-winner">—</div>
+  <button class="t-btn" onclick="location.reload()">もう一度</button>
+</div>
+<script>
+// __OLLAMA_SPEECHES__
+const OLLAMA_SPEECHES={};
+const BASEBALL_API_PORT = 0;
+const API_BASE = `http://127.0.0.1:${BASEBALL_API_PORT}/api`;
+
+async function fetchSpeech(name, cat, action){
+  if(BASEBALL_API_PORT===0) return null;
+  try{
+    const r = await fetch(`${API_BASE}/speech?name=${encodeURIComponent(name)}&cat=${encodeURIComponent(cat)}&action=${encodeURIComponent(action)}`);
+    const d = await r.json();
+    return d.speech||null;
+  }catch(e){return null;}
+}
+
+function prefetchSpeech(name, cat){
+  if(BASEBALL_API_PORT===0) return;
+  fetch(`${API_BASE}/prefetch?name=${encodeURIComponent(name)}&cat=${encodeURIComponent(cat)}`).catch(()=>{});
+}
+
+async function setSpeechAPI(name, cat, action){
+  const speech = await fetchSpeech(name, cat, action);
+  if(speech) setSpeech(name, speech);
+}
+const CAT_SPEECHES={
+  hit:{"哲学者":["思索の結晶だ","問いかけが力を生む"],"科学者":["計算通りだ","法則は裏切らない"],"芸術家":["美しい放物線！","魂を込めた一打"],"武将":["天下を取る一打！","怯むな前へ"],"政治家":["歴史が動いた","民の力を示した"],"探検家":["未知の領域へ","地平線を越えよ"],"宗教家":["因縁の一打","悟りの境地"],"医学者":["精密な一打","治療完了"],"実業家":["投資は報われた","市場を制した"]},
+  out:{"哲学者":["この失敗も問いの種","次の問いへ"],"科学者":["仮説の修正が必要","次の実験に活かす"],"芸術家":["失敗もまた芸術","悲劇の美学"],"武将":["退くは恥ではない","次の戦に備えよ"],"政治家":["戦略の見直しだ","形勢逆転を図る"],"探検家":["道に迷っただけだ","冒険に失敗はつきもの"],"宗教家":["これも縁","受け入れよ"],"医学者":["症状の見落としだ","次こそ正確に"],"実業家":["損切りも戦略","失敗から学ぶ"]},
+  hr:{"哲学者":["これが真理だ！","永遠なる一打！"],"科学者":["計算を超えた！","宇宙の果てへ！"],"芸術家":["最高傑作！","天才の一閃！"],"武将":["天下統一！","歴史が変わった！"],"政治家":["革命的な一打！","歴史に刻まれる！"],"探検家":["前人未踏の一打！","新大陸発見！"],"宗教家":["悟りの境地！","奇跡が起きた！"],"医学者":["完璧な処方！","医学の奇跡！"],"実業家":["大相場！","歴史的大取引！"]}
+};
+function getSpeech(type,name,cat){
+  if(OLLAMA_SPEECHES[name]&&OLLAMA_SPEECHES[name][type]) return OLLAMA_SPEECHES[name][type];
+  const d=CAT_SPEECHES[type][cat]||CAT_SPEECHES[type]["政治家"];
+  return d[Math.floor(Math.random()*d.length)];
+}
+const BANK=[
+  {name:"ソクラテス",cat:"哲学者"},{name:"プラトン",cat:"哲学者"},{name:"アリストテレス",cat:"哲学者"},
+  {name:"カント",cat:"哲学者"},{name:"ニーチェ",cat:"哲学者"},{name:"デカルト",cat:"哲学者"},
+  {name:"ヘーゲル",cat:"哲学者"},{name:"スピノザ",cat:"哲学者"},{name:"ヒューム",cat:"哲学者"},
+  {name:"ニュートン",cat:"科学者"},{name:"ガリレオ",cat:"科学者"},{name:"ダーウィン",cat:"科学者"},
+  {name:"アインシュタイン",cat:"科学者"},{name:"キュリー夫人",cat:"科学者"},{name:"テスラ",cat:"科学者"},
+  {name:"エジソン",cat:"科学者"},{name:"ホーキング",cat:"科学者"},{name:"ファラデー",cat:"科学者"},
+  {name:"レオナルド・ダ・ヴィンチ",cat:"芸術家"},{name:"ミケランジェロ",cat:"芸術家"},{name:"ベートーヴェン",cat:"芸術家"},
+  {name:"モーツァルト",cat:"芸術家"},{name:"シェイクスピア",cat:"芸術家"},{name:"ゴッホ",cat:"芸術家"},
+  {name:"ピカソ",cat:"芸術家"},{name:"ダンテ",cat:"芸術家"},{name:"トルストイ",cat:"芸術家"},
+  {name:"アレクサンドロス大王",cat:"武将"},{name:"カエサル",cat:"武将"},{name:"ナポレオン",cat:"武将"},
+  {name:"チンギス・ハン",cat:"武将"},{name:"織田信長",cat:"武将"},{name:"豊臣秀吉",cat:"武将"},
+  {name:"徳川家康",cat:"武将"},{name:"武田信玄",cat:"武将"},{name:"上杉謙信",cat:"武将"},
+  {name:"リンカーン",cat:"政治家"},{name:"チャーチル",cat:"政治家"},{name:"ガンジー",cat:"政治家"},
+  {name:"マンデラ",cat:"政治家"},{name:"坂本龍馬",cat:"政治家"},{name:"西郷隆盛",cat:"政治家"},
+  {name:"コロンブス",cat:"探検家"},{name:"マゼラン",cat:"探検家"},{name:"アムンゼン",cat:"探検家"},
+  {name:"釈迦",cat:"宗教家"},{name:"孔子",cat:"宗教家"},{name:"空海",cat:"宗教家"},
+  {name:"野口英世",cat:"医学者"},{name:"ヒポクラテス",cat:"医学者"},{name:"北里柴三郎",cat:"医学者"},
+  {name:"フォード",cat:"実業家"},{name:"カーネギー",cat:"実業家"},{name:"ケインズ",cat:"実業家"},
+];
+const CAT_EMOJI={"哲学者":"🧠","科学者":"🔬","芸術家":"🎨","武将":"⚔️","政治家":"👑","探検家":"🧭","宗教家":"☯️","医学者":"🩺","実業家":"💰"};
+const CAT_STYLE={"哲学者":{ctrl:.8,power:.5,contact:.65,speed:.5},"科学者":{ctrl:.75,power:.6,contact:.62,speed:.55},"芸術家":{ctrl:.7,power:.45,contact:.72,speed:.65},"武将":{ctrl:.65,power:.85,contact:.6,speed:.7},"政治家":{ctrl:.72,power:.6,contact:.68,speed:.55},"探検家":{ctrl:.68,power:.7,contact:.65,speed:.85},"宗教家":{ctrl:.85,power:.4,contact:.6,speed:.45},"医学者":{ctrl:.78,power:.55,contact:.64,speed:.52},"実業家":{ctrl:.7,power:.75,contact:.63,speed:.6}};
+
+let G={},canvas,ctx,W,H;
+let mouse={x:0,y:0,down:false,startX:0,startY:0,startT:0,vx:0,vy:0};
+let ball={x:0,y:0,visible:false,trail:[]};
+let ballLandX=0,ballLandY=0;
+let ballPassedZone=false;
+let swingState={active:false,startX:0,maxVx:0};
+let phase='';
+let animFrame=null;
+let swingTimeout=null;
+
+function shuffle(a){const b=[...a];for(let i=b.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[b[i],b[j]]=[b[j],b[i]]}return b}
+function makeTeam(){return shuffle(BANK).slice(0,9).map((p,i)=>({...p,pos:['p','c','1b','2b','ss','3b','lf','cf','rf'][i],style:CAT_STYLE[p.cat]||CAT_STYLE["政治家"],atBats:0,hits:0,hrs:0}))}
+
+// ウォッチドッグ: 5秒以上phaseが止まったら強制リセット
+let _lastPhaseChange=0, _lastPhase='';
+setInterval(()=>{
+  if(typeof G==='undefined'||!G.home||G.gameOver)return;
+  if(phase===_lastPhase){
+    if(Date.now()-_lastPhaseChange>6000&&(phase==='animating'||phase==='result'||phase==='waiting')){
+      console.warn('watchdog: force reset from',phase);
+      setupPhase();
+    }
+  } else {
+    _lastPhase=phase;_lastPhaseChange=Date.now();
+  }
+},1000);
+
+function startGame(){
+  document.getElementById('title').style.display='none';
+  document.getElementById('game').style.display='flex';
+  G={home:makeTeam(),away:makeTeam(),homeScore:0,awayScore:0,inning:1,isTop:true,outs:0,balls:0,strikes:0,bases:[false,false,false],battIdx:{home:0,away:0},pitchIdx:{home:0,away:0},maxInnings:9,gameOver:false};
+  canvas=document.getElementById('field-canvas');
+  const wrap=document.getElementById('field-wrap');
+  W=canvas.width=wrap.offsetWidth;H=canvas.height=wrap.offsetHeight;
+  ctx=canvas.getContext('2d');
+  setupMouseEvents();
+  renderScoreboard();renderPlayers();
+  startAtBat();
+  requestAnimationFrame(loop);
+  startCrowd();
+}
+
+function setupMouseEvents(){
+  canvas.addEventListener('mousedown',e=>{
+    const r=canvas.getBoundingClientRect();
+    mouse.startX=e.clientX-r.left;mouse.startY=e.clientY-r.top;
+    mouse.startT=Date.now();mouse.down=true;mouse.vx=0;mouse.vy=0;
+    if(phase==='swing'){swingState.active=true;swingState.startX=mouse.startX;swingState.maxVx=0;}
+  });
+  canvas.addEventListener('mousemove',e=>{
+    const r=canvas.getBoundingClientRect();
+    const px=e.clientX-r.left,py=e.clientY-r.top;
+    mouse.vx=px-mouse.x;mouse.vy=py-mouse.y;
+    mouse.x=px;mouse.y=py;
+    if(phase==='swing'&&swingState.active){
+      if(Math.abs(mouse.vx)>Math.abs(swingState.maxVx))swingState.maxVx=mouse.vx;
+    }
+  });
+  canvas.addEventListener('mouseup',e=>{
+    const r=canvas.getBoundingClientRect();
+    const ex=e.clientX-r.left,ey=e.clientY-r.top;
+    const dx=ex-mouse.startX,dy=ey-mouse.startY;
+    mouse.down=false;
+    if(phase==='pitch'&&Math.sqrt(dx*dx+dy*dy)>20){executePitch(dx,dy);}
+    else if(phase==='swing'&&swingState.active){swingState.active=false;executeSwing();}
+  });
+  canvas.addEventListener('touchstart',e=>{e.preventDefault();const t=e.touches[0];canvas.dispatchEvent(new MouseEvent('mousedown',{clientX:t.clientX,clientY:t.clientY}))},{passive:false});
+  canvas.addEventListener('touchmove',e=>{e.preventDefault();const t=e.touches[0];canvas.dispatchEvent(new MouseEvent('mousemove',{clientX:t.clientX,clientY:t.clientY}))},{passive:false});
+  canvas.addEventListener('touchend',e=>{e.preventDefault();const t=e.changedTouches[0];canvas.dispatchEvent(new MouseEvent('mouseup',{clientX:t.clientX,clientY:t.clientY}))},{passive:false});
+}
+
+function loop(){if(G.gameOver)return;draw();animFrame=requestAnimationFrame(loop);}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  drawField();drawStrikeZone();drawFielders();drawBallTrail();drawBall();
+  if(phase==='pitch'&&mouse.down)drawPitchGuide();
+  if(phase==='swing')drawSwingGuide();
+}
+
+function getCX(){return W/2;}
+function getCY(){return H*0.62;}
+function getR(){return Math.min(W,H)*0.22;}
+
+function drawStrikeZone(){const cx=getCX(),cy=getCY(),r=getR();const szY1=cy+r*0.05,szY2=cy+r*0.55,szX=90;ctx.strokeStyle='rgba(255,255,0,0.35)';ctx.lineWidth=2;ctx.setLineDash([4,4]);ctx.strokeRect(cx-szX,szY1,szX*2,szY2-szY1);ctx.setLineDash([]);ctx.fillStyle='rgba(255,255,0,0.04)';ctx.fillRect(cx-szX,szY1,szX*2,szY2-szY1);}
+function drawField(){
+  // 外野
+  for(let i=0;i<8;i++){
+    ctx.fillStyle=i%2===0?'#1a4010':'#1e4a12';
+    ctx.fillRect(0,i*H/8,W,H/8);
+  }
+  const cx=getCX(),cy=getCY(),r=getR();
+  // 内野土
+  ctx.beginPath();
+  ctx.moveTo(cx,cy-r);ctx.lineTo(cx+r,cy);ctx.lineTo(cx,cy+r*.35);ctx.lineTo(cx-r,cy);
+  ctx.closePath();ctx.fillStyle='#8b5a2b';ctx.fill();
+  // ベースライン
+  ctx.strokeStyle='rgba(255,255,255,.25)';ctx.lineWidth=1;ctx.setLineDash([]);
+  ctx.beginPath();ctx.moveTo(cx,cy+r*.35);ctx.lineTo(cx-r,cy);ctx.moveTo(cx,cy+r*.35);ctx.lineTo(cx+r,cy);ctx.stroke();
+  // ベース
+  [[cx+r,cy,0],[cx,cy-r,1],[cx-r,cy,2]].forEach(([bx,by,i])=>{
+    ctx.save();ctx.translate(bx,by);ctx.rotate(Math.PI/4);
+    ctx.fillStyle=G.bases[i]?'#f0c040':'white';
+    if(G.bases[i]){ctx.shadowColor='#f0c040';ctx.shadowBlur=14;}
+    ctx.fillRect(-7,-7,14,14);ctx.restore();
+  });
+  // ホームベース
+  ctx.save();ctx.translate(cx,cy+r*.35);ctx.fillStyle='white';
+  ctx.beginPath();ctx.moveTo(0,-9);ctx.lineTo(9,-3);ctx.lineTo(9,5);ctx.lineTo(-9,5);ctx.lineTo(-9,-3);ctx.closePath();ctx.fill();ctx.restore();
+  // マウンド
+  ctx.beginPath();ctx.arc(cx,cy,12,0,Math.PI*2);
+  ctx.fillStyle='#9a6535';ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,.2)';ctx.lineWidth=1;ctx.stroke();
+  // バッターボックス
+  ctx.strokeStyle='rgba(255,255,255,.35)';ctx.lineWidth=1;
+  ctx.strokeRect(cx-36,cy+r*.35-18,18,30);ctx.strokeRect(cx+18,cy+r*.35-18,18,30);
+  // フェンス
+  ctx.beginPath();ctx.arc(cx,cy+r*.4,Math.min(W,H)*.46,Math.PI*1.08,Math.PI*1.92);
+  ctx.strokeStyle='rgba(200,160,48,.45)';ctx.lineWidth=5;ctx.stroke();
+}
+
+function getFielderPos(){
+  const cx=getCX(),cy=getCY(),r=getR();
+  return {p:{x:cx,y:cy},c:{x:cx,y:cy+r*.5},'1b':{x:cx+r*.85,y:cy+r*.05},'2b':{x:cx+r*.42,y:cy-r*.5},ss:{x:cx-r*.42,y:cy-r*.5},'3b':{x:cx-r*.85,y:cy+r*.05},lf:{x:cx-r*1.2,y:cy-r*.85},cf:{x:cx,y:cy-r*1.32},rf:{x:cx+r*1.2,y:cy-r*.85}};
+}
+
+function drawFielders(){
+  const defending=G.isTop?G.home:G.away;
+  const pos=getFielderPos();
+  const posKeys=['p','c','1b','2b','ss','3b','lf','cf','rf'];
+  posKeys.forEach((pk,i)=>{
+    const p=defending[i];if(!p)return;
+    const {x,y}=pos[pk];const isPit=pk==='p';
+    ctx.beginPath();ctx.arc(x,y,isPit?13:9,0,Math.PI*2);
+    ctx.fillStyle=isPit?'rgba(240,192,64,.3)':'rgba(200,160,48,.15)';ctx.fill();
+    ctx.strokeStyle=isPit?'rgba(240,192,64,.7)':'rgba(200,160,48,.3)';ctx.lineWidth=isPit?2:1;ctx.stroke();
+    ctx.fillStyle=isPit?'#f0c040':'#c8a878';
+    ctx.font=`${isPit?10:9}px Meiryo`;ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(p.name.slice(0,4),x,y);
+  });
+}
+
+function drawBallTrail(){
+  if(ball.trail.length<2)return;
+  for(let i=1;i<ball.trail.length;i++){
+    const t=i/ball.trail.length;
+    ctx.beginPath();ctx.moveTo(ball.trail[i-1].x,ball.trail[i-1].y);ctx.lineTo(ball.trail[i].x,ball.trail[i].y);
+    ctx.strokeStyle=`rgba(255,255,220,${t*.5})`;ctx.lineWidth=t*4;ctx.stroke();
+  }
+}
+
+function drawBall(){
+  if(!ball.visible)return;
+  const grad=ctx.createRadialGradient(ball.x-2,ball.y-2,1,ball.x,ball.y,8);
+  grad.addColorStop(0,'#fff');grad.addColorStop(.6,'#f0f0e8');grad.addColorStop(1,'#c8c0a8');
+  ctx.beginPath();ctx.arc(ball.x,ball.y,8,0,Math.PI*2);
+  ctx.fillStyle=grad;ctx.shadowColor='rgba(255,255,200,.7)';ctx.shadowBlur=12;ctx.fill();ctx.shadowBlur=0;
+  ctx.strokeStyle='rgba(200,60,60,.5)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.arc(ball.x+2,ball.y,4,-.5,.5);ctx.stroke();
+  ctx.beginPath();ctx.arc(ball.x-2,ball.y,4,Math.PI-.5,Math.PI+.5);ctx.stroke();
+}
+
+function drawPitchGuide(){
+  const cx=getCX(),cy=getCY();
+  const dx=mouse.x-mouse.startX,dy=mouse.y-mouse.startY;
+  const len=Math.sqrt(dx*dx+dy*dy);if(len<10)return;
+  const nx=dx/len,ny=dy/len;
+  ctx.setLineDash([6,4]);
+  ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(cx+nx*100,cy+ny*100);
+  ctx.strokeStyle='rgba(240,192,64,.5)';ctx.lineWidth=2;ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath();ctx.arc(cx+nx*100,cy+ny*100,7,0,Math.PI*2);
+  ctx.fillStyle='rgba(240,192,64,.6)';ctx.fill();
+}
+
+function drawSwingGuide(){
+  const cx=getCX(),cy=getCY(),r=getR();
+  const bx=cx+22,by=cy+r*.35;
+  const vx=swingState.maxVx;
+  const angle=Math.max(-.6,Math.min(.6,vx/60));
+  ctx.save();ctx.translate(bx,by);ctx.rotate(angle);
+  ctx.fillStyle='rgba(180,120,50,.85)';
+  ctx.fillRect(-3,-38,6,38);
+  ctx.beginPath();ctx.arc(0,-38,8,0,Math.PI*2);ctx.fill();
+  ctx.restore();
+  if(Math.abs(vx)>10){
+    ctx.fillStyle='rgba(240,192,64,.8)';ctx.font='12px Meiryo';ctx.textAlign='center';
+    ctx.fillText(Math.abs(vx)>35?'🔥フルスイング！':'スイング中...',cx,by-58);
+  }
+}
+
+// ストライクゾーン判定
+function isStrikeZone(x,y){
+  const cx=getCX(),cy=getCY(),r=getR();
+  const szY1=cy+r*0.18;
+  const szY2=cy+r*0.48;
+  const szX=55;
+  return y>szY1&&y<szY2&&x>cx-szX&&x<cx+szX;
+}
+
+function startAtBat(){
+  G.balls=0;G.strikes=0;ball.visible=false;ball.trail=[];
+  if(swingTimeout){clearTimeout(swingTimeout);swingTimeout=null;}
+  renderScoreboard();renderPlayers();
+  setSpeech('実況','両者対峙。歴史の重みが甲子園に漂う。');
+  const _pb=G.isTop?G.away[G.battIdx.away%9]:G.home[G.battIdx.home%9];
+  prefetchSpeech(_pb.name,_pb.cat);
+  setupPhase();
+}
+
+let _phaseWatchdog=null;
+function setupPhase(){
+  if(_phaseWatchdog){clearTimeout(_phaseWatchdog);_phaseWatchdog=null;}
+  const hint=document.getElementById('ui-hint');
+  if(G.isTop){
+    phase='pitch';
+    hint.textContent='ドラッグして投球（表：プレイヤー投手）';
+    // 15秒でフリーズ検知→強制リセット
+    _phaseWatchdog=setTimeout(()=>{if(phase==='pitch'){console.warn('watchdog: pitch reset');setupPhase();}},15000);
+  } else {
+    phase='auto';
+    hint.textContent='AI投球中...';
+    setTimeout(()=>aiPitch(),900);
+    _phaseWatchdog=setTimeout(()=>{if(phase==='auto'||phase==='animating'){console.warn('watchdog: auto reset');setupPhase();}},10000);
+  }
+}
+
+function executePitch(dx,dy){
+  if(phase!=='pitch')return;
+  phase='animating';
+  const cx=getCX(),cy=getCY(),r=getR();
+  const len=Math.sqrt(dx*dx+dy*dy);
+  let pitchType='速球';
+  if(len<50)pitchType='スロー';
+  else if(Math.abs(Math.atan2(dy,dx)*180/Math.PI)>110)pitchType='変化球';
+  const nx=dx/len,ny=dy/len;
+  const defending=G.isTop?G.home:G.away;
+  const pitcher=defending[G.pitchIdx.home%9];
+  const spread=(pitchType==='速球')?35:55;
+  // 着弾点をホームベース付近に固定（制球ブレあり）
+  const ctrl=pitcher.style.ctrl;
+  const jitter=(1-ctrl)*60;
+  // プレイヤーのドラッグ方向でコースが変わる（大きくズレるとボール）
+  const aimX=cx+dx*0.8+(Math.random()-.5)*jitter;
+  const aimY=cy+r*0.3+dy*0.3+(Math.random()-.5)*jitter*.5;
+  const tx=aimX;
+  const ty=aimY;
+  const kmh={'速球':Math.floor(145+Math.random()*12),'変化球':Math.floor(118+Math.random()*15),'スロー':Math.floor(95+Math.random()*15)};
+  const speed=kmh[pitchType]||130;
+  setSpeech(pitcher.name,`${pitchType} ${speed}km/h！`);
+  document.getElementById('ui-hint').textContent=pitchType+' '+speed+'km/h';
+  animateBall(cx,cy,tx,ty,pitchType,()=>{
+    // 表: AI打者が自動スイング判定
+    const aiStrike=isStrikeZone(tx,ty);
+    const aiSwing=Math.random()<(aiStrike?0.75:0.25);
+    const aiIsStrike=isStrikeZone(tx,ty);
+    setTimeout(()=>{
+      const batter=G.away[G.battIdx.away%9];
+      // ゾーン外なら必ずボール
+      if(!aiIsStrike){
+        phase="swing"; // lookAtBallのガードを通すため
+        lookAtBall(tx,ty);
+        return;
+      }
+      if(aiSwing){
+        const rv=Math.random();
+        let outcome;
+        if(aiStrike&&rv<batter.style.power*0.25)outcome='homerun';
+        else if(aiStrike&&rv<0.55)outcome='hit';
+        else outcome='out';
+        phase='result';
+        resolveAtBat(outcome,batter,tx,ty,aiStrike);
+      } else {
+        phase='swing'; // lookAtBallのガードを通すため
+        lookAtBall(tx,ty);
+      }
+    },600);
+  });
+}
+
+function aiPitch(){
+  if(phase!=='auto')return;
+  phase='animating';
+  const cx=getCX(),cy=getCY(),r=getR();
+  const types=['速球','変化球','スロー'];
+  const pitchType=types[Math.floor(Math.random()*types.length)];
+  // 60%ストライク、40%ボール球
+  const isStrikePitch=Math.random()<0.6;
+  const tx=isStrikePitch?cx+(Math.random()-.5)*90:cx+(Math.random()>.5?1:-1)*(80+Math.random()*80);
+  const ty=isStrikePitch?cy+r*.28+(Math.random()-.5)*25:cy+r*.1+(Math.random()-.5)*r*.5;
+  const defending=G.isTop?G.home:G.away;
+  const pitcher=defending[G.pitchIdx.away%9];
+  const kmh2={'速球':Math.floor(145+Math.random()*12),'変化球':Math.floor(118+Math.random()*15),'スロー':Math.floor(95+Math.random()*15)};
+  const speed2=kmh2[pitchType]||130;
+  setSpeech(pitcher.name,`${pitchType} ${speed2}km/h！`);
+  document.getElementById('ui-hint').textContent='AI: '+pitchType+' '+speed2+'km/h → スイング！';
+  animateBall(cx,cy,tx,ty,pitchType,()=>{
+    phase='swing';
+    document.getElementById('ui-hint').textContent='マウスを横に素早く動かしてスイング！（見送りで自動判定）';
+    swingState={active:false,startX:0,maxVx:0};
+    swingTimeout=setTimeout(()=>{if(phase==='swing')lookAtBall(tx,ty);},4500);
+  });
+}
+
+function animateBall(sx,sy,tx,ty,pitchType,cb){
+  ball.x=sx;ball.y=sy;ball.visible=true;ball.trail=[];ballPassedZone=false;
+  const frames=pitchType==='速球'?22:pitchType==='変化球'?28:35;
+  const curve=pitchType==='変化球'?(Math.random()-.5)*70:0;
+  let f=0;
+  function step(){
+    f++;const t=f/frames;
+    const ease=t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+    ball.x=sx+(tx-sx)*ease+curve*Math.sin(t*Math.PI);
+    ball.y=sy+(ty-sy)*ease-70*Math.sin(t*Math.PI)*(1-t*.3);
+    ball.trail.push({x:ball.x,y:ball.y});
+    if(ball.trail.length>14)ball.trail.shift();
+    if(f<frames)setTimeout(step,16);else{ballLandX=ball.x;ballLandY=ball.y;cb&&cb();}
+  }
+  step();
+}
+
+function executeSwing(){
+  if(phase!=='swing')return;
+  // 表はAI打者なのでプレイヤースイング不可
+  if(G.isTop)return;
+  if(swingTimeout){clearTimeout(swingTimeout);swingTimeout=null;}
+  const vx=swingState.maxVx;
+  const tx=ballLandX||ball.x,ty=ballLandY||ball.y;
+  const attacking=G.isTop?G.away:G.home;
+  const batter=attacking[G.isTop?G.battIdx.away%9:G.battIdx.home%9];
+  const isStrike=isStrikeZone(ballLandX,ballLandY);
+  const spd=Math.abs(vx);
+  let outcome;
+  const rv=Math.random();
+  if(!isStrike){
+    // ゾーン外スイング: 空振りボール扱い
+    outcome='miss_ball';
+  } else if(spd<4){
+    // ゾーン内だがスイングなし/弱い: 空振りストライク
+    outcome='miss';
+  } else if(spd>20){
+    // フルスイング×ストライク: ホームランチャンス
+    outcome=rv<batter.style.power*.55?'homerun':rv<.78?'hit':'out';
+  } else if(spd>10){
+    outcome=rv<.55?'hit':'out';
+  } else {
+    outcome=rv<.4?'hit':'out';
+  }
+  resolveAtBat(outcome,batter,tx,ty,isStrike);
+}
+
+function lookAtBall(tx,ty){
+  if(phase!=='swing')return;
+  phase='waiting';
+  const isStrike=isStrikeZone(ballLandX,ballLandY);
+  const attacking=G.isTop?G.away:G.home;
+  const batter=attacking[G.isTop?G.battIdx.away%9:G.battIdx.home%9];
+  if(isStrike){
+    G.strikes++;setSpeech('審判','ストライク！');
+    if(G.strikes>=3){addLog('⚡ '+batter.name+'が三振','lo');showFlash('三振！','#ff6666');batter.atBats++;setTimeout(()=>addOut(),700);}
+    else{renderScoreboard();setTimeout(()=>setupPhase(),900);}
+  } else {
+    G.balls++;setSpeech('審判','ボール！');
+    if(G.balls>=4){addLog('🟢 '+batter.name+'が四球','lw');showFlash('四球','#44bb66');advanceBases(1,false);setTimeout(()=>nextBatter(),1100);}
+    else{renderScoreboard();setTimeout(()=>setupPhase(),900);}
+  }
+}
+
+function resolveAtBat(outcome,batter,tx,ty,isStrike){
+  phase='result';
+  if(swingTimeout){clearTimeout(swingTimeout);swingTimeout=null;}
+  if(outcome==='miss_ball'){
+    // ゾーン外スイング = ボール
+    G.balls++;setSpeech('審判','ボール！');
+    if(G.balls>=4){addLog('🟢 '+batter.name+'が四球','lw');showFlash('四球','#44bb66');advanceBases(1,false);setTimeout(()=>nextBatter(),1100);}
+    else{renderScoreboard();setTimeout(()=>setupPhase(),900);}
+    return;
+  }
+  if(outcome==='miss'){
+    if(isStrike){
+      G.strikes++;setSpeech('審判','ストライク！空振り！');
+      if(G.strikes>=3){addLog('⚡ '+batter.name+'が三振','lo');showFlash('三振！','#ff6666');batter.atBats++;setTimeout(()=>addOut(),700);}
+      else{renderScoreboard();setTimeout(()=>{if(_phaseWatchdog){clearTimeout(_phaseWatchdog);_phaseWatchdog=null;}setupPhase();},900);}
+    } else {
+      G.balls++;setSpeech('審判','ボール！');
+      if(G.balls>=4){addLog('🟢 '+batter.name+'が四球','lw');showFlash('四球','#44bb66');advanceBases(1,false);setTimeout(()=>nextBatter(),1100);}
+      else{renderScoreboard();setTimeout(()=>setupPhase(),900);}
+    }
+    return;
+  }
+  batter.atBats++;
+  if(outcome==='homerun'){
+    batter.hits++;batter.hrs++;
+    const runs=1+G.bases.filter(Boolean).length;
+    scoreRuns(runs);G.bases=[false,false,false];
+    setSpeech(batter.name,getSpeech('hr',batter.name,batter.cat));
+    addLog('💥 '+batter.name+'が'+(runs===4?'満塁':'')+'HR！'+runs+'点！','lhr');
+    showFlash(runs===4?'満塁HR！🔥':'ホームラン！','#ff4400');
+    animBallHR(tx,ty);
+    setSpeechAPI(batter.name,batter.cat,'homerun');
+    setTimeout(()=>{renderScoreboard();nextBatter();},1800);
+  } else if(outcome==='hit'){
+    batter.hits++;
+    const runs=advanceBases(1,true);
+    setSpeech(batter.name,getSpeech('hit',batter.name,batter.cat));
+    addLog('✅ '+batter.name+'がヒット！'+(runs>0?runs+'点！':''),'lh');
+    showFlash('ヒット！','#f0c040');
+    animBallGrounder(tx,ty);
+    setSpeechAPI(batter.name,batter.cat,'hit');
+    setTimeout(()=>{renderScoreboard();nextBatter();},1300);
+  } else {
+    setSpeechAPI(batter.name,batter.cat,'out');
+    const outTypes=['フライ','ライナー','ゴロ','ファウルフライ'];
+    const outType=outTypes[Math.floor(Math.random()*outTypes.length)];
+    if(outType==='フライ'||outType==='ファウルフライ'){
+      animBallFly(tx,ty,outType==='ファウルフライ');
+    } else if(outType==='ライナー'){
+      animBallLiner(tx,ty);
+    } else {
+      animBallGrounder(tx,ty);
+    }
+    if(G.bases[0]&&G.outs<2&&Math.random()<0.5&&outType==='ゴロ'){
+      G.bases[0]=false;
+      addLog('⚡ '+batter.name+'でゲッツー！','lo');
+      showFlash('ゲッツー！','#ff4444');
+      setSpeechAPI(batter.name,batter.cat,'gidp');
+      setTimeout(()=>{addOut();setTimeout(()=>addOut(),200);},600);
+    } else {
+      addLog('❌ '+batter.name+'が'+outType+'アウト','lo');
+      showFlash(outType+'アウト','#ff6666');
+      setTimeout(()=>addOut(),800);
+    }
+  }
+}
+
+function animBallFly(sx,sy,isFoul){
+  // フライ: 高く上がって落ちる
+  const cx=getCX(),cy=getCY(),r=getR();
+  const peakX=sx+(isFoul?(Math.random()-.5)*200:( Math.random()-.5)*100);
+  const peakY=sy-H*0.35;
+  const landX=isFoul?cx+(Math.random()>.5?1:-1)*(r*1.2+Math.random()*80):cx+(Math.random()-.5)*r*1.5;
+  const landY=isFoul?cy+r*.4:cy-r*.5;
+  let f=0;const frames=45;
+  ball.visible=true;ball.trail=[];
+  function s(){
+    f++;const t=f/frames;
+    if(t<0.5){
+      const t2=t*2;
+      ball.x=sx+(peakX-sx)*t2;
+      ball.y=sy+(peakY-sy)*t2;
+    } else {
+      const t2=(t-0.5)*2;
+      ball.x=peakX+(landX-peakX)*t2;
+      ball.y=peakY+(landY-peakY)*t2;
+    }
+    ball.trail.push({x:ball.x,y:ball.y});
+    if(ball.trail.length>18)ball.trail.shift();
+    if(f<frames)setTimeout(s,16);else ball.visible=false;
+  }
+  s();
+}
+
+function animBallLiner(sx,sy){
+  // ライナー: 低く速く直線的
+  const cx=getCX(),cy=getCY(),r=getR();
+  const dirs=['lf','cf','rf'];
+  const dir=dirs[Math.floor(Math.random()*dirs.length)];
+  const pos=getFielderPos();
+  const fp=pos[dir];
+  let f=0;const frames=20;
+  ball.visible=true;ball.trail=[];
+  function s(){
+    f++;const t=f/frames;
+    ball.x=sx+(fp.x-sx)*t;
+    ball.y=sy+(fp.y-sy)*t - 15*Math.sin(t*Math.PI);
+    ball.trail.push({x:ball.x,y:ball.y});
+    if(ball.trail.length>10)ball.trail.shift();
+    if(f<frames)setTimeout(s,16);else ball.visible=false;
+  }
+  s();
+}
+
+function animBallHR(sx,sy){
+  let f=0;
+  function s(){f++;ball.x=sx+f*5;ball.y=sy-f*7;ball.trail.push({x:ball.x,y:ball.y});if(ball.trail.length>20)ball.trail.shift();if(ball.y>-60&&f<60)setTimeout(s,16);else ball.visible=false;}
+  s();
+}
+function animBallGrounder(sx,sy){
+  const cx=getCX(),cy=getCY();let f=0;
+  function s(){f++;ball.x=sx+(cx-sx)*f/25;ball.y=sy+(cy-sy)*f/25+f*2;ball.trail.push({x:ball.x,y:ball.y});if(ball.trail.length>10)ball.trail.shift();if(f<25)setTimeout(s,16);else ball.visible=false;}
+  s();
+}
+
+function advanceBases(adv,includeBatter){
+  let runs=0;const nb=[false,false,false];
+  for(let i=2;i>=0;i--){if(G.bases[i]){const np=i+adv;if(np>=3)runs++;else nb[np]=true;}}
+  if(includeBatter){const bp=adv-1;if(bp<3)nb[bp]=true;}
+  G.bases=nb;scoreRuns(runs);return runs;
+}
+function scoreRuns(runs){if(runs<=0)return;if(G.isTop)G.awayScore+=runs;else G.homeScore+=runs;}
+
+function addOut(){
+  G.outs++;G.balls=0;G.strikes=0;renderScoreboard();
+  if(G.outs>=3)setTimeout(()=>endHalf(),1000);
+  else setTimeout(()=>nextBatter(),700);
+}
+function nextBatter(){
+  G.balls=0;G.strikes=0;ball.visible=false;ball.trail=[];
+  if(G.isTop)G.battIdx.away=(G.battIdx.away+1)%9;
+  else G.battIdx.home=(G.battIdx.home+1)%9;
+  if(G.outs<3&&!G.gameOver)setTimeout(()=>startAtBat(),600);
+}
+function endHalf(){
+  G.outs=0;G.bases=[false,false,false];G.balls=0;G.strikes=0;
+  addLog('--- '+G.inning+'回'+(G.isTop?'表':'裏')+' 終了 ---','ls');
+  if(!G.isTop){if(G.inning>=G.maxInnings){endGame();return;}G.inning++;}
+  G.isTop=!G.isTop;
+  if(G.inning%3===0){G.pitchIdx.home=(G.pitchIdx.home+1)%9;G.pitchIdx.away=(G.pitchIdx.away+1)%9;}
+  addLog('--- '+G.inning+'回'+(G.isTop?'表':'裏')+'開始 ---','ls');
+  renderScoreboard();setTimeout(()=>startAtBat(),700);
+}
+function endGame(){
+  G.gameOver=true;cancelAnimationFrame(animFrame);
+  document.getElementById('result').style.display='flex';
+  const hw=G.homeScore>G.awayScore,draw=G.homeScore===G.awayScore;
+  document.getElementById('r-title').textContent=draw?'引き分け':'試合終了';
+  document.getElementById('r-score').textContent=G.awayScore+' — '+G.homeScore;
+  document.getElementById('r-winner').textContent=draw?'引き分け':(hw?G.home[0].cat+'軍の勝利！':G.away[0].cat+'軍の勝利！');
+}
+
+function renderScoreboard(){
+  document.getElementById('away-nm').textContent=G.away[0].cat+'軍';
+  document.getElementById('home-nm').textContent=G.home[0].cat+'軍';
+  document.getElementById('away-sc').textContent=G.awayScore;
+  document.getElementById('home-sc').textContent=G.homeScore;
+  document.getElementById('inn-n').textContent=G.inning;
+  document.getElementById('inn-h').textContent=G.isTop?'表':'裏';
+  document.getElementById('out-lbl').textContent=G.outs+'アウト';
+  updateDots('db',G.balls,3);updateDots('ds',G.strikes,2);updateDots('do',G.outs,2);
+  [1,2,3].forEach(i=>{const el=document.getElementById('md'+i);if(el)el.classList.toggle('on',G.bases[i-1]);});
+}
+function updateDots(id,count){document.getElementById(id).querySelectorAll('.dot').forEach((d,i)=>d.classList.toggle('on',i<count));}
+function renderPlayers(){
+  const attacking=G.isTop?G.away:G.home;
+  const defending=G.isTop?G.home:G.away;
+  const batter=attacking[G.isTop?G.battIdx.away%9:G.battIdx.home%9];
+  const pitcher=defending[G.isTop?G.pitchIdx.home%9:G.pitchIdx.away%9];
+  document.getElementById('pe-p').textContent=CAT_EMOJI[pitcher.cat]||'⚾';
+  document.getElementById('pn-p').textContent=pitcher.name;
+  document.getElementById('pc-p').textContent=pitcher.cat;
+  document.getElementById('ps-p').textContent='制球'+Math.round(pitcher.style.ctrl*100)+'%';
+  document.getElementById('pe-b').textContent=CAT_EMOJI[batter.cat]||'🏏';
+  document.getElementById('pn-b').textContent=batter.name;
+  document.getElementById('pc-b').textContent=batter.cat;
+  document.getElementById('ps-b').textContent=batter.atBats>0?'打率'+(batter.hits/batter.atBats).toFixed(3).replace('0.','.') :'打率 ---';
+}
+const CROWD_CHEERS=[
+  '行けー！','ホームラン！','ナイスボール！','ストライク！','頑張れー！',
+  'ここで打てー！','いいぞいいぞ！','ファイトー！','三振取れー！','打てるか！',
+  '見てろよー','熱い試合だ','最高だ！','すごい！','信じろ！','諦めるな！',
+];
+let _crowdInterval=null;
+function startCrowd(){
+  if(_crowdInterval)clearInterval(_crowdInterval);
+  _crowdInterval=setInterval(()=>{
+    if(G.gameOver)return;
+    const cheer=CROWD_CHEERS[Math.floor(Math.random()*CROWD_CHEERS.length)];
+    showCrowdBubble(cheer);
+  },3000+Math.random()*4000);
+}
+function showCrowdBubble(text){
+  const el=document.createElement('div');
+  el.style.cssText='position:fixed;font-size:12px;color:rgba(240,192,64,.7);pointer-events:none;z-index:100;animation:crowdFade 2.5s ease-out forwards;';
+  el.style.left=Math.random()*80+10+'%';
+  el.style.top=Math.random()*30+60+'%';
+  el.textContent='「'+text+'」';
+  document.body.appendChild(el);
+  setTimeout(()=>el.remove(),2500);
+}
+// スタイル追加
+const _crowdStyle=document.createElement('style');
+_crowdStyle.textContent='@keyframes crowdFade{0%{opacity:0;transform:translateY(0)}20%{opacity:1}100%{opacity:0;transform:translateY(-40px)}}';
+document.head.appendChild(_crowdStyle);
+
+function setSpeech(name,text){document.getElementById('sp-nm').textContent='— '+name+' —';document.getElementById('sp-tx').textContent=text;}
+function addLog(text,cls=''){const el=document.getElementById('log');const d=document.createElement('div');if(cls)d.className=cls;d.textContent=text;el.appendChild(d);el.scrollTop=el.scrollHeight;}
+function showFlash(text,color){const el=document.getElementById('flash');el.textContent=text;el.style.color=color;el.style.textShadow='0 0 40px '+color;el.style.display='block';el.style.animation='none';el.offsetHeight;el.style.animation='fa 1.3s ease-out forwards';setTimeout(()=>el.style.display='none',1400);}
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+ollama
+chromadb
+python-dotenv
+MIDIUtil
+yt-dlp
+requests
+numpy
+rich

@@ -112,14 +112,14 @@ USER_NAME     = "先輩"
 OBSERVED_SUBJECT_NAME = USER_NAME
 STATE_FILE    = "s01_state.json"
 POWER_MODE    = "mid"
-TEMP_FACT     = 0.05
+TEMP_FACT     = 0.05           # 事実確認モード温度 (get_llm_opt is_logic=True 時に使用予定)
 TEMP_VOICE    = 0.72
 TEMP_HISTORY: list[float] = [0.72]
 FACT_MIN_CHARS = 20
 
 # ★[v129] Thinking Mode設定
 THINKING_MODE = False          # True: chain-of-thought強制 (/think で切替)
-THINKING_BUDGET = 1024        # thinking用トークン予算
+THINKING_BUDGET = 1024        # thinking用トークン予算 (handle_think_mode が参照)
 
 # ★[v129] TokenBudget — 動的ctx管理
 TOKEN_BUDGET_SAFETY = 128     # 安全マージン(tok)
@@ -132,8 +132,8 @@ TEMP_MAP: dict[str, float] = {
     "/r": 0.85, "/d": 0.62, "/think": 0.20, "/plan": 0.35,
     "/code": 0.15, "/reflect": 0.50,
 }
-MAX_RETRIES   = 0
-RETRY_DELAY   = 0.6
+MAX_RETRIES   = 0              # ★ 現在未使用: stream_responseはリトライなし設計
+RETRY_DELAY   = 0.6            # ★ 現在未使用: 上記と同じ理由
 
 # ★[v129] ThreadPoolExecutor — 非同期RAG・ツール並列実行
 _THREAD_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="s01")
@@ -623,19 +623,32 @@ def apply_user_directive(user_text: str, persona_name: str = "") -> list[str]:
     return applied
 
 def inject_optimizations(_mode: str = "", persona_name: str = "") -> str:
+    """★[修正/reference] グローバルAI技術ディレクティブ + ペルソナ指摘を両方注入する。
+    /reference はglobalバケツに書くため、persona専用バケツと両方をマージする。"""
     if not PROMPT_OPTIMIZATIONS: return ""
-    bucket = _get_persona_bucket(persona_name or "global")
-    if not bucket: return ""
     parts = []
-    # ユーザー直接指摘（禁止表現・指定表現）を先頭・全件展開（上限5件なので安全）
-    for cat in ("禁止表現", "指定表現"):
-        for d in bucket.get(cat, []):
-            parts.append(f"【ユーザー指摘・厳守】{d}")
-    # 自動最適化指示は最新2件のみ
-    for cat, directives in bucket.items():
-        if cat in ("禁止表現", "指定表現"): continue
-        for d in directives[-2:]:
-            parts.append(f"【{cat}改善】{d}")
+
+    def _extract_bucket(bucket: dict, label_prefix: str):
+        # ユーザー直接指摘（禁止表現・指定表現）を先頭・全件展開
+        for cat in ("禁止表現", "指定表現"):
+            for d in bucket.get(cat, []):
+                parts.append(f"【ユーザー指摘・厳守】{d}")
+        # AI技術系ディレクティブ: カテゴリ別に最新2件
+        for cat, directives in bucket.items():
+            if cat in ("禁止表現", "指定表現"): continue
+            for d in directives[-2:]:
+                parts.append(f"【{label_prefix}{cat}改善】{d}")
+
+    # 1) globalバケツ (主に /reference が書き込む)
+    global_bucket = _get_persona_bucket("global")
+    _extract_bucket(global_bucket, "AI技術/")
+
+    # 2) ペルソナ固有バケツ (apply_user_directive が書き込む)
+    if persona_name and persona_name != "global":
+        persona_bucket = _get_persona_bucket(persona_name)
+        if persona_bucket:
+            _extract_bucket(persona_bucket, "")
+
     return "\n" + "\n".join(parts) if parts else ""
 
 def auto_optimize_prompts() -> list[str]:
@@ -2415,32 +2428,35 @@ def _fetch_ddg_snippets(query: str) -> str:
     except Exception:
         return ""
 
-def _fetch_nhk_snippets(query: str) -> str:
+# ★[統合] 同一パターンの3関数を汎用ヘルパーで置換
+def _fetch_simple_snippets(url: str, pattern: str, label: str, min_len: int = 20) -> str:
+    """汎用スニペット取得: URL・正規表現・ラベルを指定するだけで動作。
+    旧: _fetch_nhk_snippets / _fetch_kotobank / _fetch_stackoverflow_snippets"""
     if OFFLINE_MODE: return ""
     try:
-        url = f"https://www3.nhk.or.jp/news/search/?keyword={U.quote(query)}"
         h = fetch_html(url, timeout=4, silent=True, spoof_bot=True)
-        snips = re.findall(r'<p class="text--M"[^>]*>(.*?)</p>', h, re.I | re.S)
-        return "\n".join(f"[NEWS] {strip_tags(s)}" for s in snips[:3] if len(strip_tags(s)) > 20)
+        snips = re.findall(pattern, h, re.I | re.S)
+        return "\n".join(f"[{label}] {strip_tags(s)}" for s in snips[:3] if len(strip_tags(s)) > min_len)
     except Exception: return ""
+
+def _fetch_nhk_snippets(query: str) -> str:
+    return _fetch_simple_snippets(
+        f"https://www3.nhk.or.jp/news/search/?keyword={U.quote(query)}",
+        r'<p class="text--M"[^>]*>(.*?)</p>', "NEWS")
 
 def _fetch_kotobank(query: str) -> str:
-    if OFFLINE_MODE: return ""
-    try:
-        url = f"https://kotobank.jp/gs/?q={U.quote(query)}"
-        h = fetch_html(url, timeout=4, silent=True, spoof_bot=True)
-        snips = re.findall(r'<div[^>]+class="[^"]*description[^"]*"[^>]*>(.*?)</div>', h, re.I | re.S)
-        return "\n".join(f"[コトバンク] {strip_tags(s)}" for s in snips[:3] if len(strip_tags(s)) > 20)
-    except Exception: return ""
+    return _fetch_simple_snippets(
+        f"https://kotobank.jp/gs/?q={U.quote(query)}",
+        r'<div[^>]+class="[^"]*description[^"]*"[^>]*>(.*?)</div>', "コトバンク")
 
 def _fetch_stackoverflow_snippets(query: str) -> str:
-    if OFFLINE_MODE: return ""
-    try:
-        url = f"https://api.stackexchange.com/2.3/search?order=desc&sort=relevance&intitle={U.quote(query)}&site=stackoverflow&pagesize=3"
-        h = fetch_html(url, timeout=4, silent=True, spoof_bot=True)
-        items = re.findall(r'"title":\s*"([^"]+)"', h)
-        return "\n".join(f"[Stack Overflow] {s}" for s in items[:3] if len(s) > 10)
-    except Exception: return ""
+    return _fetch_simple_snippets(
+        f"https://api.stackexchange.com/2.3/search?order=desc&sort=relevance&intitle={U.quote(query)}&site=stackoverflow&pagesize=3",
+        r'"title":\s*"([^"]+)"', "Stack Overflow", min_len=10)
+
+
+
+
 
 def get_async_rag_data(query: str) -> str:
     """
@@ -7466,14 +7482,17 @@ class ShogiEngine:
             target = self.board[tr][tc]
             if target and target[0] == color: continue  # 味方駒
             can_promote = ptype in self.PROMOTE_MAP
-            in_zone_from = self._promote_zone(color, r)
-            in_zone_to   = self._promote_zone(color, tr)
-            must = can_promote and self._must_promote(color, ptype, tr)
-            if must:
-                moves.append((tr, tc, True))
-            elif can_promote and (in_zone_from or in_zone_to):
-                moves.append((tr, tc, True))   # 成り
-                moves.append((tr, tc, False))  # 不成
+            if can_promote:
+                in_zone_from = self._promote_zone(color, r)
+                in_zone_to   = self._promote_zone(color, tr)
+                must = self._must_promote(color, ptype, tr)
+                if must:
+                    moves.append((tr, tc, True))
+                elif in_zone_from or in_zone_to:
+                    moves.append((tr, tc, True))
+                    moves.append((tr, tc, False))
+                else:
+                    moves.append((tr, tc, False))
             else:
                 moves.append((tr, tc, False))
         return moves
@@ -7487,17 +7506,81 @@ class ShogiEngine:
         return None
 
     def in_check(self, color: str) -> bool:
+        """王手判定: 敵の利きに王がいるか (高速版: 王位置から逆算)"""
         kpos = self._find_king(color)
         if kpos is None: return True
         kr, kc = kpos
         enemy = self._enemy(color)
-        for r in range(9):
-            for c in range(9):
-                cell = self.board[r][c]
-                if not cell or cell[0] != enemy: continue
-                _, ptype = cell
-                for tr, tc in self._piece_moves_raw(enemy, ptype, r, c):
-                    if (tr, tc) == (kr, kc): return True
+        s = (enemy == self.SENTE)
+        # 歩
+        dr_fu = -1 if s else 1
+        r2, c2 = kr + dr_fu, kc
+        if self._on_board(r2, c2):
+            cell = self.board[r2][c2]
+            if cell and cell[0] == enemy and cell[1] == "FU": return True
+        # 桂
+        drs_ke = [(-2,-1),(-2,1)] if s else [(2,-1),(2,1)]
+        for dr, dc in drs_ke:
+            r2, c2 = kr+dr, kc+dc
+            if self._on_board(r2, c2):
+                cell = self.board[r2][c2]
+                if cell and cell[0] == enemy and cell[1] == "KE": return True
+        # 香 (スライド)
+        dr_ky = -1 if s else 1
+        r2, c2 = kr+dr_ky, kc
+        while self._on_board(r2, c2):
+            cell = self.board[r2][c2]
+            if cell:
+                if cell[0] == enemy and cell[1] == "KY": return True
+                break
+            r2 += dr_ky
+        # 飛・龍 (縦横スライド)
+        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+            r2, c2 = kr+dr, kc+dc
+            while self._on_board(r2, c2):
+                cell = self.board[r2][c2]
+                if cell:
+                    if cell[0] == enemy and cell[1] in ("HI","+HI"): return True
+                    break
+                r2 += dr; c2 += dc
+        # 角・馬 (斜めスライド)
+        for dr, dc in [(-1,-1),(-1,1),(1,-1),(1,1)]:
+            r2, c2 = kr+dr, kc+dc
+            while self._on_board(r2, c2):
+                cell = self.board[r2][c2]
+                if cell:
+                    if cell[0] == enemy and cell[1] in ("KA","+KA"): return True
+                    break
+                r2 += dr; c2 += dc
+        # 龍の1マス斜め, 馬の1マス縦横
+        for dr, dc in [(-1,-1),(-1,1),(1,-1),(1,1)]:
+            r2, c2 = kr+dr, kc+dc
+            if self._on_board(r2, c2):
+                cell = self.board[r2][c2]
+                if cell and cell[0] == enemy and cell[1] == "+HI": return True
+        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+            r2, c2 = kr+dr, kc+dc
+            if self._on_board(r2, c2):
+                cell = self.board[r2][c2]
+                if cell and cell[0] == enemy and cell[1] == "+KA": return True
+        # 銀・金・成り駒・王 (1マス)
+        gold_dirs = self._GOLD_DIRS_S if s else self._GOLD_DIRS_G
+        silver_dirs = [(1,-1),(1,0),(1,1),(-1,-1),(-1,1)] if s else [(-1,-1),(-1,0),(-1,1),(1,-1),(1,1)]
+        for dr, dc in gold_dirs:
+            r2, c2 = kr+dr, kc+dc
+            if self._on_board(r2, c2):
+                cell = self.board[r2][c2]
+                if cell and cell[0] == enemy and cell[1] in ("KI","+FU","+KY","+KE","+GI"): return True
+        for dr, dc in silver_dirs:
+            r2, c2 = kr+dr, kc+dc
+            if self._on_board(r2, c2):
+                cell = self.board[r2][c2]
+                if cell and cell[0] == enemy and cell[1] == "GI": return True
+        for dr, dc in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]:
+            r2, c2 = kr+dr, kc+dc
+            if self._on_board(r2, c2):
+                cell = self.board[r2][c2]
+                if cell and cell[0] == enemy and cell[1] == "OU": return True
         return False
 
     def _apply_temp(self, fr, fc, tr, tc, promote: bool, drop_ptype: str | None = None) -> dict:
@@ -7585,13 +7668,16 @@ class ShogiEngine:
         self._undo_temp(saved)
         return is_zume
 
-    def move(self, fr, fc, tr, tc, promote: bool = False, drop_ptype: str | None = None) -> tuple[bool, str]:
-        """手を実行。(True, 棋譜) or (False, エラー)"""
+    def move(self, fr, fc, tr, tc, promote: bool = False, drop_ptype: str | None = None,
+             _skip_legal_check: bool = False) -> tuple[bool, str]:
+        """手を実行。(True, 棋譜) or (False, エラー)
+        _skip_legal_check=True: 呼び出し元がlegal_movesで検証済みの場合に再計算を省略。"""
         if self.game_over:
             return False, "ゲームは終了しています"
-        legal = self.legal_moves(self.turn)
-        if (fr, fc, tr, tc, promote, drop_ptype) not in legal:
-            return False, "その手は合法ではありません"
+        if not _skip_legal_check:
+            legal = self.legal_moves(self.turn)
+            if (fr, fc, tr, tc, promote, drop_ptype) not in legal:
+                return False, "その手は合法ではありません"
 
         # 実行
         if drop_ptype:
@@ -7729,8 +7815,14 @@ class ShogiAI:
     def _minimax(self, g: "ShogiEngine", depth: int, alpha: int, beta: int, maximizing: bool) -> int:
         if depth == 0 or g.game_over: return self.evaluate(g)
 
-        # ★[v129] Transposition Table
-        bh = hash((str([[str(c) for c in row] for row in g.board]), g.turn, depth))
+        # ★ TTハッシュを軽量化: str()変換を廃止してtuple化
+        bh = hash((
+            tuple(tuple(cell if cell is None else (cell[0], cell[1])
+                         for cell in row) for row in g.board),
+            g.turn, depth,
+            tuple(sorted(g.hands[ShogiEngine.SENTE].items())),
+            tuple(sorted(g.hands[ShogiEngine.GOTE].items())),
+        ))
         if bh in self._tt: return self._tt[bh]
 
         color = ShogiEngine.SENTE if maximizing else ShogiEngine.GOTE
@@ -8038,21 +8130,20 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
             if fr is not None: last_sqs.add((fr, fc))
             last_sqs.add((tr, tc))
 
+        # ★ legal_moves_cache は _refresh_legal() で選択駒専用にフィルタ済みなので
+        #   mv[0]==selected[0] の二重チェックは不要（チェック漏れの原因だった）
         legal_tgts = set()
         if isinstance(selected, tuple) and len(selected) == 2:
             for mv in legal_moves_cache:
-                _, _, tr, tc, _, _ = mv
-                if mv[0] == selected[0] and mv[1] == selected[1]:
-                    legal_tgts.add((tr, tc))
+                legal_tgts.add((mv[2], mv[3]))
         elif isinstance(selected, tuple) and len(selected) == 3 and selected[0] == "hand":
             for mv in legal_moves_cache:
-                _, _, tr, tc, _, drop = mv
-                if drop == selected[2]:
-                    legal_tgts.add((tr, tc))
+                legal_tgts.add((mv[2], mv[3]))
 
         king_r, king_c = None, None
         kpos = g._find_king(g.turn)
         in_chk = g.in_check(g.turn)
+        g._cached_in_check = in_chk   # ★ _draw_title で再利用
         if kpos: king_r, king_c = kpos
 
         for r in range(9):
@@ -8228,7 +8319,8 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
 
     def _draw_title():
         turn_str = "☗先手" if g.turn == ShogiEngine.SENTE else "☖後手"
-        chk_str = " 【王手！】" if g.in_check(g.turn) else ""
+        # ★ _draw_board で計算済みの結果を使う (in_check の二重呼び出し回避)
+        chk_str = " 【王手！】" if getattr(g, "_cached_in_check", False) else ""
         ai_str = f"  [AI:{_diff_labels.get(ai.difficulty,'')}]" if ai else ""
         move_n = len(g.move_history)
         title = f"  将棋{ai_str}  {turn_str}の番{chk_str}   {move_n}手目  "
@@ -8262,6 +8354,7 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
             pass
 
     def _redraw():
+        # ★ noutrefresh+doupdate でちらつき排除
         stdscr.erase()
         _draw_title()
         _draw_board()
@@ -8269,7 +8362,8 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
         _draw_panel()
         _draw_status(status_msg, status_warn)
         _draw_telop()
-        stdscr.refresh()
+        stdscr.noutrefresh()
+        curses.doupdate()
 
     def _refresh_legal(sel):
         nonlocal legal_moves_cache
@@ -8293,7 +8387,7 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
         fr, fc, tr, tc, promote, drop = mv
         # 着手前の取られる駒を記録（コメント判定用・軽量）
         captured = g.board[tr][tc]
-        ok, msg = g.move(fr, fc, tr, tc, promote, drop)
+        ok, msg = g.move(fr, fc, tr, tc, promote, drop, _skip_legal_check=True)
         if ok:
             undo_stack.append(snap)
             if len(undo_stack) > 80: undo_stack.pop(0)
@@ -8374,7 +8468,7 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                     _needs_redraw = True
                     snap = _snapshot()
                     fr, fc, tr, tc, promote, drop = mv
-                    ok, msg = g.move(fr, fc, tr, tc, promote, drop)
+                    ok, msg = g.move(fr, fc, tr, tc, promote, drop, _skip_legal_check=True)
                     if ok:
                         undo_stack.append(snap)
                         if len(undo_stack) > 80: undo_stack.pop(0)
@@ -8401,19 +8495,21 @@ def _shogi_curses_main(stdscr, g: "ShogiEngine", ai: "ShogiAI | None" = None,
                         _needs_redraw = True
                         _ai_thread = threading.Thread(target=_ai_think_bg, daemon=True)
                         _ai_thread.start()
-            # AI思考中は500ms間隔で最小限の再描画（ちらつき防止）
+            # ★ AI思考中: 200ms間隔で最小限の再描画（ちらつき防止・CPU節約）
             now = time.time()
             if _needs_redraw or (now - _last_ai_redraw >= 0.5):
                 _redraw()
                 _needs_redraw = False
                 _last_ai_redraw = now
-            stdscr.timeout(80)
+            stdscr.timeout(200)
             stdscr.getch()
             continue
 
         if _needs_redraw:
             _redraw()
             _needs_redraw = False
+        # ★ プレイヤーターンはブロッキング待機でCPU消費ゼロ
+        stdscr.timeout(-1)
         key = stdscr.getch()
 
         if key == curses.KEY_MOUSE:
@@ -10244,6 +10340,20 @@ def _trusted_fetch(url: str, timeout: int = 8) -> str:
     return fetch_html(url, timeout=timeout, silent=True)
 
 
+def _stop_files() -> str:
+    """★[外出し] 一時ファイル削除。旧: run()内 _handle_stop"""
+    removed = 0
+    patterns = ["ytdl_y_*", "tts_*.mp3", "aegis_*.md", "aegis_export_*.*", "*.mid", "*.wav"]
+    for pat in patterns:
+        for f in glob.glob(pat):
+            try:
+                os.remove(f)
+                removed += 1
+            except OSError:
+                pass
+    return f"{C['g']}一時ファイル {removed}件削除{C['w']}"
+
+
 def run() -> None:
     global POWER_MODE, TEMP_VOICE, KEYWORD_MEMORY, ROLEPLAY_ACTIVE, ROLEPLAY_SCENE, CUSTOM_PERSONA
     SESSION_STATS["start_time"] = time.time()
@@ -10423,7 +10533,9 @@ def run() -> None:
         else:
             sys_msg = get_sys_prm(mode, user_text, per_id=persona_id)
             cm = build_chat_messages(sys_msg, messages + [{"role": "user", "content": user_text}], p)
-            result = stream_response(cm, mode in ("a", "c", "sum", "deep"), len(user_text), model=model) or ""
+            # ★[修正/TEMP_MAP] コマンドモード別温度をTEMP_MAPから取得して接続
+            _cmd_temp = TEMP_MAP.get(f"/{mode}")
+            result = stream_response(cm, mode in ("a", "c", "sum", "deep"), len(user_text), temp_override=_cmd_temp, model=model) or ""
         if mode != "d":
             update_keyword_memory(user_text)
             kw = extract_keywords(result)
@@ -10467,7 +10579,7 @@ def run() -> None:
         # 旧コードは引数全体を text として渡し target_lang が常に "en" 固定だった。
         "tr": lambda a: (lambda p: handle_translate(p[1], p[0]) if len(p) >= 2 else handle_translate(a))(a.split(None, 1)) if a else handle_translate(""),
         "reference": lambda _: _handle_reference(),
-        "stop": lambda _: _handle_stop(),
+        "stop": lambda _: _stop_files(),
         "s": lambda a: _handle_persona_switch(a),
         "g": lambda _: _handle_clear(messages),
         "h": lambda _: HELP_TEXT,
@@ -10714,6 +10826,9 @@ def run() -> None:
                 clean_json = re.sub(r'```json|```', '', apply_raw).strip()
                 tech_directives = _json.loads(clean_json)
                 applied, skipped = [], []
+                # ★[修正/reference] _get_persona_bucket('global') を使って正しい入れ子構造に書き込む
+                # 旧コードは PROMPT_OPTIMIZATIONS[cat]=[] のフラット書き込みで inject_optimizations に届かなかった
+                _ref_bucket = _get_persona_bucket("global")
                 for td in sorted(tech_directives, key=lambda x: -x.get("priority", 0)):
                     cat = td.get("category", "prompt")
                     directive = td.get("directive", "")
@@ -10721,14 +10836,18 @@ def run() -> None:
                     rationale = td.get("rationale", "")
                     pri = td.get("priority", 1)
                     if not directive or not cat: continue
-                    if cat not in PROMPT_OPTIMIZATIONS:
-                        PROMPT_OPTIMIZATIONS[cat] = []
-                    if any(directive[:20] in d for d in PROMPT_OPTIMIZATIONS[cat]):
+                    if cat not in _ref_bucket:
+                        _ref_bucket[cat] = []
+                    if any(directive[:20] in d for d in _ref_bucket[cat]):
                         skipped.append(tech_name); continue
-                    PROMPT_OPTIMIZATIONS[cat].append(directive)
-                    OPTIMIZATION_HISTORY.append(
-                        f"[/reference #{_REF_STATE['run_count']}] {tech_name}: {directive[:60]}"
-                    )
+                    # カテゴリ上限管理
+                    if len(_ref_bucket[cat]) >= _DIRECTIVE_PER_CAT_MAX:
+                        _ref_bucket[cat].pop(0)
+                    _ref_bucket[cat].append(directive)
+                    hist_msg = f"[/reference #{_REF_STATE['run_count']}] {tech_name}: {directive[:60]}"
+                    OPTIMIZATION_HISTORY.append(hist_msg)
+                    if len(OPTIMIZATION_HISTORY) > 50:
+                        OPTIMIZATION_HISTORY[:] = OPTIMIZATION_HISTORY[-50:]
                     stars = "★" * pri + "☆" * (5 - pri)
                     applied.append(
                         f"  {C['g']}✓{C['w']} {stars} {C['c']}{tech_name}{C['w']}"
@@ -10738,6 +10857,8 @@ def run() -> None:
                 if applied:
                     lines.append(f"{C['g']}  反映済み ({len(applied)}件):{C['w']}")
                     lines.extend(applied)
+                    # ★ 反映後に即座に永続化
+                    persist_learning()
                 if skipped:
                     lines.append(f"  {C['dim']}スキップ（既反映）: {', '.join(skipped)}{C['w']}")
             except Exception as e:
@@ -10833,6 +10954,86 @@ def run() -> None:
             f"  {C['g']}✓{C['w']} パストラバーサル防止・クエリ長上限512chars",
         ]
 
+        # ══ SECTION 7: コード自己進化 (Code Self-Evolution) ══
+        if raw_tech_summary:
+            lines.append(f"\n{C['y']}【7】コード自己進化 — 自動パッチ提案{C['w']}")
+            print(f"  → コード改善案生成中... ", end="", flush=True)
+            # 自分のソースファイルを特定
+            _self_src = os.path.abspath(sys.argv[0]) if sys.argv else ""
+            _evolvable = os.path.isfile(_self_src) and _self_src.endswith(".py")
+
+            code_evo_sys = (
+                "あなたはPythonベースの自律AI (S-01) のコード改善エンジン。\n"
+                "以下の最新AI技術サマリーをもとに、このAI自身のコードに即座に適用できる\n"
+                "具体的なPythonコード改善案を提案せよ。\n\n"
+                "【条件】\n"
+                "- 既存コードの動作を壊さない、安全な追加・置換のみ\n"
+                "- Negamax/RAG/BM25/curses UIなど既存機能の改善を優先\n"
+                "- 1件につき: 対象関数名 | 改善内容(30字) | 改善効果(20字) | 優先度(1-5)\n"
+                "- 出力はJSONのみ。マークダウン不要。\n"
+                '[{"func": "関数名", "desc": "改善内容", "effect": "改善効果", "priority": 優先度}]\n'
+                "3〜5件出力せよ。"
+            )
+            code_evo_raw = stream_response(
+                [{"role": "system", "content": code_evo_sys},
+                 {"role": "user",   "content": raw_tech_summary}],
+                False, 150, temp_override=0.05, model=DEEP_MODEL,
+                max_tokens=512, silent=True
+            ) or "[]"
+            print(f"{C['g']}完了{C['w']}")
+
+            try:
+                clean_evo = re.sub(r'```json|```', '', code_evo_raw).strip()
+                evo_items = _json.loads(clean_evo)
+                evo_applied = []
+                for item in sorted(evo_items, key=lambda x: -x.get("priority", 0)):
+                    func  = item.get("func",   "?")
+                    desc  = item.get("desc",   "")
+                    effect= item.get("effect", "")
+                    pri   = item.get("priority", 1)
+                    if not desc: continue
+                    stars = "★" * pri + "☆" * (5 - pri)
+                    evo_applied.append(
+                        f"  {C['c']}{stars}{C['w']} {C['g']}{func}(){C['w']} — {desc}"
+                        f"\n    {C['dim']}効果: {effect}{C['w']}"
+                    )
+                    # ★ 提案をOPTIMIZATION_HISTORYに記録 (コード改善提案として)
+                    OPTIMIZATION_HISTORY.append(
+                        f"[CODE_EVO #{_REF_STATE['run_count']}] {func}: {desc[:60]}"
+                    )
+                    if len(OPTIMIZATION_HISTORY) > 50:
+                        OPTIMIZATION_HISTORY[:] = OPTIMIZATION_HISTORY[-50:]
+
+                if evo_applied:
+                    lines.append(f"  {C['g']}コード改善提案 ({len(evo_applied)}件):{C['w']}")
+                    lines.extend(evo_applied)
+                    # ★ 提案を自AIのソースファイル末尾にコメントとして記録
+                    if _evolvable:
+                        try:
+                            ts = _time.strftime("%Y-%m-%d %H:%M")
+                            patch_comment = (
+                                f"\n# ━━ /reference CODE_EVO #{_REF_STATE['run_count']} ({ts}) ━━\n"
+                            )
+                            for item in sorted(evo_items, key=lambda x: -x.get("priority", 0)):
+                                func  = item.get("func",  "?")
+                                desc  = item.get("desc",  "")
+                                effect= item.get("effect","")
+                                pri   = item.get("priority", 1)
+                                if desc:
+                                    patch_comment += f"# [{pri}★] {func}: {desc} → {effect}\n"
+                            with open(_self_src, "a", encoding="utf-8") as _pf:
+                                _pf.write(patch_comment)
+                            lines.append(
+                                f"  {C['dim']}改善提案をソース末尾に記録: {os.path.basename(_self_src)}{C['w']}"
+                            )
+                        except Exception as _pe:
+                            lines.append(f"  {C['dim']}ソース記録スキップ: {_pe}{C['w']}")
+                else:
+                    lines.append(f"  {C['dim']}コード改善提案なし{C['w']}")
+            except Exception as e:
+                lines.append(f"  {C['r']}コード進化JSON解析失敗: {e}{C['w']}")
+                lines.append(f"  {C['dim']}{code_evo_raw[:200]}{C['w']}")
+
         # ══ フッター ══
         lines += [
             f"\n{C['c']}{{'═'*64}}{C['w']}",
@@ -10846,17 +11047,7 @@ def run() -> None:
         return "\n".join(lines)
 
 
-    def _handle_stop() -> str:
-        removed = 0
-        patterns = ["ytdl_y_*", "tts_*.mp3", "aegis_*.md", "aegis_export_*.*", "*.mid", "*.wav"]
-        for pat in patterns:
-            for f in glob.glob(pat):
-                try:
-                    os.remove(f)
-                    removed += 1
-                except OSError:
-                    pass
-        return f"{C['g']}一時ファイル {removed}件削除{C['w']}"
+    _handle_stop = _stop_files  # ★ 外出し済み（run()直前で定義）
 
     def _handle_offline(arg: str) -> str:
         global OFFLINE_MODE

@@ -1,0 +1,276 @@
+[1mdiff --git a/new_main_v130.6.py b/new_main_v130.6.py[m
+[1mindex 97cd255..58abb86 100644[m
+[1m--- a/new_main_v130.6.py[m
+[1m+++ b/new_main_v130.6.py[m
+[36m@@ -8831,36 +8831,13 @@[m [mdef handle_philosopher_wolf(arg: str) -> str:[m
+       9 : 人狼2・狂人1・占い師1・霊媒師1・騎士1・村人3[m
+     """[m
+     global _PHIL_WOLF_HTML_PATH[m
+[31m-    import tempfile, pathlib, webbrowser[m
+[32m+[m[32m    import tempfile, pathlib[m
+ [m
+     arg = arg.strip().lower()[m
+     village_size = 9 if "9" in arg else 6[m
+     html_content = _build_philosopher_wolf_html(village_size)[m
+ [m
+[31m-    # ── ファイル確保（WSL対応: /mj と同じロジック）────────────────────[m
+[31m-    def _get_win_temp_dir() -> "str | None":[m
+[31m-        """WSL環境でWindowsのTEMPディレクトリを返す。非WSLならNone。"""[m
+[31m-        try:[m
+[31m-            import subprocess as _sp3[m
+[31m-            win_temp = _sp3.check_output([m
+[31m-                ["cmd.exe", "/c", "echo", "%TEMP%"],[m
+[31m-                stderr=_sp3.DEVNULL).decode().strip()[m
+[31m-            if win_temp:[m
+[31m-                linux_temp = _sp3.check_output([m
+[31m-                    ["wslpath", "-u", win_temp],[m
+[31m-                    stderr=_sp3.DEVNULL).decode().strip()[m
+[31m-                if os.path.isdir(linux_temp):[m
+[31m-                    return linux_temp[m
+[31m-        except Exception:[m
+[31m-            pass[m
+[31m-        for d in ["/mnt/c/Windows/Temp", "/mnt/c/Users/Public"]:[m
+[31m-            if os.path.isdir(d):[m
+[31m-                return d[m
+[31m-        return None[m
+[31m-[m
+[31m-    win_temp = _get_win_temp_dir()[m
+[31m-    save_dir = win_temp if win_temp else tempfile.gettempdir()[m
+[31m-[m
+[32m+[m[32m    save_dir = tempfile.gettempdir()[m
+     if _PHIL_WOLF_HTML_PATH and pathlib.Path(_PHIL_WOLF_HTML_PATH).exists():[m
+         html_path = _PHIL_WOLF_HTML_PATH[m
+     else:[m
+[36m@@ -8873,87 +8850,44 @@[m [mdef handle_philosopher_wolf(arg: str) -> str:[m
+ [m
+     file_uri = pathlib.Path(html_path).as_uri()[m
+ [m
+[31m-    def _try_open_browser(uri: str) -> "tuple[bool, str]":[m
+[32m+[m[32m    def _try_open_browser(uri: str) -> tuple[bool, str]:[m
+         import subprocess as _sp[m
+         _sys = platform.system()[m
+[31m-[m
+[31m-        # ── Windows ──────────────────────────────────────────[m
+         if _sys == "Windows":[m
+             candidates = [[m
+                 (os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"), "Brave"),[m
+[31m-                (os.path.expandvars(r"%PROGRAMFILES%\BraveSoftware\Brave-Browser\Application\brave.exe"), "Brave"),[m
+[31m-                (os.path.expandvars(r"%PROGRAMFILES(X86)%\BraveSoftware\Brave-Browser\Application\brave.exe"), "Brave"),[m
+                 (os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"), "Chrome"),[m
+[31m-                (os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"), "Chrome"),[m
+                 (os.path.expandvars(r"%PROGRAMFILES%\Mozilla Firefox\firefox.exe"), "Firefox"),[m
+             ][m
+             for exe, name in candidates:[m
+[31m-                if os.path.isfile(exe):[m
+[32m+[m[32m                if exe and os.path.exists(exe):[m
+                     try:[m
+[31m-                        S.Popen([exe, uri])[m
+[32m+[m[32m                        _sp.Popen([exe, uri], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)[m
+                         return True, name[m
+                     except Exception:[m
+[31m-                        continue[m
+[31m-[m
+[31m-        # ── macOS ─────────────────────────────────────────────[m
+[31m-        elif _sys == "Darwin":[m
+[31m-            mac_candidates = [[m
+[31m-                (["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", uri], "Brave"),[m
+[31m-                (["open", "-a", "Brave Browser", uri], "Brave"),[m
+[31m-                (["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", uri], "Chrome"),[m
+[31m-                (["open", "-a", "Google Chrome", uri], "Chrome"),[m
+[31m-                (["open", "-a", "Firefox", uri], "Firefox"),[m
+[31m-            ][m
+[31m-            for cmd, name in mac_candidates:[m
+[31m-                try:[m
+[31m-                    S.Popen(cmd)[m
+[31m-                    return True, name[m
+[31m-                except Exception:[m
+[31m-                    continue[m
+[31m-[m
+[31m-        # ── Linux / WSL ───────────────────────────────────────[m
+[31m-        else:[m
+[32m+[m[32m                        pass[m
+             try:[m
+[31m-                # Linuxパス → Windowsパスに変換してcmd.exeで開く（WSL対応）[m
+[31m-                linux_path = uri.replace("file://", "").replace("%20", " ")[m
+[31m-                _win_path = _sp.check_output([m
+[31m-                    ["wslpath", "-w", linux_path],[m
+[31m-                    stderr=_sp.DEVNULL).decode().strip()[m
+[31m-                S.Popen(["cmd.exe", "/c", "start", "", _win_path],[m
+[31m-                        stdout=S.DEVNULL, stderr=S.DEVNULL)[m
+[31m-                return True, "ブラウザ"[m
+[32m+[m[32m                os.startfile(uri)  # type: ignore[attr-defined][m
+[32m+[m[32m                return True, "既定ブラウザ"[m
+             except Exception:[m
+[31m-                pass[m
+[31m-            linux_bins = [[m
+[31m-                ("brave-browser", "Brave"), ("brave", "Brave"),[m
+[31m-                ("google-chrome", "Chrome"), ("firefox", "Firefox"),[m
+[31m-            ][m
+[31m-            for bin_name, display_name in linux_bins:[m
+[31m-                if shutil.which(bin_name):[m
+[31m-                    try:[m
+[31m-                        S.Popen([bin_name, uri], stdout=S.DEVNULL, stderr=S.DEVNULL)[m
+[31m-                        return True, display_name[m
+[31m-                    except Exception:[m
+[31m-                        continue[m
+[31m-[m
+[31m-        # ── 最終フォールバック ────────────────────────────────[m
+[32m+[m[32m                return False, "起動失敗"[m
+         try:[m
+[31m-            webbrowser.open(uri)[m
+[31m-            return True, "デフォルトブラウザ"[m
+[31m-        except Exception as e:[m
+[31m-            return False, str(e)[m
+[32m+[m[32m            import webbrowser[m
+[32m+[m[32m            return (webbrowser.open(uri), "既定ブラウザ")[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            return False, "起動失敗"[m
+ [m
+     ok, browser_name = _try_open_browser(file_uri)[m
+     label = f"{village_size}人村"[m
+     if ok:[m
+         return ([m
+[31m-            f"\033[32m哲学者人狼 {label} を {browser_name} で起動しました。\033[0m\n"[m
+[31m-            f"\033[90m   ファイル: {html_path}\033[0m\n"[m
+[32m+[m[32m            f"\033[32m哲学者人狼 {label} を起動しました（{browser_name}）。\033[0m\n"[m
+[32m+[m[32m            f"\033[36m{file_uri}\033[0m\n"[m
+             f"\033[33m   /wolf 6 → 6人村  /wolf 9 → 9人村\033[0m"[m
+         )[m
+     return ([m
+         f"\033[33m哲学者人狼HTMLを作成しましたが、ブラウザ自動起動に失敗しました。\033[0m\n"[m
+[31m-        f"次のURLをBraveのアドレスバーに貼り付けてください:\n{file_uri}"[m
+[32m+[m[32m        f"\033[36m{file_uri}\033[0m"[m
+     )[m
+ [m
+ def _build_philosopher_wolf_cast() -> list[list[str]]:[m
+[36m@@ -10084,25 +10018,6 @@[m [mfunction doKan(pi,tile,isAnkan){[m
+   else setTimeout(()=>aiTurn(pi),600);[m
+ }[m
+ [m
+[31m-function doDaimikan(pi,discardTile){[m
+[31m-  // 大明槓: 手牌から3枚 + 捨て牌1枚 = 4枚でカン[m
+[31m-  const p=G.players[pi];[m
+[31m-  const kanTiles=[];let rm=0;[m
+[31m-  p.hand=p.hand.filter(t=>{if(rm<3&&tilesEqual(t,discardTile)){rm++;kanTiles.push(t);return false;}return true;});[m
+[31m-  if(rm<3){console.warn('doDaimikan: 牌不足 rm='+rm+' → 強制進行');advanceTurn(G.lastDiscardPlayer!=null?G.lastDiscardPlayer:0);return;}[m
+[31m-  kanTiles.push(discardTile);[m
+[31m-  p.melds.push({type:'kan',tiles:kanTiles,isAnkan:false});[m
+[31m-  if(G.deadWall.length){[m
+[31m-    p.drawn=G.deadWall.shift();[m
+[31m-    const _doraPos=4-G.doraIndicators.length;[m
+[31m-    if(_doraPos>=0&&_doraPos<G.deadWall.length)G.doraIndicators.push(G.deadWall[_doraPos]);[m
+[31m-  }[m
+[31m-  G.pendingClaims=[];[m
+[31m-  renderAll();log(`${p.name}が大明槓`);[m
+[31m-  if(p.isHuman){G.activePlayer=pi;G.phase='discard';G.waitingForPlayer=true;renderControls();}[m
+[31m-  else{G.activePlayer=pi;setTimeout(()=>aiTurn(pi),600);}[m
+[31m-}[m
+[31m-[m
+ function checkClaims(tile,dpi){[m
+   const claims=[];[m
+   for(let i=0;i<G.numPlayers;i++){[m
+[36m@@ -10118,11 +10033,6 @@[m [mfunction checkClaims(tile,dpi){[m
+       if(p.isHuman)claims.push({type:'pon',player:i,priority:2});[m
+       else if(Math.random()<0.4)claims.push({type:'pon',player:i,priority:2});[m
+     }[m
+[31m-    // ★[修正/kan] 大明槓クレーム（手牌に3枚ある場合）[m
+[31m-    if(!p.riichi&&canKan(p.hand,tile)&&!_isKitaTile3){[m
+[31m-      if(p.isHuman)claims.push({type:'kan',player:i,priority:2});[m
+[31m-      else if(Math.random()<0.25)claims.push({type:'kan',player:i,priority:2});[m
+[31m-    }[m
+     if(!p.riichi&&G.numPlayers===4){[m
+       const co=canChi(p.hand,tile,i,dpi);[m
+       if(co.length){[m
+[36m@@ -10183,11 +10093,9 @@[m [mfunction executeAIClaim(claim,tile){[m
+     renderAll();[m
+     const _cpi=claim.player;[m
+     setTimeout(()=>aiTurn(_cpi),600);[m
+[31m-  } else if(claim.type==='kan'){[m
+[31m-    // ★[修正/kan] AI大明槓[m
+[31m-    doDaimikan(claim.player,tile);[m
+   } else {[m
+[31m-    // ★[修正/freeze-claim] 未知のクレームタイプ[m
+[32m+[m[32m    // ★[修正/freeze-claim] 未知のクレームタイプ: 旧コードはここで何も呼ばずゲームが[m
+[32m+[m[32m    // phase='claim' のまま永久凍結した。else 節を追加して強制進行する。[m
+     console.warn('executeAIClaim: 未知タイプ='+claim.type+' → 強制進行');[m
+     advanceTurn(G.lastDiscardPlayer!=null?G.lastDiscardPlayer:G.activePlayer||0);[m
+   }[m
+[36m@@ -10325,46 +10233,6 @@[m [mfunction humanSkip(){[m
+   advanceTurn(G.lastDiscardPlayer);[m
+ }[m
+ [m
+[31m-// ── カン操作 ──[m
+[31m-function humanKan(){[m
+[31m-  // 大明槓: claim フェーズで呼ばれる[m
+[31m-  if(!G.waitingForPlayer)return;[m
+[31m-  const tile=G.lastDiscard;[m
+[31m-  doDaimikan(0,tile);[m
+[31m-}[m
+[31m-function humanAnkan(sn){[m
+[31m-  // 暗槓: discard フェーズで呼ばれる[m
+[31m-  if(!G.waitingForPlayer)return;[m
+[31m-  const p=G.players[0];[m
+[31m-  const all=[...p.hand,...(p.drawn?[p.drawn]:[])];[m
+[31m-  const tile=all.find(t=>t.suit+t.num===sn);[m
+[31m-  if(!tile)return;[m
+[31m-  G.waitingForPlayer=false;[m
+[31m-  doKan(0,tile,true);[m
+[31m-}[m
+[31m-function humanKakan(sn){[m
+[31m-  // 加槓: discard フェーズで呼ばれる（既存のポンに4枚目を追加）[m
+[31m-  if(!G.waitingForPlayer)return;[m
+[31m-  const p=G.players[0];[m
+[31m-  const all=[...p.hand,...(p.drawn?[p.drawn]:[])];[m
+[31m-  const addTile=all.find(t=>t.suit+t.num===sn);[m
+[31m-  if(!addTile)return;[m
+[31m-  const ponIdx=p.melds.findIndex(m=>m.type==='pon'&&tilesEqual(m.tiles[0],addTile));[m
+[31m-  if(ponIdx===-1)return;[m
+[31m-  if(p.drawn&&p.drawn.uid===addTile.uid){p.drawn=null;}[m
+[31m-  else{const idx=p.hand.findIndex(t=>t.uid===addTile.uid);if(idx!==-1)p.hand.splice(idx,1);}[m
+[31m-  p.melds[ponIdx].tiles.push(addTile);[m
+[31m-  p.melds[ponIdx].type='kan';[m
+[31m-  if(G.deadWall.length){[m
+[31m-    p.drawn=G.deadWall.shift();[m
+[31m-    const _doraPos=4-G.doraIndicators.length;[m
+[31m-    if(_doraPos>=0&&_doraPos<G.deadWall.length)G.doraIndicators.push(G.deadWall[_doraPos]);[m
+[31m-  }[m
+[31m-  G.waitingForPlayer=false;[m
+[31m-  G.activePlayer=0;G.phase='discard';G.waitingForPlayer=true;[m
+[31m-  log('加槓');renderAll();renderControls();[m
+[31m-}[m
+[31m-[m
+ // ── 描画 ──[m
+ function tileHTML(t,sz='medium'){[m
+   if(!t)return'';[m
+[36m@@ -10434,21 +10302,13 @@[m [mfunction renderControls(){[m
+   }[m
+   if(G.phase==='discard'&&G.activePlayer===0&&G.waitingForPlayer){[m
+     if(canTsumo(p))html+=`<button class="action-btn btn-tsumo" onclick="humanTsumo()">ツモ</button>`;[m
+[31m-    // ★[修正/kan] 暗槓・加槓ボタン[m
+[31m-    if(!p.riichi){[m
+[31m-      const _ak=canAnkan([...p.hand,...(p.drawn?[p.drawn]:[])]);[m
+[31m-      for(const _sn of _ak){const _kt=[...p.hand,...(p.drawn?[p.drawn]:[])].find(t=>t.suit+t.num===_sn);html+=`<button class="action-btn btn-kan" onclick="humanAnkan('${_sn}')">暗槓(${_kt?tileStr(_kt):'?'})</button>`;}[m
+[31m-      const _allH=[...p.hand,...(p.drawn?[p.drawn]:[])];[m
+[31m-      for(const _m of p.melds){if(_m.type==='pon'&&_allH.some(t=>tilesEqual(t,_m.tiles[0]))){const _sn=_m.tiles[0].suit+_m.tiles[0].num;html+=`<button class="action-btn btn-kan" onclick="humanKakan('${_sn}')">加槓(${tileStr(_m.tiles[0])})</button>`;}}[m
+[31m-    }[m
+     if(!p.riichi&&!p.melds.length&&p.score>=1000){[m
+       const all=[...p.hand,...(p.drawn?[p.drawn]:[])];[m
+       if(all.some(t=>isTenpai(all.filter(x=>x.uid!==t.uid),p.melds)))[m
+         html+=`<button class="action-btn btn-riichi" onclick="humanRiichi()">立直</button>`;[m
+     }[m
+     if(G.riichiCandidates.length){[m
+[31m-      // ★[修正/dama-tsumo] 旧コード html=代入でツモボタンを上書きしていた→html+=に変更[m
+[31m-      html+=`<span style="font-size:12px;color:var(--gold)">立直する牌を選んでください</span>`;[m
+[32m+[m[32m      html=`<span style="font-size:12px;color:var(--gold)">立直する牌を選んでください</span>`;[m
+       html+=`<button class="action-btn btn-skip" onclick="G.riichiCandidates=[];G.selectedTile=null;renderControls();renderHand(0);">キャンセル</button>`;[m
+     } else if(G.selectedTile||p.riichi){[m
+       html+=`<button class="action-btn btn-discard" onclick="humanDiscard(${p.riichi?(p.drawn?p.drawn.uid:-1):G.selectedTile?.uid})">${p.riichi?'ツモ切り':'捨てる'}</button>`;[m
+[36m@@ -10459,8 +10319,6 @@[m [mfunction renderControls(){[m
+     const cs=G.pendingClaims;[m
+     if(cs.some(c=>c.type==='ron'))html+=`<button class="action-btn btn-ron" onclick="humanRon()">ロン</button>`;[m
+     if(cs.some(c=>c.type==='pon'))html+=`<button class="action-btn btn-pon" onclick="humanPon()">ポン</button>`;[m
+[31m-    // ★[修正/kan] 大明槓ボタン[m
+[31m-    if(cs.some(c=>c.type==='kan'))html+=`<button class="action-btn btn-kan" onclick="humanKan()">カン</button>`;[m
+     if(cs.some(c=>c.type==='chi')){[m
+       cs.filter(c=>c.type==='chi')[0].options.forEach(o=>{[m
+         html+=`<button class="action-btn btn-chi" onclick="humanChi([${o}])">チー(${o.join('-')})</button>`;[m
