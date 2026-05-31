@@ -42,3 +42,7 @@ port_features.py
 # その他
 run.sh
 *.zip
+
+# 環境変数
+.env
+.env.local
