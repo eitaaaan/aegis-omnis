@@ -1,0 +1,61 @@
+--- new_main_v131_0.py
++++ new_main_v131_0.py
+@@ -2955,6 +2955,31 @@
+         if _think_end != -1:
+             full_result = full_result[_think_end + 8:].strip()
+ 
++    # ★[修正/trunc-3] 不完全末尾クリーンアップ
++    # num_predictの上限に達してトークンが途中で打ち切られると、
++    # 「たとえば」「そのよう」など文末が欠けた状態で返る。
++    # 最後の文末句読点（。！？）より後に未完文が残っていれば除去する。
++    def _cleanup_incomplete(text: str) -> str:
++        """最後の完結文（。！？）以降に不完全フラグメントが残っていれば切り捨てる。"""
++        if not text:
++            return text
++        # 末尾が既に完結句読点で終わっているなら何もしない
++        if text.rstrip()[-1:] in "。！？!?\n":
++            return text
++        # 最後の句読点位置を探して、そこまでを返す
++        last_end = max(
++            text.rfind("。"),
++            text.rfind("！"),
++            text.rfind("？"),
++            text.rfind("!"),
++            text.rfind("?"),
++        )
++        if last_end > len(text) // 2:  # 後半以降に句読点があれば切り捨て
++            return text[:last_end + 1]
++        return text  # 句読点が少なすぎる場合はそのまま返す
++
++    full_result = _cleanup_incomplete(full_result)
++
+     # 繰り返しループ検出 → 末尾を整形して返す
+     if detect_repetition(full_result):
+         full_result = full_result.rstrip("、，")
+@@ -2983,8 +3008,12 @@
+         num_predict = min(max_tokens or 2048, 2048)
+         final_temp = temp_override if temp_override is not None else 0.10
+     elif is_logic_mode:
+-        ctx = max(ctx, 6144 if _gpu else 4096)
+-        num_predict = min(max_tokens or 1024, 1024 if not _gpu else 2048)
++        # ★[修正/trunc-4] max_tokensが大きい場合はctxも合わせて拡張する
++        # d_tokens=2800〜3200を渡したとき ctx=4096 だと入力+出力が収まらず途切れる。
++        # 安全マージン1024を加えた値とデフォルトctxの大きいほうを使う。
++        _needed_ctx = (max_tokens or 1024) + 1024
++        ctx = max(ctx, _needed_ctx, 6144 if _gpu else 5120)
++        num_predict = min(max_tokens or 2800, 2800 if not _gpu else 4096)  # ★[修正/trunc-2] CPU1024→2800: 哲学者長文に対応
+         final_temp = temp_override if temp_override is not None else tl
+     elif text_len < 80:
+         # ★[v131] 短い入力はctxをさらに絞る
+@@ -11788,7 +11817,10 @@
+                         f"早期結論禁止。最後の文を「。」で完結させること。"
+                         + rag_snippet
+                     )
+-                d_tokens = 1024  # ★[修正/ctx-5] -1（無制限）→2048: ctx超過による途切れ防止
++                # ★[修正/trunc-1b] ウィトゲンシュタインは8段落指定のため3200、その他は2800
++                # 旧値1024では哲学者長文の途中（特に「たとえば〜」最終文）でトークン上限に
++                # 達して文が途切れる直接原因になっていた。
++                d_tokens = 3200 if (_is_late_witt or _is_early_witt) else 2800
+             else:
+                 sys_content = (
+                     f"あなたは{p['name']}。口調:{p['style']}。一人称:{p.get('first_person','私')}。ユーザーは{USER_NAME}。"
