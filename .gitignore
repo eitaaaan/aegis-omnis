@@ -46,3 +46,7 @@ run.sh
 # 環境変数
 .env
 .env.local
+s01_rag_cache/
+s01_persona_cache.json
+s01_chroma_db/
+new_main_v130_6_fixed.py

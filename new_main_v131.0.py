@@ -93,25 +93,29 @@ def _get_ollama():
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # モデルは POWER_MODE と入力の複雑度から自動選択される。
 # GPU環境 (OLLAMA_GPU=1) では 12b モデルが自動的に使用される。
-_GPU_AVAILABLE = os.environ.get("OLLAMA_GPU", "0") == "1" or os.environ.get("CUDA_VISIBLE_DEVICES", "") != ""
+_GPU_AVAILABLE = (
+    os.environ.get("OLLAMA_GPU", "0") == "1"
+    or os.environ.get("CUDA_VISIBLE_DEVICES", "") != ""
+    or os.environ.get("OLLAMA_IGPU_ENABLE", "0") == "1"
+)
 _HAS_12B       = False  # 起動時に ollama list で確認 (check_ollama_connection内)
 
 # モデル優先順位: ultra/high=12b→4b, mid=4b, low=1b
 MODEL_TIERS = {
     "ultra": ["gemma3:12b", "gemma3:4b"],
-    "high":  ["gemma3:12b", "gemma3:4b"],
+    "high":  ["gemma3:4b", "gemma3:12b"],
     "mid":   ["gemma3:4b"],
     "low":   ["gemma3:1b", "gemma3:4b"],
 }
 MODEL_NAME    = "gemma3:4b"   # デフォルト（check_ollama_connectionで更新）
 DEEP_MODEL    = "gemma3:4b"   # complexモード用（同上）
-FAST_MODEL    = "gemma3:1b"   # 高速応答用（1b優先）
+FAST_MODEL    = "gemma3:4b"   # ★[GPU] iGPU環境では4bが最適バランス
 MAX_HISTORY   = 6             # ★[v129] 4→6: 長い文脈での一貫性向上
-RAG_TIMEOUT   = 4.0           # ★[v129] 3.0→4.0: ハイブリッドRAGで取得量増加
+RAG_TIMEOUT = 5           # ★[v129] 3.0→1.5: ハイブリッドRAGで取得量増加
 USER_NAME     = "先輩"
 OBSERVED_SUBJECT_NAME = USER_NAME
 STATE_FILE    = "s01_state.json"
-POWER_MODE    = "mid"
+POWER_MODE    = "high"
 TEMP_FACT     = 0.05           # 事実確認モード温度 (get_llm_opt is_logic=True 時に使用予定)
 TEMP_VOICE    = 0.72
 TEMP_HISTORY: list[float] = [0.72]
@@ -174,14 +178,81 @@ def estimate_complexity(text: str, cmd: str = "") -> str:
     return "simple"
 
 def select_model(text: str, cmd: str = "") -> str:
-    """★[v129] 複雑度・長さ・コマンドでモデル自動選択 (CPU専用最適化)"""
+    """★[v131] GPU環境: 全クエリをFAST_MODEL(4b)で処理、12bは使わない"""
     c = estimate_complexity(text, cmd)
-    if c == "complex": return DEEP_MODEL
+    if c == "complex": return FAST_MODEL  # ★[GPU] 12bは遅すぎるので4bで統一
     if c == "simple" and len(text) < 60 and not cmd:
-        return FAST_MODEL  # ★[v129] 短い単純質問→FASTモデルで高速応答
-    return MODEL_NAME
+        return FAST_MODEL
+    return FAST_MODEL  # ★[GPU] 全部4bで統一
 
 RAG_CACHE: dict[str, tuple[float, str, int, float]] = {}
+
+# ══ RAG高速化: L2ディスクキャッシュ + プリフェッチ + 適応型タイムアウト ══
+import hashlib as _hl_rag, json as _json_rag, os as _os_rag
+
+_RAG_DISK_DIR   = "s01_rag_cache"          # L2キャッシュディレクトリ
+_RAG_DISK_TTL   = 3600 * 6                  # 6時間有効
+_RAG_ADAPT_LOCK = threading.Lock()
+_RAG_TIMING: list[float] = []               # 直近10回の取得時間
+_RAG_PREFETCH_QUEUE: set[str] = set()       # プリフェッチ済みキュー
+_os_rag.makedirs(_RAG_DISK_DIR, exist_ok=True)
+
+def _rag_normalize_query(q: str) -> str:
+    """クエリ正規化: 類似クエリを同一キーに統一"""
+    import re as _re_n
+    q = q.strip().rstrip("？?。．.！!").lower()
+    q = _re_n.sub(r'[はがをにでのもとやか]$', '', q)  # 助詞末尾を除去
+    q = _re_n.sub(r'\s+', ' ', q)
+    return q[:80]  # 最大80文字
+
+def _rag_disk_key(query: str) -> str:
+    return _hl_rag.md5(query.encode()).hexdigest()[:16]
+
+def _rag_disk_get(query: str):
+    """L2ディスクキャッシュから取得"""
+    try:
+        path = _os_rag.path.join(_RAG_DISK_DIR, _rag_disk_key(query) + ".json")
+        if not _os_rag.path.exists(path): return None
+        with open(path, 'r', encoding='utf-8') as f:
+            d = _json_rag.load(f)
+        if time.time() - d['ts'] > _RAG_DISK_TTL: return None
+        return d['content']
+    except: return None
+
+def _rag_disk_set(query: str, content: str):
+    """L2ディスクキャッシュに保存"""
+    try:
+        path = _os_rag.path.join(_RAG_DISK_DIR, _rag_disk_key(query) + ".json")
+        with open(path, 'w', encoding='utf-8') as f:
+            _json_rag.dump({'ts': time.time(), 'content': content, 'query': query}, f, ensure_ascii=False)
+    except: pass
+
+def _rag_adaptive_timeout() -> float:
+    """直近の取得時間から適応型タイムアウトを計算"""
+    with _RAG_ADAPT_LOCK:
+        if len(_RAG_TIMING) < 3: return RAG_TIMEOUT
+        avg = sum(_RAG_TIMING[-5:]) / len(_RAG_TIMING[-5:])
+        # 平均の1.5倍、最小0.8秒・最大RAG_TIMEOUT
+        return max(0.8, min(RAG_TIMEOUT, avg * 1.5))
+
+def _rag_record_timing(elapsed: float):
+    with _RAG_ADAPT_LOCK:
+        _RAG_TIMING.append(elapsed)
+        if len(_RAG_TIMING) > 10: _RAG_TIMING.pop(0)
+
+def prefetch_rag(query: str):
+    """プリフェッチ: バックグラウンドでRAGを先読み"""
+    nq = _rag_normalize_query(query)
+    if nq in _RAG_PREFETCH_QUEUE: return
+    _RAG_PREFETCH_QUEUE.add(nq)
+    def _do():
+        try: get_async_rag_data(query)
+        except: pass
+        finally:
+            try: _RAG_PREFETCH_QUEUE.discard(nq)
+            except: pass
+    _THREAD_POOL.submit(_do)
+
 _RAG_LOCK = threading.Lock()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1743,6 +1814,7 @@ HELP_TEXT = "\n".join([
     f"  {C['c']}/spi{C['w']}                SPI/玉手箱 対策（/spi 模擬 で10問連続）",
     f"  {C['c']}/comp <ID> <ID> [テーマ]{C['w']}  ヘーゲル弁証法対話（哲学者/カジュアル/ビジネス自動判定）",
     f"  {C['c']}/split <ID or 名前> [テーマ]{C['w']} 1ペルソナをテーゼ/アンチテーゼに分解して内的弁証法",
+    f"  {C['c']}/baseball{C['w']}           ⚾ 甲子園列伝（ブラウザで起動）",
     f"  {C['c']}/chess{C['w']}              ♟ チェス（MCTS強化・curses UI）\n              例: /chess easy  /chess middle  /chess hard  /chess very_hard",
     f"  {C['c']}/shogi{C['w']}              将棋（Negamax+TT+Killer強化・curses UI）\n              例: /shogi easy  /shogi middle  /shogi hard  /shogi very_hard",
     f"  {C['c']}/wolf [6|9]{C['w']}         哲学者/偉人人狼（ブラウザ起動・昼議論/投票/夜行動）\n              例: /wolf 6 → 6人村  /wolf 9 → 9人村",
@@ -1806,12 +1878,30 @@ class SystemSpinner:
 _RE_SURROGATE = re.compile(r'[\ud800-\udfff]')
 
 def sanitize(txt: str) -> str:
-    # ★[v131] サロゲートペアが無ければ encode/decode を省略（ストリーミング高速化）
+    # ★[v131] サロゲートペア＋異常Unicode文字を除去
+    import unicodedata
     s = str(txt)
     if _RE_SURROGATE.search(s):
         s = _RE_SURROGATE.sub('', s)
-        return s.encode("utf-8", "ignore").decode("utf-8")
-    return s
+        s = s.encode("utf-8", "ignore").decode("utf-8")
+    # 異常文字除去: タミル・タイ・アラビア・ハングル混入など
+    # 許可: 日本語(CJK/ひら/カタ)・英数・基本記号・Latin
+    _ALLOW = set(range(0x0020, 0x007F))  # ASCII
+    result = []
+    for ch in s:
+        cp = ord(ch)
+        cat = unicodedata.category(ch)
+        # 制御文字除外（改行・タブは許可）
+        if cat == 'Cc' and ch not in ('\n', '\t', '\r'):
+            continue
+        # 日本語・CJK・ASCII・基本Latin・句読点は許可
+        if (0x0020 <= cp <= 0x024F or   # Latin
+            0x3000 <= cp <= 0x9FFF or   # CJK・ひら・カタ・日本語記号
+            0xF900 <= cp <= 0xFAFF or   # CJK互換
+            0xFF00 <= cp <= 0xFFEF or   # 全角
+            ch in '\n\t\r '):
+            result.append(ch)
+    return ''.join(result)
 
 def sanitize_obj(value):
     if isinstance(value, str):
@@ -2523,12 +2613,21 @@ def get_async_rag_data(query: str) -> str:
       並列Web取得 → BM25スコアリング → ChromaDB vector_search
       → RRF融合 → Contextual Compression → Cross-Encoder Reranking
     """
+    # ── L1: メモリキャッシュ（最速）──
+    _nq = _rag_normalize_query(query)
     with _RAG_LOCK:
-        cached = RAG_CACHE.get(query)
+        # 正規化キーでも検索
+        cached = RAG_CACHE.get(query) or RAG_CACHE.get(_nq)
         if cached and time.time() - cached[0] < 1800:
             ts, content, access_count, confidence = cached
             RAG_CACHE[query] = (ts, content, access_count + 1, confidence)
             return content
+    # ── L2: ディスクキャッシュ（再起動後も有効）──
+    _disk_hit = _rag_disk_get(_nq)
+    if _disk_hit is not None:
+        with _RAG_LOCK:
+            RAG_CACHE[query] = (time.time(), _disk_hit, 1, 0.7)
+        return _disk_hit
     res: dict[str, str] = {}
     lock = threading.Lock()
 
@@ -2540,11 +2639,7 @@ def get_async_rag_data(query: str) -> str:
 
     tasks = [
         ("wiki",     get_wikipedia,         query),
-        ("yahoo",    _fetch_yahoo_snippets,  query + " 概要"),
         ("ddg",      _fetch_ddg_snippets,    query),
-        ("bing",     _fetch_bing_snippets,   query),
-        ("kotobank", _fetch_kotobank,        query),
-        ("nhk",      _fetch_nhk_snippets,    query),
     ]
     # ★[v131] HyDE をWeb取得と並列実行（Ollama利用可能時のみ）
     # RAG待機中にHyDE仮想ドキュメントを生成しておくことで遅延ゼロ
@@ -2555,6 +2650,7 @@ def get_async_rag_data(query: str) -> str:
             _hyde_future = _THREAD_POOL.submit(hyde_expand_query, query, _o)
     futures = {_THREAD_POOL.submit(run_task, k, fn, *a): k for k, fn, *a in tasks}
     start_time = time.time()
+    _rag_t0 = time.time()
 
     while time.time() - start_time < RAG_TIMEOUT:
         with lock:
@@ -2635,7 +2731,9 @@ def get_async_rag_data(query: str) -> str:
 
     merged_web = "\n".join(final_web_lines)
 
-    if len(wiki) < 10 and len(merged_web) < 20: return ""
+    if len(wiki) < 10 and len(merged_web) < 20:
+        _rag_disk_set(_rag_normalize_query(query), "")  # 空結果もキャッシュ
+        return ""
     parts = []
     if wiki: parts.append(f"[Wikipedia JA]\n{wiki}")
     tag = "BM25+Vector+RRF+CE" if (vec_ranked and CROSS_ENCODER_ENABLED) else "BM25 ranked"
@@ -2653,6 +2751,8 @@ def get_async_rag_data(query: str) -> str:
             evict_keys = sorted(RAG_CACHE.items(), key=lambda x: (x[1][2], x[1][0]))[:20]
             for k, _ in evict_keys: RAG_CACHE.pop(k, None)
         RAG_CACHE[query] = (time.time(), final, 1, confidence)
+        _rag_record_timing(time.time() - _rag_t0)
+        _rag_disk_set(_rag_normalize_query(query), final)  # L2保存
     return final
 
 def _parse_facts(raw: str) -> tuple[bool, list[str], dict[str, int]]:
@@ -4749,7 +4849,7 @@ def _update_model_for_power():
         for t in tier:
             if any(t.split(":")[0] in n for n in names):
                 MODEL_NAME = t; break
-        if _HAS_12B and POWER_MODE in ("high", "ultra"):
+        if _HAS_12B and POWER_MODE in ("high", "mid", "ultra"):
             DEEP_MODEL = "gemma3:12b"
         else:
             DEEP_MODEL = MODEL_NAME
@@ -4804,6 +4904,22 @@ def build_custom_persona(attr: str, hint: str = "") -> dict:
     return {"name": name, "style": (f"{name}。{' + '.join(styles)}")[:250], "first_person": first_person}
 
 PERSONA_STYLE_CACHE: dict[str, dict] = {}
+_PERSONA_CACHE_PATH = "s01_persona_cache.json"
+
+def _persona_cache_load():
+    try:
+        if os.path.exists(_PERSONA_CACHE_PATH):
+            with open(_PERSONA_CACHE_PATH, 'r', encoding='utf-8') as f:
+                PERSONA_STYLE_CACHE.update(json.load(f))
+    except: pass
+
+def _persona_cache_save():
+    try:
+        with open(_PERSONA_CACHE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(PERSONA_STYLE_CACHE, f, ensure_ascii=False, indent=2)
+    except: pass
+
+_persona_cache_load()  # 起動時に読み込み
 
 def _fetch_persona_web_info(name: str) -> str:
     """複数ソースを並列スクレイピングしてペルソナ情報を収集する。
@@ -4944,6 +5060,14 @@ def _llm_persona_style(name: str) -> dict:
     if name in PERSONA_STYLE_CACHE:
         return PERSONA_STYLE_CACHE[name]
     o = _get_ollama()
+    # フォールバック: _get_ollama()がNoneの場合は直接初期化
+    if o is None:
+        try:
+            import ollama as _ol_mod
+            _host = os.environ.get("OLLAMA_HOST", "")
+            o = _ol_mod.Client(host=_host) if _host else _ol_mod
+        except Exception:
+            pass
 
     # ── ① ネットから人物情報を取得 ──────────────────────────────
     web_info = ""
@@ -4958,6 +5082,7 @@ def _llm_persona_style(name: str) -> dict:
             style += web_info[:200]
         p = {"name": name, "style": style[:250], "first_person": "私", "_web": bool(web_info)}
         PERSONA_STYLE_CACHE[name] = p
+        _persona_cache_save()
         return p
 
     result = [""]
@@ -4965,16 +5090,21 @@ def _llm_persona_style(name: str) -> dict:
         try:
             if web_info:
                 prompt = (
-                    f"以下は「{name}」に関する複数ソース（Wikipedia・SEP・ブリタニカ・Web検索）からの情報だ:\n"
-                    f"{web_info[:1800]}\n\n"
-                    f"この情報を踏まえ、「{name}」がAIとして日本語で話すときの"
-                    f"口調・性格・思想的特徴・一人称を80字以内で設定せよ。"
-                    f"形式：「一人称:XX / 口調:YYYY / 特徴:ZZZZ」"
+                    f"以下は「{name}」に関する情報だ:\n{web_info[:1800]}\n\n"
+                    f"「{name}」がAIとして日本語で話す設定を作れ。\n"
+                    f"ルール:\n"
+                    f"- 歴史上の武将・王・皇帝・偉人なら一人称は「我」「余」「朕」「拙者」など時代に合ったもの\n"
+                    f"- 口調は時代・身分・性格を忠実に再現せよ\n"
+                    f"- 「私」「は」は歴史上人物の一人称として不適切\n"
+                    f"必ず以下の形式のみで答えよ（他の文章不要）:\n"
+                    f"一人称:XX / 口調:YYYY / 特徴:ZZZZ"
                 )
             else:
                 prompt = (
-                    f"「{name}」がAIとして日本語で話すときの口調・性格・一人称を"
-                    f"30字以内で設定せよ。形式：「一人称:XX / 口調:YYYY」"
+                    f"「{name}」がAIとして日本語で話す設定を作れ。\n"
+                    f"歴史上人物なら一人称は「我」「余」「朕」など時代に合ったもの。\n"
+                    f"必ず以下の形式のみで答えよ:\n"
+                    f"一人称:XX / 口調:YYYY / 特徴:ZZZ"
                 )
             r = o.chat(
                 model=MODEL_NAME,
@@ -4987,7 +5117,7 @@ def _llm_persona_style(name: str) -> dict:
             print(f"{C['y']}[WARN] LLM生成スレッド失敗: {_e}{C['w']}")
 
     t = threading.Thread(target=_gen, daemon=True)
-    t.start(); t.join(timeout=5.0)
+    t.start(); t.join(timeout=30.0)
 
     raw_style = result[0]
     if not raw_style or len(raw_style) < 8:
@@ -4995,9 +5125,23 @@ def _llm_persona_style(name: str) -> dict:
 
     # 一人称を抽出
     fp = "私"
-    m = re.search(r'一人称[：:は「『]?\s*([ぁ-んァ-ヶ一-龯a-zA-Z]{1,6})', raw_style)
+    # 一人称ルール:
+    # - 偉人・歴史上の人物 → 我/余/朕/拙者など
+    # - 年上アニメキャラ   → 先輩くん呼び
+    # - 年下アニメキャラ   → 先輩呼び
+    # - 一般              → LLM出力に従う
+    _HISTORICAL_KEYWORDS = ['武将','大名','天皇','将軍','王','皇帝','哲学者','思想家','科学者','発明家','革命家']
+    _is_historical = any(kw in web_info[:500] for kw in _HISTORICAL_KEYWORDS)
+    _FP_HISTORICAL = ['我','余','朕','拙者','某','吾輩','わし']
+    m = re.search(r'一人称[：:]\s*([^\s/　「」]{1,6})', raw_style)
     if m:
-        fp = m.group(1).strip()
+        _fp_cand = m.group(1).strip('「」『』')
+        fp = _fp_cand if _fp_cand not in ('は','が','を','に','の','も','と','私は') else '私'
+    else:
+        fp = '私'
+    # 歴史上の人物で一人称が「私」になった場合は適切なものに補正
+    if _is_historical and fp in ('私', 'は'):
+        fp = next((f for f in _FP_HISTORICAL if f in raw_style), '我')
 
     # スタイル文字列を構築（Web情報の要約を冒頭に付与）
     style_parts = [raw_style[:300]]
@@ -5010,6 +5154,7 @@ def _llm_persona_style(name: str) -> dict:
     final_style = "\n".join(style_parts)[:600]
     p = {"name": name, "style": final_style, "first_person": fp, "_web": bool(web_info)}
     PERSONA_STYLE_CACHE[name] = p
+    _persona_cache_save()  # ★ディスク永続化
     print(f"{C['dim']}[ペルソナ生成] {name} / 一人称:{fp} / Web情報:{'あり' if web_info else 'なし'}{C['w']}")
     return p
 
@@ -5045,7 +5190,7 @@ def check_ollama_connection() -> bool:
 
         MODEL_NAME  = selected
         DEEP_MODEL  = "gemma3:12b" if has_12b else selected
-        FAST_MODEL  = "gemma3:1b"  if has_1b  else selected
+        FAST_MODEL  = "gemma3:4b"  if has_4b  else ("gemma3:1b" if has_1b else selected)  # ★[GPU] 4b優先
 
         gpu_tag = f" {C['g']}[GPU]{C['w']}" if _GPU_AVAILABLE else ""
         print(f"{C['g']}[OK] FAST={FAST_MODEL} | MAIN={MODEL_NAME} | DEEP={DEEP_MODEL}{gpu_tag}{C['w']}")
@@ -9059,10 +9204,20 @@ function checkWin(){
 function say(who,msg){G.log.push({who,msg}); if(G.log.length>160)G.log.shift()}
 function suspicionFor(p){
  let s=p.suspicion;
- if(p.role==='werewolf')s+=.18;
- if(p.role==='madman')s+=.1;
- if(G.lastExecuted&&p.role==='werewolf')s+=.05;
- return s+Math.random()*.35;
+ // 占い結果で黒判定されたら疑惑大幅増
+ const blackSee=G.log.filter(x=>x.who==='system'&&x.msg.includes('占い結果')&&x.msg.includes(p.name)&&x.msg.includes('黒'));
+ const whiteSee=G.log.filter(x=>x.who==='system'&&x.msg.includes('占い結果')&&x.msg.includes(p.name)&&x.msg.includes('白'));
+ s+=blackSee.length*0.5;
+ s-=whiteSee.length*0.3;
+ // 複数から名指しされるほど疑惑増
+ const mentions=G.log.filter(x=>x.who!=='system'&&x.who!==p.name&&x.msg.includes(p.name));
+ s+=mentions.length*0.08;
+ // 偽COしているプレイヤーは矛盾が出やすいので疑惑増
+ if(p.fakeRole)s+=0.15;
+ // COしていない人はやや疑惑増（役職隠し）
+ if(!p.co&&G.day>=2)s+=0.05;
+ // ランダム要素を小さく抑える
+ return s+Math.random()*0.1;
 }
 function aiCO(){
  for(const p of alive().filter(p=>p.id!==0)){
@@ -9134,9 +9289,17 @@ function discussion(){
    ];
    msg=p.quote+' '+reactions[Math.random()*reactions.length|0];
   }
-  // 通常発言
+  // 通常発言: 疑惑スコア上位を狙う
   else{
-   const target=shuffle(alive().filter(x=>x.id!==p.id))[0];
+   const candidates=alive().filter(x=>x.id!==p.id);
+   // 人狼・狂人は村人陣営を狙う、村人陣営は疑惑上位を狙う
+   let target;
+   if(p.role==='werewolf'||p.role==='madman'){
+    target=shuffle(candidates.filter(x=>x.role!=='werewolf'&&x.role!=='madman'))[0]||shuffle(candidates)[0];
+   }else{
+    const sorted=candidates.slice().sort((a,b)=>suspicionFor(b)-suspicionFor(a));
+    target=Math.random()<0.75?sorted[0]:sorted[1]||sorted[0];
+   }
    const suffixes=[
     `私は${target.name}の昨日の間合いが気になる。`,
     `${target.name}を急いで信じるには、まだ根拠が薄い。`,
@@ -9155,13 +9318,32 @@ function playerCO(){
   say('あなた','【CO】私は占い師です。');
   const lastSee=G.log.filter(x=>x.who==='system'&&x.msg.includes('占い結果')).slice(-1)[0];
   if(lastSee)say('あなた',lastSee.msg);
+  else{const candidates=alive().filter(p=>p.id!==0&&p.role!=='werewolf');const t=candidates[Math.random()*candidates.length|0];if(t)say('あなた','占い結果: '+t.name+'は⬜白（村人）でした。');}
  }else if(me.role==='medium'){
   say('あなた','【CO】私は霊媒師です。');
   const lastMed=G.log.filter(x=>x.who==='system'&&x.msg.includes('霊媒結果')).slice(-1)[0];
   if(lastMed)say('あなた',lastMed.msg);
+ }else if(me.role==='werewolf'||me.role==='madman'){
+  const fakeCO=Math.random()<0.5?'占い師':'霊媒師';
+  me.fakeRole=fakeCO;
+  say('あなた','【CO】私は'+fakeCO+'です。');
  }else if(me.role==='knight'){
   const guardLog=G.log.filter(x=>x.who==='system'&&x.msg.includes('護衛')).slice(-1)[0];
   say('あなた','【護衛公開】'+(guardLog?guardLog.msg:'まだ護衛していません。'));
+ }
+ render();
+}
+function playerCOas(fakeRole){
+ const me=G.players[0];
+ me.co=true; me.fakeRole=fakeRole;
+ say('あなた','【CO】私は'+fakeRole+'です。');
+ if(fakeRole==='占い師'){
+  const fakeTarget=alive().filter(p=>p.id!==0&&p.role!=='werewolf');
+  const t=fakeTarget[Math.random()*fakeTarget.length|0];
+  if(t)say('あなた','占い結果: '+t.name+'は⬜白（村人）でした。');
+ }else{
+  const dead=G.players.filter(x=>!x.alive);
+  if(dead.length>0){const d=dead[Math.random()*dead.length|0];say('あなた','霊媒結果: '+d.name+'は⬜白（村人）でした。');}
  }
  render();
 }
@@ -9178,9 +9360,18 @@ function resolveVote(){
  for(const p of alive().filter(p=>p.id!==0)){
    const candidates=alive().filter(x=>x.id!==p.id);
    let t;
-   if(p.role==='werewolf')t=shuffle(candidates.filter(x=>x.role!=='werewolf'))[0]||shuffle(candidates)[0];
-   else if(p.role==='madman')t=shuffle(candidates.filter(x=>x.role!=='madman'))[0];
-   else t=candidates.sort((a,b)=>suspicionFor(b)-suspicionFor(a))[0];
+   if(p.role==='werewolf'){
+    // 人狼: 村人陣営の中で疑惑が高い（=吊られやすい）人に投票して偽装
+    const vCandidates=candidates.filter(x=>x.role!=='werewolf').slice().sort((a,b)=>suspicionFor(b)-suspicionFor(a));
+    t=vCandidates[0]||shuffle(candidates)[0];
+   }else if(p.role==='madman'){
+    // 狂人: 村人陣営の疑惑上位に投票
+    const mCandidates=candidates.filter(x=>x.role!=='madman').slice().sort((a,b)=>suspicionFor(b)-suspicionFor(a));
+    t=mCandidates[0]||shuffle(candidates)[0];
+   }else{
+    // 村人陣営: 疑惑スコア上位に投票（占い結果・名指し回数を考慮）
+    t=candidates.slice().sort((a,b)=>suspicionFor(b)-suspicionFor(a))[0];
+   }
    t.votes++;
  }
  const max=Math.max(...alive().map(p=>p.votes));
@@ -9199,7 +9390,10 @@ function resolveNight(){
    telop(`占い: ${t.name}は${t.role==='werewolf'?'人狼':'白'}判定`, t.role==='werewolf'?'danger':'blue');
  }
  let guard=-1;
- if(G.players[0].role==='knight'&&G.players[0].alive)guard=guardSel;
+ if(G.players[0].role==='knight'&&G.players[0].alive){
+  guard=guardSel>=0?guardSel:alive().filter(p=>p.id!==0)[0]?.id??-1;
+  const gt=G.players[guard]; if(gt)say('system',`騎士の護衛: ${gt.name}を護衛した。`);
+ }
  else {
    const k=alive().find(p=>p.role==='knight');
    if(k)guard=shuffle(alive().filter(p=>p.id!==k.id))[0].id;
@@ -9219,7 +9413,11 @@ function render(){
  document.getElementById('day').textContent=G.day+'日目';
  document.getElementById('phase').textContent=G.phase;
  document.getElementById('myRole').textContent=roleInfo[G.players[0].role];
- document.getElementById('players').innerHTML=G.players.map(p=>`<div class="card ${p.alive?'':'dead'}"><div class="name">${p.name}</div><div class="role">${p.id===0||p.known?roleInfo[p.role]:'役職不明'}</div><span class="tag ${p.alive?'green':'red'}">${p.alive?'生存':'死亡'}</span>${p.votes?`<span class="tag red">${p.votes}票</span>`:''}<div class="small">${p.quote}</div></div>`).join('');
+ const isWolf=G.players[0].role==='werewolf';
+ document.getElementById('players').innerHTML=G.players.map(p=>{
+  const isPartner=isWolf&&p.id!==0&&p.role==='werewolf';
+  return `<div class="card ${p.alive?'':'dead'}${isPartner?' wolf-partner':''}"><div class="name">${p.name}${isPartner?' <span style="color:#e74c3c;font-size:11px;">🐺相方</span>':''}</div><div class="role">${p.id===0||p.known?roleInfo[p.role]:'役職不明'}</div><span class="tag ${p.alive?'green':'red'}">${p.alive?'生存':'死亡'}</span>${p.votes?`<span class="tag red">${p.votes}票</span>`:''}<div class="small">${p.quote}</div></div>`;
+ }).join('');
  document.getElementById('log').innerHTML=G.log.map(x=>`<div class="line"><span class="${x.who==='system'?'system':'speaker'}">${x.who}</span> ${x.msg}</div>`).join('');
  document.getElementById('log').scrollTop=99999;
  const opts=alive().filter(p=>p.id!==0).map(p=>`<option value="${p.id}">${p.name}</option>`).join('');
@@ -9230,14 +9428,18 @@ function render(){
   if(me.alive&&!me.co){
    if(me.role==='seer'||me.role==='medium')
     act+='<button class="primary" onclick="playerCO()">COする</button>';
+   if(me.role==='werewolf'||me.role==='madman'){
+    act+='<button class="primary" onclick="playerCOas(\'占い師\')">占い師COする</button>';
+    act+='<button class="primary" onclick="playerCOas(\'霊媒師\')">霊媒師COする</button>';
+   }
    if(me.role==='knight')
     act+='<button class="primary" onclick="playerCO()">護衛先を公開</button>';
   }
  }
  if(G.phase==='投票')act=G.players[0].alive?`<select id="voteTarget">${opts}</select><button class="danger" onclick="advance()">投票する</button>`:'<span class="small">死亡中のため投票できません</span><button class="primary" onclick="advance()">投票結果へ</button>';
  if(G.phase==='夜'){
-  if(G.players[0].role==='seer'&&G.players[0].alive)act+=`<span class="small">占い</span><select id="seeTarget">${opts}</select>`;
-  if(G.players[0].role==='knight'&&G.players[0].alive)act+=`<span class="small">護衛</span><select id="guardTarget">${alive().map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}</select>`;
+  if(G.players[0].role==='seer'&&G.players[0].alive&&G.day>=2){const seerOpts=alive().filter(p=>p.id!==0&&p.role!=='werewolf').map(p=>`<option value="${p.id}">${p.name}</option>`).join('');act+=`<span class="small">占い</span><select id="seeTarget">${seerOpts}</select>`;}
+  if(G.players[0].role==='knight'&&G.players[0].alive)act+=`<span class="small">護衛</span><select id="guardTarget">${alive().filter(p=>p.id!==0).map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}</select>`;
    if(G.players[0].role==='werewolf'&&G.players[0].alive)act+=`<span class="small">襲撃</span><select id="killTarget">${alive().filter(p=>p.role!=='werewolf').map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}</select>`;
    act+='<button class="primary" onclick="advance()">夜を明かす</button>';
  }
@@ -11304,23 +11506,63 @@ def _stop_files() -> str:
     return f"{C['g']}一時ファイル {removed}件削除{C['w']}"
 
 
+def _handle_baseball() -> str:
+    """⚾ 甲子園列伝HTMLをWSL2→Windowsブラウザで起動"""
+    import subprocess as _sub, pathlib
+    html = pathlib.Path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "s01_baseball.html")).resolve()
+    if not html.exists():
+        return f"{C['r']}[ERR] s01_baseball.html が見つかりません: {html}{C['w']}"
+    try:
+        win_path = _sub.check_output(
+            ["wslpath", "-w", str(html)],
+            text=True, timeout=3).strip()
+        # detach=Trueでバックグラウンド起動（フリーズ防止）
+        _sub.Popen(
+            ["cmd.exe", "/c", "start", "", win_path],
+            stdin=_sub.DEVNULL,
+            stdout=_sub.DEVNULL,
+            stderr=_sub.DEVNULL,
+            close_fds=True
+        )
+        return f"{C['g']}⚾ 甲子園列伝を起動しました！{C['w']}"
+    except Exception as e:
+        try:
+            import webbrowser, threading
+            threading.Thread(
+                target=webbrowser.open,
+                args=(f"file://{html}",),
+                daemon=True
+            ).start()
+            return f"{C['g']}⚾ 甲子園列伝を起動しました（webbrowser）{C['w']}"
+        except Exception as e2:
+            return f"{C['y']}[WARN] 起動失敗: {e} / {e2}{C['w']}"
+
 def run() -> None:
     global POWER_MODE, TEMP_VOICE, KEYWORD_MEMORY, ROLEPLAY_ACTIVE, ROLEPLAY_SCENE, CUSTOM_PERSONA
     global _SESSION_START_INTERACTIONS
+    global VECTOR_AVAILABLE, VECTOR_COL, _VECTOR_CLIENT
     SESSION_STATS["start_time"] = time.time()
     messages: list[dict] = []
     persona_id: int = 2
     current_persona: dict = get_persona(persona_id)
-    restore_learning()
+    _t0=__import__("time").time(); restore_learning(); print(f"restore: {__import__('time').time()-_t0:.2f}s")
     # ★[修正/#12] 再起動直後に total_interactions が 25 の倍数の場合に
     # 1ターン目から persist_learning が走るバグを防ぐ。
     # restore_learning() 後の値をセッション開始ベースラインとして記録する。
     _SESSION_START_INTERACTIONS = LEARNING_STATS["total_interactions"]
+    _t1=__import__("time").time()
     if not check_ollama_connection():
-        print(f"{C['r']}ollama接続不可。終了します。{C['w']}"); return
+        print(f"ollama: {__import__('time').time()-_t1:.2f}s"); return
+    print(f"ollama: {__import__('time').time()-_t1:.2f}s")
     # ★[v129] vector_db初期化・OPTIMIZER・バックグラウンドで並列起動
-    threading.Thread(target=_init_vector_db, daemon=True).start()
-    OPTIMIZER.start()
+    _t2=__import__("time").time(); _init_vector_db(); print(f"vector_db_thread: {__import__("time").time()-_t2:.2f}s")
+    _t3=__import__("time").time(); OPTIMIZER.start(); print(f"optimizer: {__import__("time").time()-_t3:.2f}s")
+    # ウォームアップ: バックグラウンドでモデルをプリロード
+    def _warmup():
+        import ollama as _ol
+        try: _ol.chat(model=FAST_MODEL, messages=[{"role":"user","content":"hi"}], options={"num_predict":1})
+        except: pass
+    threading.Thread(target=_warmup, daemon=True).start()
     # ★[v129] BANNER動的更新（check_ollama_connectionでモデル名が確定した後）
     _dynamic_banner = (
         f"{C['c']}{C['bold']}\nPROJECT AEGIS [v130.1 NEXT GENERATION]{C['w']}\n"
@@ -11358,14 +11600,16 @@ def run() -> None:
             # ★[修正/chat-1] select_model を使って複雑度に応じてモデルを切り替える
             # 旧コードは model_choice = MODEL_NAME 固定でDEEP_MODELが使われなかった
             if model is None:
-                model = DEEP_MODEL if is_complex else MODEL_NAME
+                model = DEEP_MODEL if (is_complex and mode == "deep") else FAST_MODEL if is_complex else MODEL_NAME
             if is_complex:
                 # ★[修正/rag-d] d/complexモードにもRAGデータを注入する
                 # get_async_rag_dataは並列取得済みキャッシュを優先するため遅延は最小限
                 rag_snippet = ""
                 if not OFFLINE_MODE:
                     try:
-                        _rag = get_async_rag_data(user_text)
+                        _rag_future = _THREAD_POOL.submit(get_async_rag_data, user_text)
+                        try: _rag = _rag_future.result(timeout=_rag_adaptive_timeout())
+                        except: _rag = ""
                         if _rag and len(_rag.strip()) > 30:
                             # ★[修正/ctx-2] RAGデータをctx予算に合わせてトリミング
                             # complexモード(ctx=8192, n_predict=4096)では残り≒4096トークン≒2700文字
@@ -11465,7 +11709,7 @@ def run() -> None:
                         f"早期結論禁止。最後の文を「。」で完結させること。"
                         + rag_snippet
                     )
-                d_tokens = 2048  # ★[修正/ctx-5] -1（無制限）→2048: ctx超過による途切れ防止
+                d_tokens = 1024  # ★[修正/ctx-5] -1（無制限）→2048: ctx超過による途切れ防止
             else:
                 sys_content = (
                     f"あなたは{p['name']}。口調:{p['style']}。一人称:{p.get('first_person','私')}。ユーザーは{USER_NAME}。"
@@ -11480,6 +11724,7 @@ def run() -> None:
             cm = [sys_msg] + trim_history(messages[-MAX_HISTORY * 2:], token_budget=_hist_budget) + [{"role": "user", "content": user_text}]
             # total_len: システムプロンプト込みの総文字数をctx計算に渡す
             total_len = sum(len(m.get("content","")) for m in cm)
+            print(f"[DEBUG] using model={model} is_complex={is_complex}", flush=True)
             result = stream_response(cm, is_complex, total_len, model=model, max_tokens=d_tokens) or ""
         else:
             sys_msg = get_sys_prm(mode, user_text, per_id=persona_id)
@@ -11487,6 +11732,9 @@ def run() -> None:
             # ★[修正/TEMP_MAP] コマンドモード別温度をTEMP_MAPから取得して接続
             _cmd_temp = TEMP_MAP.get(f"/{mode}")
             result = stream_response(cm, mode in ("a", "c", "sum", "deep"), len(user_text), temp_override=_cmd_temp, model=model) or ""
+        # プリフェッチ: 次の入力に備えてRAGを先読み
+        if mode == "d" and result and len(user_text) > 4:
+            _THREAD_POOL.submit(prefetch_rag, result[-80:])
         if mode != "d":
             update_keyword_memory(user_text)
             kw = extract_keywords(result)
@@ -11551,6 +11799,7 @@ def run() -> None:
         "split": lambda a: handle_split(a),
         "offline": lambda a: _handle_offline(a),
         "ety": lambda a: handle_ety(a),
+        "baseball":   lambda a: _handle_baseball(),
         "chess":       lambda a: handle_chess(a, persona=current_persona),
         "shogi":       lambda a: handle_shogi(a, persona=current_persona),
         "wolf":        lambda a: handle_philosopher_wolf(a),
@@ -11656,12 +11905,6 @@ def run() -> None:
         lines.append(f"\n{C['y']}【1】最新AI技術 収集 (ホワイトリスト限定){C['w']}")
 
         _TRUSTED_SOURCES = [
-            ("arxiv/cs.CL (LLM・プロンプト)",
-             "https://arxiv.org/search/?searchtype=all&query=LLM+prompt+RAG+agent&start=0",
-             "🔬"),
-            ("arxiv/cs.AI (推論・自己改善)",
-             "https://arxiv.org/search/?searchtype=all&query=reasoning+chain-of-thought+self-improvement&start=0",
-             "🔬"),
             ("HuggingFace Blog",
              "https://huggingface.co/blog",
              "🤗"),
@@ -11677,38 +11920,39 @@ def run() -> None:
             ("Prompting Guide",
              "https://www.promptingguide.ai/",
              "💡"),
-            ("Anthropic News",
-             "https://www.anthropic.com/news",
-             "🏢"),
         ]
 
         collected_texts = []
         fetch_report = []
+        _fetch_lock = threading.Lock()
 
-        for src_name, src_url, src_tag in _TRUSTED_SOURCES:
-            print(f"  {src_tag} {src_name} ... ", end="", flush=True)
+        def _fetch_one(src):
+            src_name, src_url, src_tag = src
             try:
-                html = _trusted_fetch(src_url, timeout=8)
+                html = _trusted_fetch(src_url, timeout=4)
                 if not html:
-                    print(f"{C['r']}空レスポンス{C['w']}")
-                    fetch_report.append(f"  ✗ {src_name}: 空レスポンス")
-                    continue
+                    return (None, f"  ✗ {src_name}: 空レスポンス")
                 text = strip_tags(html)[:2500]
                 h = _hl.sha256(text.encode()).hexdigest()[:12]
-                if h in _REF_STATE["content_hashes"]:
-                    print(f"{C['dim']}キャッシュ済み{C['w']}")
-                    fetch_report.append(f"  ↩ {src_name}: キャッシュ済み")
-                    continue
-                _REF_STATE["content_hashes"].add(h)
-                collected_texts.append(f"==[{src_name}]==\n{text}")
-                print(f"{C['g']}OK ({len(text)}chars){C['w']}")
-                fetch_report.append(f"  ✓ {src_name}")
+                with _fetch_lock:
+                    if h in _REF_STATE["content_hashes"]:
+                        return (None, f"  ↩ {src_name}: キャッシュ済み")
+                    _REF_STATE["content_hashes"].add(h)
+                return (f"==[{src_name}]==\n{text}", f"  ✓ {src_name} ({len(text)}chars)")
             except ValueError as e:
-                print(f"{C['r']}🔒 セキュリティブロック{C['w']}")
-                fetch_report.append(f"  🔒 {src_name}: {str(e)[:60]}")
+                return (None, f"  🔒 {src_name}: {str(e)[:60]}")
             except Exception as e:
-                print(f"{C['r']}エラー{C['w']}")
-                fetch_report.append(f"  ✗ {src_name}: {str(e)[:60]}")
+                return (None, f"  ✗ {src_name}: {str(e)[:60]}")
+
+        print(f"  並列fetch中 ({len(_TRUSTED_SOURCES)}ソース)...", flush=True)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futures = {ex.submit(_fetch_one, src): src for src in _TRUSTED_SOURCES}
+            for fut in as_completed(futures):
+                text_result, report = fut.result()
+                if text_result:
+                    collected_texts.append(text_result)
+                fetch_report.append(report)
 
         lines.append("\n".join(fetch_report))
 
@@ -11716,24 +11960,34 @@ def run() -> None:
             lines.append(f"  {C['r']}全ソースの取得失敗 — ネット確認または /offline on を検討{C['w']}")
             raw_tech_summary = ""
         else:
-            print(f"\n  → LLMで技術抽出中... ", end="", flush=True)
-            tech_extract_sys = (
-                "あなたは最先端AI研究のキュレーター兼エンジニア。\n"
-                "以下の信頼済みWebソースから取得したテキストを分析し、\n"
-                "LLM・プロンプトエンジニアリング・RAG・エージェント・推論・安全性に関する\n"
-                "最新技術トレンドを抽出せよ。\n\n"
-                "【出力フォーマット — 1行1技術、最大12件、重要度順】\n"
-                "技術名 | 概要(30字以内) | 分類(prompt/rag/reasoning/safety/memory/output) "
-                "| 自律AIへの応用可能性(高/中/低) | 実装難易度(易/中/難)\n\n"
-                "余分な説明・前置き・番号は不要。フォーマット通りに出力せよ。"
-            )
-            raw_tech_summary = stream_response(
-                [{"role": "system", "content": tech_extract_sys},
-                 {"role": "user", "content": "\n\n".join(collected_texts)}],
-                False, 500, temp_override=0.0, model=DEEP_MODEL,
-                max_tokens=1200, silent=True
-            ) or ""
-            print(f"{C['g']}完了{C['w']}")
+            _t_extract = __import__('time').time()
+            print(f"\n  → ルールベース技術抽出中... ", end="", flush=True)
+            tech_extract_sys = ""  # ルールベース化のため未使用
+            # ルールベース技術抽出（LLM不要・高速）
+            _TECH_KEYWORDS = [
+                ("Chain-of-Thought",    "段階的推論プロンプト",          "reasoning", "高", "易"),
+                ("RAG",                 "検索拡張生成",                  "rag",       "高", "中"),
+                ("HyDE",                "仮想ドキュメント埋め込み",       "rag",       "高", "中"),
+                ("Self-Reflection",     "自己反省ループ",                 "reasoning", "高", "中"),
+                ("Function Calling",    "LLMツール呼び出し",             "output",    "高", "易"),
+                ("BM25",                "キーワードランキング検索",       "rag",       "高", "易"),
+                ("Cross-Encoder",       "再ランキングモデル",             "rag",       "中", "中"),
+                ("Constitutional AI",   "安全制約付き学習",              "safety",    "高", "難"),
+                ("Agent Loop",          "自律エージェントループ",         "memory",    "高", "難"),
+                ("Structured Output",   "JSON強制出力",                  "output",    "高", "易"),
+                ("Prompt Compression",  "入力圧縮で高速化",              "prompt",    "高", "中"),
+                ("Speculative Decoding","投機的デコードで高速化",         "output",    "中", "難"),
+            ]
+            all_text = " ".join(collected_texts).lower()
+            matched = []
+            for tech, summary, cat, app, diff in _TECH_KEYWORDS:
+                if tech.lower() in all_text or tech.split("-")[0].lower() in all_text:
+                    matched.append(f"{tech} | {summary} | {cat} | {app} | {diff}")
+            # マッチしない場合は全件採用
+            if len(matched) < 3:
+                matched = [f"{t} | {s} | {c} | {a} | {d}" for t,s,c,a,d in _TECH_KEYWORDS[:6]]
+            raw_tech_summary = "\n".join(matched)
+            print(f"{C['g']}完了 ({__import__('time').time()-_t_extract:.1f}秒){C['w']}")
 
             lines.append(f"\n  {C['c']}{'技術名':<22} {'分類':<12} {'応用性':<6} {'難易度'}{C['w']}")
             lines.append(f"  {'─'*56}")
@@ -11752,27 +12006,28 @@ def run() -> None:
         # ══ SECTION 2: 適用可能技術を自動でPROMPT_OPTIMIZATIONSに反映 ══
         if raw_tech_summary:
             lines.append(f"\n{C['y']}【2】自AI適用 & PROMPT_OPTIMIZATIONS 自動反映{C['w']}")
-            print(f"  → 適用分析中... ", end="", flush=True)
-            apply_sys = (
-                "あなたはPythonベースの自律AI（RAG・ベクターDB・哲学者ペルソナ36体・"
-                "MIDI生成・BM25・背景最適化スレッド・web検索・codeサンドボックス搭載）の開発者。\n"
-                "以下のAI技術リストから今すぐ取り入れられる技術を選び実装方針をJSONで出力せよ。\n\n"
-                "【出力 — JSONのみ、マークダウン不要】\n"
-                "[\n"
-                "  {\"tech\": \"技術名\",\n"
-                "   \"category\": \"prompt|rag|memory|reasoning|safety|output\",\n"
-                "   \"directive\": \"具体的指示(日本語・50字以内)\",\n"
-                "   \"rationale\": \"なぜ有効か(20字以内)\",\n"
-                "   \"priority\": 1~5}\n"
-                "]\n\n"
-                "応用可能性「高」を優先。3〜6件出力せよ。"
-            )
-            apply_raw = stream_response(
-                [{"role": "system", "content": apply_sys},
-                 {"role": "user", "content": raw_tech_summary}],
-                False, 200, temp_override=0.0, model=DEEP_MODEL,
-                max_tokens=768, silent=True
-            )
+            _t_apply = __import__('time').time()
+            print(f"  → ルールベース適用分析中... ", end="", flush=True)
+            import json as _json2
+            _directive_map = {
+                "Chain-of-Thought":   ("reasoning", "CoTプロンプトを自動付与せよ"),
+                "RAG":                ("rag",       "BM25+ベクトルハイブリッドRAGを使用"),
+                "HyDE":               ("rag",       "検索前にHyDEでクエリ変換"),
+                "Self-Reflection":    ("reasoning", "長文後に自己反省ループ実行"),
+                "Function Calling":   ("output",    "ツール呼び出しをJSON統一"),
+                "BM25":               ("rag",       "初期検索にBM25を必ず通す"),
+                "Constitutional AI":  ("safety",    "出力前に安全制約チェック"),
+                "Structured Output":  ("output",    "出力はJSON強制モード"),
+                "Prompt Compression": ("prompt",    "2000字超は圧縮してから送る"),
+            }
+            _auto_directives = []
+            for row in raw_tech_summary.splitlines():
+                parts = [p.strip() for p in row.split("|")]
+                if len(parts) >= 3:
+                    tech = parts[0]
+                    cat, directive = _directive_map.get(tech, ("prompt", f"{tech}を積極活用せよ"))
+                    _auto_directives.append({"tech": tech, "category": cat, "directive": directive, "rationale": "自動抽出", "priority": 3})
+            apply_raw = _json2.dumps(_auto_directives, ensure_ascii=False)
             # ★[修正/ollama-silent] 戻り値空 = Ollama未起動 or タイムアウト → 警告を表示
             if not apply_raw:
                 print(f"{C['r']}失敗{C['w']}")
@@ -11780,7 +12035,7 @@ def run() -> None:
                 lines.append(f"  {C['dim']}  ヒント: ollama serve && ollama pull {DEEP_MODEL}{C['w']}")
                 apply_raw = "[]"
             else:
-                print(f"{C['g']}完了{C['w']}")
+                print(f"{C['g']}完了 ({__import__('time').time()-_t_apply:.1f}秒){C['w']}")
 
             try:
                 clean_json = re.sub(r'```json|```', '', apply_raw).strip()
@@ -11876,10 +12131,11 @@ def run() -> None:
                     "4. 【危険信号】スコアが0.3以下があれば緊急アラートを出せ\n"
                     "日本語・簡潔に。"
                 )
-                quality_comment = stream_response(
+                quality_comment = None  # スキップ: 速度優先
+                if False: quality_comment = stream_response(
                     [{"role": "system", "content": quality_sys},
                      {"role": "user", "content": log_summary}],
-                    False, 100, temp_override=0.0, model=DEEP_MODEL,
+                    False, 100, temp_override=0.0, model=FAST_MODEL,
                     max_tokens=300, silent=True
                 )
                 # ★[修正/ollama-silent] 空応答 → Ollama警告
@@ -11949,35 +12205,32 @@ def run() -> None:
             _self_src = os.path.abspath(sys.argv[0]) if sys.argv else ""
             _evolvable = os.path.isfile(_self_src) and _self_src.endswith(".py")
 
-            code_evo_sys = (
-                "あなたはPythonベースの自律AI (S-01) のコード改善エンジン。\n"
-                "以下の最新AI技術サマリーをもとに、このAI自身のコードに即座に適用できる\n"
-                "具体的なPythonコード改善案を提案せよ。\n\n"
-                "【条件】\n"
-                "- 既存コードの動作を壊さない、安全な追加・置換のみ\n"
-                "- Negamax/RAG/BM25/curses UIなど既存機能の改善を優先\n"
-                "- 1件につき: 対象関数名 | 改善内容(30字) | 改善効果(20字) | 優先度(1-5)\n"
-                "- 出力はJSONのみ。マークダウン不要。\n"
-                '[{"func": "関数名", "desc": "改善内容", "effect": "改善効果", "priority": 優先度}]\n'
-                "3〜5件出力せよ。"
-            )
-            code_evo_raw = stream_response(
-                [{"role": "system", "content": code_evo_sys},
-                 {"role": "user",   "content": raw_tech_summary}],
-                False, 150, temp_override=0.05, model=DEEP_MODEL,
-                max_tokens=512, silent=True
-            )
-            # ★[修正/ollama-silent] 空応答 → Ollama警告
-            if not code_evo_raw:
-                print(f"{C['r']}失敗{C['w']}")
-                lines.append(f"  {C['r']}⚠ Ollama未起動 — SECTION 7コード進化スキップ{C['w']}")
-                lines.append(f"  {C['dim']}  ヒント: ollama serve && ollama pull {DEEP_MODEL}{C['w']}")
-                code_evo_raw = "[]"
-            else:
-                print(f"{C['g']}完了{C['w']}")
+            # ルールベースCODE_EVO（LLM不要・高速）
+            _EVO_RULES = {
+                "Chain-of-Thought":    ("stream_response",   "CoT指示をシステムプロンプトに自動付与",  "推論精度向上", 4),
+                "RAG":                 ("hybrid_search_advanced", "BM25+ベクトルのn_candidates増加", "検索精度向上", 4),
+                "HyDE":                ("vector_search",     "検索前にHyDEクエリ変換を追加",          "意味検索強化", 3),
+                "Self-Reflection":     ("run",               "長文応答後に自己反省ループ追加",          "品質向上",     3),
+                "Function Calling":    ("_handle_reference", "出力をJSON強制モードで統一",              "安定性向上",   3),
+                "BM25":                ("bm25_search",       "BM25スコアにTF-IDF重みを追加",           "検索精度向上", 3),
+                "Constitutional AI":   ("run",               "出力前に安全制約チェックを挿入",          "安全性向上",   4),
+                "Structured Output":   ("stream_response",   "JSONスキーマバリデーションを追加",        "出力安定化",   3),
+                "Prompt Compression":  ("run",               "2000字超入力を自動圧縮",                 "高速化",       3),
+            }
+            _evo_items = []
+            for row in raw_tech_summary.splitlines():
+                parts = [p.strip() for p in row.split("|")]
+                if parts and parts[0] in _EVO_RULES:
+                    func, desc, effect, pri = _EVO_RULES[parts[0]]
+                    _evo_items.append({"func": func, "desc": desc, "effect": effect, "priority": pri})
+            import json as _json3
+            code_evo_raw = _json3.dumps(_evo_items, ensure_ascii=False) if _evo_items else "[]"
+            print(f"{C['g']}完了({len(_evo_items)}件){C['w']}")
 
             try:
-                clean_evo = re.sub(r'```json|```', '', code_evo_raw).strip()
+                _evo_tmp = re.sub(r'```json|```', '', code_evo_raw).strip()
+                _evo_match = re.search(r'\[.*?\]', _evo_tmp, re.DOTALL)
+                clean_evo = _evo_match.group(0) if _evo_match else '[]'
                 evo_items = _json.loads(clean_evo)
                 evo_applied = []
                 for item in sorted(evo_items, key=lambda x: -x.get("priority", 0)):
@@ -12465,3 +12718,21 @@ def run() -> None:
 if __name__ == "__main__":
     atexit.register(_cleanup)
     run()
+
+# ━━ /reference CODE_EVO #1 (2026-06-04 19:33) sig=40d1f758 ━━
+# [1★] function_name: Improve readability and consistency in function names. → Enhanced clarity for maintainability.
+# [1★] function_name: Add comments to explain complex logic within functions. → Improved understanding of code behavior, especially for new developers.
+# [1★] function_name: Implement error handling (e.g., try-except blocks) where appropriate. → Robustness and prevent unexpected crashes.
+# [1★] function_name: Ensure function inputs are validated to check data types or ranges. → Prevent errors caused by invalid input values.
+# [1★] function_name: Add type hints for parameters, especially those that could be used in calculations. → Improved code readability and static analysis.
+# [1★] function_name: Consider using more descriptive variable names to improve understanding of data within the function. → Enhanced maintainability.
+# [1★] function_name: Add a docstring explaining what the function does, its parameters, return value and any potential side effects.  → Documentation for future developers.
+# [1★] function_name: Implement logging to track important events or errors within functions. → Debugging and monitoring code execution.
+# [1★] function_name: Add unit tests to verify the correctness of function logic.  → Automated testing for quality.
+# [1★] function_name: Ensure that all functions have a clear return value, indicating success or failure. → Clearer understanding and predictability.
+
+# ━━ /reference CODE_EVO #1 (2026-06-05 04:09) sig=6b89d641 ━━
+# [4★] stream_response: CoT指示をシステムプロンプトに自動付与 → 推論精度向上
+# [4★] hybrid_search_advanced: BM25+ベクトルのn_candidates増加 → 検索精度向上
+# [3★] run: 長文応答後に自己反省ループ追加 → 品質向上
+# [3★] _handle_reference: 出力をJSON強制モードで統一 → 安定性向上
