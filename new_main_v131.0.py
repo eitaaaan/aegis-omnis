@@ -1814,6 +1814,7 @@ HELP_TEXT = "\n".join([
     f"  {C['c']}/spi{C['w']}                SPI/玉手箱 対策（/spi 模擬 で10問連続）",
     f"  {C['c']}/comp <ID> <ID> [テーマ]{C['w']}  ヘーゲル弁証法対話（哲学者/カジュアル/ビジネス自動判定）",
     f"  {C['c']}/split <ID or 名前> [テーマ]{C['w']} 1ペルソナをテーゼ/アンチテーゼに分解して内的弁証法",
+    f"  {C['c']}/prime <式>{C['w']}         素数判定（多倍長対応・Miller-Rabin）\n              例: /prime 997  /prime 2**31-1  /prime 10**18+9",
     f"  {C['c']}/baseball{C['w']}           ⚾ 甲子園列伝（ブラウザで起動）",
     f"  {C['c']}/chess{C['w']}              ♟ チェス（MCTS強化・curses UI）\n              例: /chess easy  /chess middle  /chess hard  /chess very_hard",
     f"  {C['c']}/shogi{C['w']}              将棋（Negamax+TT+Killer強化・curses UI）\n              例: /shogi easy  /shogi middle  /shogi hard  /shogi very_hard",
@@ -11506,6 +11507,84 @@ def _stop_files() -> str:
     return f"{C['g']}一時ファイル {removed}件削除{C['w']}"
 
 
+def _handle_prime(arg: str) -> str:
+    """★ 素数判定コマンド: ASTベース・多倍長整数対応"""
+    import ast as _ast, math, time
+
+    arg = arg.strip()
+    if not arg:
+        return (f"{C['y']}使い方: /prime <数式または整数>{C['w']}\n"
+                f"  例: /prime 997\n"
+                f"  例: /prime 2**31-1\n"
+                f"  例: /prime 10**18+9")
+
+    # ── ASTで数式を安全に評価 ──
+    _ALLOWED = (
+        _ast.Expression, _ast.BinOp, _ast.UnaryOp, _ast.Constant,
+        _ast.Add, _ast.Sub, _ast.Mult, _ast.Pow, _ast.FloorDiv,
+        _ast.Mod, _ast.USub, _ast.UAdd,
+    )
+    try:
+        tree = _ast.parse(arg, mode="eval")
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ALLOWED):
+                return f"{C['r']}[ERR] 使用できない式です: {type(node).__name__}{C['w']}"
+        n = eval(compile(tree, "<prime>", "eval"), {"__builtins__": {}})
+        if not isinstance(n, int):
+            return f"{C['r']}[ERR] 整数のみ対応しています（結果: {n}）{C['w']}"
+    except Exception as e:
+        return f"{C['r']}[ERR] 式の評価に失敗: {e}{C['w']}"
+
+    if n < 2:
+        return f"{C['c']}{n:,}{C['w']} は素数ではありません（2未満）"
+    if n == 2:
+        return f"{C['g']}{n:,}{C['w']} は {C['g']}素数{C['w']} です ✓"
+    if n % 2 == 0:
+        return f"{C['c']}{n:,}{C['w']} は素数ではありません（偶数）"
+
+    # ── Miller-Rabin 確率的素数判定（多倍長対応・決定論的）──
+    def _miller_rabin(n: int) -> bool:
+        # n-1 = 2^r * d
+        r, d = 0, n - 1
+        while d % 2 == 0:
+            r += 1
+            d //= 2
+        # 決定論的witness（n < 3.3×10^24まで正確）
+        witnesses = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+        for a in witnesses:
+            if a >= n:
+                continue
+            x = pow(a, d, n)  # 高速べき乗（Python組み込み）
+            if x == 1 or x == n - 1:
+                continue
+            for _ in range(r - 1):
+                x = pow(x, 2, n)
+                if x == n - 1:
+                    break
+            else:
+                return False
+        return True
+
+    t0 = time.time()
+    is_prime = _miller_rabin(n)
+    elapsed = time.time() - t0
+
+    digits = len(str(n))
+    time_str = f"{elapsed*1000:.2f}ms" if elapsed < 1 else f"{elapsed:.3f}s"
+
+    if is_prime:
+        return (f"{C['g']}{n:,}{C['w']} は {C['g']}素数{C['w']} です ✓\n"
+                f"  桁数: {digits}桁 | 判定時間: {time_str} | 手法: Miller-Rabin")
+    else:
+        # 小さな因数を探す
+        factor = ""
+        for p in [2,3,5,7,11,13,17,19,23,29,31]:
+            if n % p == 0 and n != p:
+                factor = f" （{p} で割り切れる）"
+                break
+        return (f"{C['c']}{n:,}{C['w']} は素数ではありません{factor}\n"
+                f"  桁数: {digits}桁 | 判定時間: {time_str} | 手法: Miller-Rabin")
+
 def _handle_baseball() -> str:
     """⚾ 甲子園列伝HTMLをWSL2→Windowsブラウザで起動"""
     import subprocess as _sub, pathlib
@@ -11799,6 +11878,7 @@ def run() -> None:
         "split": lambda a: handle_split(a),
         "offline": lambda a: _handle_offline(a),
         "ety": lambda a: handle_ety(a),
+        "prime":      lambda a: _handle_prime(a),
         "baseball":   lambda a: _handle_baseball(),
         "chess":       lambda a: handle_chess(a, persona=current_persona),
         "shogi":       lambda a: handle_shogi(a, persona=current_persona),
